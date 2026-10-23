@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - name: Entra ID discovery/JWKS/token errors, Defender API, Datadog intake (no credentials)
         run: go -C control-plane test -tags live -count=1 -run Live -v ./internal/oidc ./internal/defender ./internal/export
