@@ -4,7 +4,7 @@
 # Runtime configuration (environment):
 #   AEGIS_API_BASE_URL   API origin when it differs from the console origin, e.g. https://aegis-api.corp.example
 #   AEGIS_API_UPSTREAM   alternatively: reverse-proxy /api/ to this upstream (same-origin), e.g. http://control-plane:8081
-FROM node:24-alpine AS build
+FROM node:25-alpine AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
