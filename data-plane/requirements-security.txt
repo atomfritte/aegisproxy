@@ -1,0 +1,4 @@
+# Security overrides for transitive dependencies whose fixed release is excluded by an upper bound in
+# mitmproxy's package metadata. Installed with --no-deps after mitmproxy (image, installers, CI).
+# Remove an entry once mitmproxy allows the fixed version.
+Brotli==1.2.1  # CVE-2026-111497 (PYSEC-2026-4322): out-of-bounds write in the Brotli decoder (crafted streams)

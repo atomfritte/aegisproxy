@@ -1,0 +1,32 @@
+id: 6de49e4e-573a-55c0-a35f-a6cc1cbfba74
+name: AegisProxy - Emergency policy change bypassed four-eyes review
+description: |
+  A Super Admin published a policy set without the required second review (emergency change). Review the justification and the change.
+severity: Medium
+requiredDataConnectors: []
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+relevantTechniques:
+  - T1562
+query: |
+  AegisProxy_CL
+  | where Stream == "audit" and Action == "POLICY_SET_EMERGENCY_PUBLISH"
+  | project TimeGenerated, Actor, Message, PolicySet = tostring(Data.entity_name)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: Actor
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1d
+    matchingMethod: AnyAlert
+version: 1.0.0
+kind: Scheduled

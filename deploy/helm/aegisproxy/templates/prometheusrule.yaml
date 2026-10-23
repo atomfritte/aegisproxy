@@ -1,0 +1,63 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "aegis.fullname" . }}
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  groups:
+    - name: aegisproxy.rules
+      rules:
+        - alert: AegisDataPlaneFailedClosed
+          expr: increase(aegis_dp_hook_errors_total[10m]) > 0
+          labels: { severity: critical }
+          annotations:
+            summary: "AegisProxy worker {{`{{ $labels.pod }}`}} blocked traffic after an internal error"
+            description: "A data-plane hook raised an exception and the request was blocked (fail-closed). Check the worker log; repeated errors can indicate an attack on the parser."
+        - alert: AegisDataPlanePolicyStale
+          expr: aegis_dp_policy_sync_age_seconds > {{ .Values.metrics.prometheusRule.policyStaleSeconds }}
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "AegisProxy worker {{`{{ $labels.pod }}`}} cannot sync policy from the control-plane"
+        - alert: AegisClamdUnavailable
+          expr: aegis_dp_clamd_available == 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "ClamAV is unreachable from worker {{`{{ $labels.pod }}`}} (downloads are handled per av_fail_mode)"
+        - alert: AegisICAPErrors
+          expr: increase(aegis_dp_icap_scans_total{result="error"}[15m]) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "ICAP scans fail on worker {{`{{ $labels.pod }}`}} (downloads are handled per icap_fail_mode)"
+        - alert: AegisNoHealthyDataPlanes
+          expr: max(aegis_dataplanes_healthy) < {{ .Values.metrics.prometheusRule.minHealthyDataPlanes }}
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Fewer healthy AegisProxy workers report to the control-plane than expected"
+        - alert: AegisExportFailing
+          expr: min by (sink) (aegis_export_sink_healthy) == 0
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Log export destination {{`{{ $labels.sink }}`}} is failing (records are spooled)"
+        - alert: AegisExportDropping
+          expr: increase(aegis_export_records_dropped_total[15m]) > 0
+          labels: { severity: critical }
+          annotations:
+            summary: "Log export dropped records (spool full) for {{`{{ $labels.sink }}`}}: SIEM coverage gap"
+        - alert: AegisLoginFailures
+          expr: sum(increase(aegis_login_total{result="failure"}[10m])) > {{ .Values.metrics.prometheusRule.loginFailures }}
+          labels: { severity: warning }
+          annotations:
+            summary: "Many failed console sign-ins (possible password guessing)"
+        - alert: AegisThreatIntelStale
+          expr: max by (feed) (aegis_threatintel_feed_age_seconds) > {{ .Values.metrics.prometheusRule.feedStaleSeconds }}
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Threat-intelligence feed {{`{{ $labels.feed }}`}} has not been updated"
+{{- end }}

@@ -1,0 +1,839 @@
+package engine
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/netip"
+	"net/url"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"aegisproxy/control-plane/internal/models"
+)
+
+type RedirectGrant struct {
+	ServerIP   string
+	TargetHost string
+	TargetPath string
+	ParentURL  string
+	RuleID     string
+	RuleName   string
+	ExpiresAt  time.Time
+}
+
+type EvaluationRequest struct {
+	ServerIP      string `json:"server_ip"`
+	ProxyAuthUser string `json:"proxy_auth_user"`
+	Method        string `json:"method"`
+	Scheme        string `json:"scheme"`
+	Host          string `json:"host"`
+	Port          int    `json:"port,omitempty"`
+	Path          string `json:"path"`
+	FullURL       string `json:"full_url"`
+	UserAgent     string `json:"user_agent"`
+}
+
+type EvaluationResult struct {
+	Allowed           bool     `json:"allowed"`
+	Verdict           string   `json:"verdict"` // "ALLOWED", "BLOCKED", "LEARNING_ALLOWED", "REDIRECT_OBJECT_ALLOWED", "TLS_BYPASS"
+	TLSBypass         bool     `json:"tls_bypass"`
+	ServerID          string   `json:"server_id"`
+	ServerHostname    string   `json:"server_hostname"`
+	GroupIDs          []string `json:"group_ids"`
+	MatchedRuleID     string   `json:"matched_rule_id,omitempty"`
+	MatchedRuleName   string   `json:"matched_rule_name,omitempty"`
+	FollowRedirects   bool     `json:"follow_redirects"`
+	RedirectParentURL string   `json:"redirect_parent_url,omitempty"`
+	SessionID         string   `json:"session_id,omitempty"`
+	SuggestedHost     string   `json:"suggested_host"`
+	SuggestedPath     string   `json:"suggested_path"`
+	BlockReason       string   `json:"block_reason,omitempty"`
+	ThreatCategory    string   `json:"threat_category,omitempty"`
+	ThreatSource      string   `json:"threat_source,omitempty"`
+	ThreatIndicator   string   `json:"threat_indicator,omitempty"`
+	SecurityFlags     []string `json:"security_flags,omitempty"`
+}
+
+const redirectShardCount = 32
+
+type redirectShard struct {
+	mu     sync.RWMutex
+	grants map[string]RedirectGrant
+}
+
+type CompiledGroupCIDR struct {
+	GroupID string
+	Prefix  netip.Prefix
+	RawCIDR string
+}
+
+type IndexedRule struct {
+	Rule          models.PolicyRule
+	GroupSet      map[string]struct{}
+	AllGroups     bool
+	ServerIDSet   map[string]struct{}
+	AllServers    bool
+	LowerHostPat  string
+	CompanionHost []string
+	CompanionPath []string
+}
+
+// AppliesTo reports whether a rule covers the source. "*" scopes cover sources with at least one
+// group membership ("*" group) or registered servers ("*" server) — never unknown sources, so a
+// catch-all rule cannot open egress for unregistered machines.
+func (ir IndexedRule) AppliesTo(serverID string, groupIDs []string) bool {
+	if ir.AllGroups && len(groupIDs) > 0 {
+		return true
+	}
+	if ir.AllServers && serverID != "" && !strings.HasPrefix(serverID, UnregisteredPrefix) {
+		return true
+	}
+	for _, g := range groupIDs {
+		if _, ok := ir.GroupSet[g]; ok {
+			return true
+		}
+	}
+	if _, ok := ir.ServerIDSet[serverID]; ok {
+		return true
+	}
+	return false
+}
+
+// UnregisteredPrefix marks synthetic server IDs of sources that matched neither a registered server
+// nor a group CIDR.
+const UnregisteredPrefix = "srv-unregistered-"
+
+// CompiledPolicyIndex holds pre-parsed, O(1) lookup structures rebuilt atomically on config changes.
+type CompiledPolicyIndex struct {
+	Revision       uint64
+	ServerByIP     map[string]models.Server
+	ServerByAuth   map[string]models.Server // bare username -> Server (requires IP/subnet binding)
+	ServerByToken  map[string]models.Server // hex SHA-256(token) -> Server
+	StrictGroups   map[string]bool          // groups with StrictIsolation
+	ParsedCIDRs    []CompiledGroupCIDR
+	ExactHostRules map[string][]IndexedRule // exact lowercase hostname -> rules (sorted BLOCK first)
+	WildcardRules  []IndexedRule            // rules with *.domain or * or companion wildcards (sorted BLOCK first)
+}
+
+func sortIndexedRulesBlockFirst(list []IndexedRule) {
+	sort.SliceStable(list, func(i, j int) bool {
+		iBlock := strings.EqualFold(list[i].Rule.Action, "BLOCK")
+		jBlock := strings.EqualFold(list[j].Rule.Action, "BLOCK")
+		return iBlock && !jBlock
+	})
+}
+
+// NormalizeHost strips port numbers and trailing FQDN dots ("github.com." -> "github.com") in lowercase.
+func NormalizeHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if strings.HasPrefix(h, "[") {
+		if end := strings.IndexByte(h, ']'); end != -1 {
+			return h[1:end]
+		}
+	}
+	if idx := strings.IndexByte(h, ':'); idx != -1 {
+		h = h[:idx]
+	}
+	return strings.TrimRight(h, ".")
+}
+
+// HashProxyToken returns the hex SHA-256 digest used to store and look up server proxy tokens.
+func HashProxyToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func BuildCompiledIndex(revision uint64, groups []models.ServerGroup, servers []models.Server, rules []models.PolicyRule) *CompiledPolicyIndex {
+	idx := &CompiledPolicyIndex{
+		Revision:       revision,
+		ServerByIP:     make(map[string]models.Server, len(servers)),
+		ServerByAuth:   make(map[string]models.Server, len(servers)),
+		ServerByToken:  make(map[string]models.Server, len(servers)),
+		StrictGroups:   make(map[string]bool),
+		ParsedCIDRs:    make([]CompiledGroupCIDR, 0, len(groups)*2),
+		ExactHostRules: make(map[string][]IndexedRule, len(rules)),
+		WildcardRules:  make([]IndexedRule, 0, len(rules)/2+1),
+	}
+
+	for _, g := range groups {
+		if g.StrictIsolation {
+			idx.StrictGroups[g.ID] = true
+		}
+		for _, cidr := range g.CIDRs {
+			if pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr)); err == nil {
+				idx.ParsedCIDRs = append(idx.ParsedCIDRs, CompiledGroupCIDR{
+					GroupID: g.ID,
+					Prefix:  pfx.Masked(),
+					RawCIDR: cidr,
+				})
+			}
+		}
+	}
+
+	for _, srv := range servers {
+		cleanIP := strings.TrimSpace(srv.IP)
+		if cleanIP != "" {
+			idx.ServerByIP[cleanIP] = srv
+		}
+		uLower := strings.ToLower(strings.TrimSpace(srv.ProxyAuthUser))
+		if uLower != "" {
+			idx.ServerByAuth[uLower] = srv
+		}
+		if h := strings.ToLower(strings.TrimSpace(srv.ProxyAuthTokenHash)); h != "" {
+			idx.ServerByToken[h] = srv
+		}
+	}
+
+	now := time.Now().UTC()
+	for _, r := range rules {
+		if !r.Enabled {
+			continue
+		}
+		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
+			continue
+		}
+		grpSet := make(map[string]struct{}, len(r.GroupIDs))
+		allGroups := false
+		for _, gid := range r.GroupIDs {
+			if gid == "*" {
+				allGroups = true
+				break
+			}
+			grpSet[gid] = struct{}{}
+		}
+		srvSet := make(map[string]struct{}, len(r.ServerIDs))
+		allServers := false
+		for _, sid := range r.ServerIDs {
+			if sid == "*" {
+				allServers = true
+				break
+			}
+			srvSet[sid] = struct{}{}
+		}
+
+		lowerHost := NormalizeHost(r.HostPattern)
+		compHosts := make([]string, 0, len(r.CompanionRules))
+		compPaths := make([]string, 0, len(r.CompanionRules))
+		hasWildcardCompanion := false
+		for _, comp := range r.CompanionRules {
+			ch, cp := splitCompanionPattern(comp)
+			chLower := NormalizeHost(ch)
+			compHosts = append(compHosts, chLower)
+			compPaths = append(compPaths, cp)
+			if strings.Contains(chLower, "*") {
+				hasWildcardCompanion = true
+			}
+		}
+
+		ir := IndexedRule{
+			Rule:          r,
+			GroupSet:      grpSet,
+			AllGroups:     allGroups,
+			ServerIDSet:   srvSet,
+			AllServers:    allServers,
+			LowerHostPat:  lowerHost,
+			CompanionHost: compHosts,
+			CompanionPath: compPaths,
+		}
+
+		if !strings.Contains(lowerHost, "*") && !hasWildcardCompanion {
+			idx.ExactHostRules[lowerHost] = append(idx.ExactHostRules[lowerHost], ir)
+			for _, ch := range compHosts {
+				if ch != lowerHost {
+					idx.ExactHostRules[ch] = append(idx.ExactHostRules[ch], ir)
+				}
+			}
+		} else {
+			idx.WildcardRules = append(idx.WildcardRules, ir)
+		}
+	}
+
+	for h, list := range idx.ExactHostRules {
+		sortIndexedRulesBlockFirst(list)
+		idx.ExactHostRules[h] = list
+	}
+	sortIndexedRulesBlockFirst(idx.WildcardRules)
+
+	return idx
+}
+
+type PolicyEngine struct {
+	shards [redirectShardCount]redirectShard
+}
+
+func NewPolicyEngine() *PolicyEngine {
+	e := &PolicyEngine{}
+	for i := 0; i < redirectShardCount; i++ {
+		e.shards[i].grants = make(map[string]RedirectGrant, 32)
+	}
+	go e.evictExpiredLoop()
+	return e
+}
+
+func fnv32(key string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func (e *PolicyEngine) evictExpiredLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		for i := 0; i < redirectShardCount; i++ {
+			sh := &e.shards[i]
+			sh.mu.Lock()
+			for k, g := range sh.grants {
+				if now.After(g.ExpiresAt) {
+					delete(sh.grants, k)
+				}
+			}
+			sh.mu.Unlock()
+		}
+	}
+}
+
+// internalSuffixes are DNS suffixes that are never valid redirect / egress targets.
+var internalSuffixes atomic.Pointer[[]string]
+
+func init() {
+	def := []string{".internal.corp", ".local", ".localdomain", ".internal", ".lan", ".home.arpa"}
+	internalSuffixes.Store(&def)
+}
+
+// SetInternalSuffixes configures the internal DNS suffixes (AEGIS_INTERNAL_DOMAINS).
+func SetInternalSuffixes(suffixes []string) {
+	cp := append([]string(nil), suffixes...)
+	internalSuffixes.Store(&cp)
+}
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// IsInternalAddr reports loopback, RFC1918/ULA, link-local (incl. 169.254.169.254 cloud metadata),
+// CGNAT, multicast and unspecified addresses.
+func IsInternalAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() || cgnatPrefix.Contains(addr)
+}
+
+// IsInternalHost reports internal hostnames and addresses (see IsInternalAddr and SetInternalSuffixes).
+func IsInternalHost(host string) bool {
+	h := NormalizeHost(host)
+	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	for _, suf := range *internalSuffixes.Load() {
+		if strings.HasSuffix(h, suf) || h == strings.TrimPrefix(suf, ".") {
+			return true
+		}
+	}
+	if addr, err := netip.ParseAddr(h); err == nil {
+		return IsInternalAddr(addr)
+	}
+	return false
+}
+
+// IsDisallowedRedirectTarget blocks 302 open redirects pointing to RFC1918, loopback, link-local (169.254.169.254), or internal corp hosts.
+func IsDisallowedRedirectTarget(host string) bool {
+	return IsInternalHost(host)
+}
+
+// CanonicalizePath decodes percent-encoded traversal sequences (%2e%2e, %2f), rejects null-bytes, backslash smuggling,
+// or >3x nested percent-encoding, and resolves dot-segments (/microsoft/../torvalds -> /torvalds).
+func CanonicalizePath(rawPath string) (string, bool) {
+	if rawPath == "" {
+		return "/", true
+	}
+	if idx := strings.IndexByte(rawPath, '?'); idx != -1 {
+		rawPath = rawPath[:idx]
+	}
+	if idx := strings.IndexByte(rawPath, '#'); idx != -1 {
+		rawPath = rawPath[:idx]
+	}
+	cur := rawPath
+	for i := 0; i < 3; i++ {
+		if strings.Contains(cur, "\x00") || strings.Contains(cur, "\\") {
+			return "", false
+		}
+		unesc, err := url.PathUnescape(cur)
+		if err != nil {
+			return "", false
+		}
+		if strings.Contains(unesc, "\x00") || strings.Contains(unesc, "\\") {
+			return "", false
+		}
+		if unesc == cur {
+			break
+		}
+		cur = unesc
+	}
+	// Reject 4x+ nested percent-encoding evasion attempts
+	if extra, err := url.PathUnescape(cur); err != nil || extra != cur {
+		return "", false
+	}
+	if !strings.HasPrefix(cur, "/") {
+		cur = "/" + cur
+	}
+	cleaned := path.Clean(cur)
+	if !strings.HasPrefix(cleaned, "/") {
+		cleaned = "/" + cleaned
+	}
+	return cleaned, true
+}
+
+// RegisterRedirectGrant records a temporary object access grant when an allowed URL redirects (301/302/307/308) to a CDN/Object host.
+func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, ruleID, ruleName string) {
+	parsed, err := url.Parse(locationURL)
+	if err != nil || parsed.Host == "" {
+		return
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return
+	}
+	host := NormalizeHost(parsed.Host)
+	if IsDisallowedRedirectTarget(host) {
+		return
+	}
+	cleanPath, ok := CanonicalizePath(parsed.Path)
+	if !ok {
+		return
+	}
+	exp := time.Now().Add(2 * time.Minute)
+	grant := RedirectGrant{
+		ServerIP:   serverIP,
+		TargetHost: host,
+		TargetPath: cleanPath,
+		ParentURL:  parentURL,
+		RuleID:     ruleID,
+		RuleName:   ruleName,
+		ExpiresAt:  exp,
+	}
+	key := fmt.Sprintf("%s|%s|%s", serverIP, host, cleanPath)
+	sh := &e.shards[fnv32(key)%redirectShardCount]
+	sh.mu.Lock()
+	if len(sh.grants) < 1024 {
+		sh.grants[key] = grant
+	}
+	sh.mu.Unlock()
+
+	// Also register a host-level CONNECT pre-flight key so HTTPS tunnel setup to the redirect target succeeds
+	connKey := fmt.Sprintf("%s|%s|CONNECT", serverIP, host)
+	shConn := &e.shards[fnv32(connKey)%redirectShardCount]
+	shConn.mu.Lock()
+	if len(shConn.grants) < 1024 {
+		shConn.grants[connKey] = grant
+	}
+	shConn.mu.Unlock()
+}
+
+func (e *PolicyEngine) CheckRedirectGrant(serverIP, host, rawPath, method string) (RedirectGrant, bool) {
+	upperMethod := strings.ToUpper(strings.TrimSpace(method))
+	// Redirect object grants only permit read-only retrieval (GET/HEAD) and CONNECT tunnel pre-flight, never POST/PUT exfiltration.
+	if upperMethod != "GET" && upperMethod != "HEAD" && upperMethod != "CONNECT" {
+		return RedirectGrant{}, false
+	}
+	host = NormalizeHost(host)
+	if IsDisallowedRedirectTarget(host) {
+		return RedirectGrant{}, false
+	}
+	if upperMethod == "CONNECT" {
+		connKey := fmt.Sprintf("%s|%s|CONNECT", serverIP, host)
+		shConn := &e.shards[fnv32(connKey)%redirectShardCount]
+		shConn.mu.RLock()
+		grant, ok := shConn.grants[connKey]
+		shConn.mu.RUnlock()
+		if ok && time.Now().Before(grant.ExpiresAt) {
+			return grant, true
+		}
+	}
+	cleanPath, ok := CanonicalizePath(rawPath)
+	if !ok {
+		return RedirectGrant{}, false
+	}
+	key := fmt.Sprintf("%s|%s|%s", serverIP, host, cleanPath)
+	sh := &e.shards[fnv32(key)%redirectShardCount]
+	sh.mu.RLock()
+	grant, ok := sh.grants[key]
+	sh.mu.RUnlock()
+	if ok && time.Now().Before(grant.ExpiresAt) {
+		return grant, true
+	}
+	return RedirectGrant{}, false
+}
+
+// MatchHost checks if a request host matches a pattern like "github.com" or "*.ubuntu.com".
+func MatchHost(pattern, host string) bool {
+	pattern = NormalizeHost(pattern)
+	host = NormalizeHost(host)
+	if pattern == "*" || pattern == host {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := pattern[1:] // ".ubuntu.com"
+		root := pattern[2:]   // "ubuntu.com"
+		return host == root || strings.HasSuffix(host, suffix)
+	}
+	return false
+}
+
+// IsDomainWidePathPattern returns true if a PathPattern covers the entire host ("", "*", "/*", "/**").
+func IsDomainWidePathPattern(pattern string) bool {
+	p := strings.TrimSpace(pattern)
+	return p == "" || p == "*" || p == "/*" || p == "/**"
+}
+
+// MatchPath checks boundary-aware path patterns such as "/microsoft/**", "/repos/microsoft/**", or prefix wildcards like "/token**"
+// after canonicalizing dot-segments and percent-encoding.
+func MatchPath(pattern, reqPath string) bool {
+	pattern = strings.TrimSpace(pattern)
+	cleanPath, ok := CanonicalizePath(reqPath)
+	if !ok {
+		return false
+	}
+	if IsDomainWidePathPattern(pattern) {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/**") {
+		rawPrefix := strings.TrimSuffix(pattern, "/**")
+		if rawPrefix == "" {
+			return true
+		}
+		prefix, okP := CanonicalizePath(rawPrefix)
+		if !okP {
+			return false
+		}
+		return cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/")
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		rawPrefix := strings.TrimSuffix(pattern, "/*")
+		if rawPrefix == "" {
+			return true
+		}
+		prefix, okP := CanonicalizePath(rawPrefix)
+		if !okP {
+			return false
+		}
+		return cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/")
+	}
+	// Support mid/suffix wildcards not preceded by slash (e.g. "/github-production-release-asset-**" or "/token**")
+	if strings.HasSuffix(pattern, "**") || strings.HasSuffix(pattern, "*") {
+		rawPrefix := strings.TrimRight(pattern, "*")
+		if rawPrefix == "" || rawPrefix == "/" {
+			return true
+		}
+		if !strings.HasPrefix(rawPrefix, "/") {
+			rawPrefix = "/" + rawPrefix
+		}
+		return strings.HasPrefix(cleanPath, rawPrefix)
+	}
+	cleanPattern, okPat := CanonicalizePath(pattern)
+	if !okPat {
+		return false
+	}
+	return cleanPath == cleanPattern
+}
+
+func MatchMethod(methods []string, reqMethod string) bool {
+	if len(methods) == 0 {
+		return true
+	}
+	reqMethod = strings.ToUpper(reqMethod)
+	if reqMethod == "CONNECT" {
+		// CONNECT pre-flight check is allowed if any method is allowed on the host
+		return true
+	}
+	for _, m := range methods {
+		if m == "*" || strings.EqualFold(m, reqMethod) {
+			return true
+		}
+	}
+	return false
+}
+
+func MatchRule(rule models.PolicyRule, host, path, method string) bool {
+	if !rule.Enabled {
+		return false
+	}
+	if rule.ExpiresAt != nil && time.Now().After(*rule.ExpiresAt) {
+		return false
+	}
+	if !MatchMethod(rule.Methods, method) {
+		return false
+	}
+	// For HTTP CONNECT tunnel initiation, path is empty or host:port.
+	// Allow CONNECT for ALLOW rules if the host matches so mitmproxy can inspect the inner HTTPS path.
+	// For BLOCK rules, only block at the CONNECT stage if the BLOCK rule is domain-wide ("/**", "/*", "*");
+	// path-specific BLOCK rules (e.g. "github.com/torvalds/**") must NOT block CONNECT to github.com:443!
+	if strings.EqualFold(method, "CONNECT") {
+		if strings.EqualFold(rule.Action, "BLOCK") {
+			if MatchHost(rule.HostPattern, host) && IsDomainWidePathPattern(rule.PathPattern) {
+				return true
+			}
+			for _, comp := range rule.CompanionRules {
+				compHost, compPath := splitCompanionPattern(comp)
+				if MatchHost(compHost, host) && IsDomainWidePathPattern(compPath) {
+					return true
+				}
+			}
+			return false
+		}
+		if MatchHost(rule.HostPattern, host) {
+			return true
+		}
+		for _, comp := range rule.CompanionRules {
+			compHost, _ := splitCompanionPattern(comp)
+			if MatchHost(compHost, host) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if MatchHost(rule.HostPattern, host) && MatchPath(rule.PathPattern, path) {
+		return true
+	}
+
+	// Check companion patterns (e.g., "codeload.github.com/microsoft/**")
+	for _, comp := range rule.CompanionRules {
+		compHost, compPath := splitCompanionPattern(comp)
+		if MatchHost(compHost, host) && MatchPath(compPath, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitCompanionPattern(comp string) (string, string) {
+	comp = strings.TrimSpace(comp)
+	idx := strings.IndexByte(comp, '/')
+	if idx == -1 {
+		return comp, "/**"
+	}
+	return comp[:idx], comp[idx:]
+}
+
+func MatchCIDR(cidrStr, ipStr string) bool {
+	prefix, err := netip.ParsePrefix(cidrStr)
+	if err != nil {
+		return cidrStr == ipStr
+	}
+	addr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return false
+	}
+	return prefix.Contains(addr)
+}
+
+// SuggestRulePattern derives a smart host & path pattern from a raw URL.
+func SuggestRulePattern(host, path string) (string, string, bool) {
+	host = NormalizeHost(host)
+	if idx := strings.IndexByte(path, '?'); idx != -1 {
+		path = path[:idx]
+	}
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if host == "github.com" || host == "codeload.github.com" {
+		if len(segments) >= 1 && segments[0] != "" {
+			return "github.com", "/" + segments[0] + "/**", true
+		}
+	}
+	if len(segments) >= 2 && segments[0] != "" {
+		return host, "/" + segments[0] + "/" + segments[1] + "/**", true
+	}
+	if len(segments) == 1 && segments[0] != "" {
+		return host, "/" + segments[0] + "/**", false
+	}
+	return host, "/**", false
+}
+
+// CompileSessionRules analyzes captured traffic flows from a Learning Session and automatically synthesizes generalized whitelist rules.
+func CompileSessionRules(flows []models.TrafficFlow) []models.CompiledRuleCandidate {
+	type bucket struct {
+		host            string
+		pathPattern     string
+		methods         map[string]bool
+		sampleURLs      []string
+		redirectTargets map[string]bool
+		followRedirects bool
+		companionMap    map[string]bool
+		hitCount        int
+		isRedirectChild bool
+	}
+
+	buckets := make(map[string]*bucket)
+	redirectedTargetHosts := make(map[string]string) // targetHost -> parentKey
+
+	// First pass: detect redirect relationships
+	for _, f := range flows {
+		if strings.EqualFold(f.Method, "CONNECT") {
+			continue
+		}
+		if f.RedirectLocation != "" {
+			if u, err := url.Parse(f.RedirectLocation); err == nil && u.Host != "" {
+				hPat, pPat, _ := generalizeFlow(f.Host, f.Path)
+				parentKey := hPat + "|" + pPat
+				redirectedTargetHosts[strings.ToLower(u.Host)] = parentKey
+			}
+		}
+		if f.RedirectParentURL != "" {
+			if u, err := url.Parse(f.RedirectParentURL); err == nil && u.Host != "" {
+				hPat, pPat, _ := generalizeFlow(u.Host, u.Path)
+				parentKey := hPat + "|" + pPat
+				redirectedTargetHosts[strings.ToLower(f.Host)] = parentKey
+			}
+		}
+	}
+
+	for _, f := range flows {
+		if strings.EqualFold(f.Method, "CONNECT") {
+			continue
+		}
+		hostPat, pathPat, companions := generalizeFlow(f.Host, f.Path)
+		key := hostPat + "|" + pathPat
+
+		// Check if this host is an ephemeral CDN/Object child of a parent rule
+		isChild := false
+		if parentKey, ok := redirectedTargetHosts[strings.ToLower(f.Host)]; ok && parentKey != key {
+			isChild = true
+			if pb, exists := buckets[parentKey]; exists {
+				pb.followRedirects = true
+				pb.redirectTargets[f.Host] = true
+			}
+		}
+
+		b, exists := buckets[key]
+		if !exists {
+			b = &bucket{
+				host:            hostPat,
+				pathPattern:     pathPat,
+				methods:         make(map[string]bool),
+				redirectTargets: make(map[string]bool),
+				companionMap:    make(map[string]bool),
+				isRedirectChild: isChild,
+			}
+			buckets[key] = b
+		}
+		b.hitCount++
+		b.methods[strings.ToUpper(f.Method)] = true
+		if len(b.sampleURLs) < 4 {
+			already := false
+			for _, s := range b.sampleURLs {
+				if s == f.FullURL {
+					already = true
+					break
+				}
+			}
+			if !already {
+				b.sampleURLs = append(b.sampleURLs, f.FullURL)
+			}
+		}
+		for _, c := range companions {
+			b.companionMap[c] = true
+		}
+		if f.RedirectLocation != "" {
+			b.followRedirects = true
+			if u, err := url.Parse(f.RedirectLocation); err == nil && u.Host != "" {
+				b.redirectTargets[strings.ToLower(u.Host)] = true
+			}
+		}
+	}
+
+	candidates := make([]models.CompiledRuleCandidate, 0, len(buckets))
+	idx := 1
+	for _, b := range buckets {
+		methods := make([]string, 0, len(b.methods))
+		for m := range b.methods {
+			methods = append(methods, m)
+		}
+		sort.Strings(methods)
+
+		companions := make([]string, 0, len(b.companionMap))
+		for c := range b.companionMap {
+			companions = append(companions, c)
+		}
+		sort.Strings(companions)
+
+		redirs := make([]string, 0, len(b.redirectTargets))
+		for r := range b.redirectTargets {
+			redirs = append(redirs, r)
+		}
+		sort.Strings(redirs)
+
+		// Auto-enable FollowRedirects for GitHub / S3 / Package CDNs
+		follow := b.followRedirects || b.host == "github.com" || b.host == "pypi.org" || strings.Contains(b.host, "docker.io")
+
+		candidates = append(candidates, models.CompiledRuleCandidate{
+			ID:              fmt.Sprintf("cand-%d", idx),
+			HostPattern:     b.host,
+			PathPattern:     b.pathPattern,
+			Methods:         methods,
+			FollowRedirects: follow,
+			CompanionRules:  companions,
+			SampleURLs:      b.sampleURLs,
+			RedirectTargets: redirs,
+			HitCount:        b.hitCount,
+			IsRedirectChild: b.isRedirectChild,
+			Selected:        !b.isRedirectChild, // By default select primary rules; redirect children are covered by FollowRedirects!
+		})
+		idx++
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].IsRedirectChild != candidates[j].IsRedirectChild {
+			return !candidates[i].IsRedirectChild
+		}
+		return candidates[i].HitCount > candidates[j].HitCount
+	})
+
+	return candidates
+}
+
+func generalizeFlow(host, path string) (string, string, []string) {
+	host = strings.ToLower(strings.Split(host, ":")[0])
+	if idx := strings.IndexByte(path, '?'); idx != -1 {
+		path = path[:idx]
+	}
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+
+	// GitHub special intelligence: group by org (e.g. github.com/microsoft/**) + attach codeload & api companions
+	if host == "github.com" || host == "codeload.github.com" {
+		if len(segments) >= 1 && segments[0] != "" {
+			org := segments[0]
+			companions := []string{
+				fmt.Sprintf("codeload.github.com/%s/**", org),
+				fmt.Sprintf("api.github.com/repos/%s/**", org),
+				fmt.Sprintf("raw.githubusercontent.com/%s/**", org),
+			}
+			return "github.com", fmt.Sprintf("/%s/**", org), companions
+		}
+	}
+
+	if host == "api.github.com" && len(segments) >= 2 && segments[0] == "repos" {
+		org := segments[1]
+		return "github.com", fmt.Sprintf("/%s/**", org), []string{
+			fmt.Sprintf("codeload.github.com/%s/**", org),
+			fmt.Sprintf("api.github.com/repos/%s/**", org),
+		}
+	}
+
+	if host == "objects.githubusercontent.com" || host == "release-assets.githubusercontent.com" {
+		return host, "/github-production-release-asset-**", nil
+	}
+
+	if strings.HasSuffix(host, ".ubuntu.com") {
+		return "*.ubuntu.com", "/ubuntu/**", nil
+	}
+
+	if len(segments) >= 2 && segments[0] != "" {
+		return host, fmt.Sprintf("/%s/**", segments[0]), nil
+	}
+	return host, "/**", nil
+}

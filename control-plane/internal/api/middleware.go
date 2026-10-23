@@ -1,0 +1,247 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"net"
+	"net/http"
+	"net/netip"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func newRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func validRequestID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// middleware wires request IDs, panic recovery, access logging, metrics, security headers,
+// CORS and body size limits around every handler.
+func (s *Server) middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		reqID := r.Header.Get("X-Request-ID")
+		if !validRequestID(reqID) {
+			reqID = newRequestID()
+		}
+		rec := &statusRecorder{ResponseWriter: w}
+		h := rec.Header()
+		h.Set("X-Request-ID", reqID)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+		if s.cfg.TLSCertFile != "" || strings.HasPrefix(s.cfg.PublicURL, "https://") {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
+		if isAPI {
+			h.Set("Cache-Control", "no-store")
+			h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		}
+
+		defer func() {
+			if p := recover(); p != nil {
+				s.log.Error("panic in handler", "panic", p, "path", r.URL.Path, "request_id", reqID, "stack", string(debug.Stack()))
+				if rec.status == 0 {
+					writeError(rec, http.StatusInternalServerError, "internal server error")
+				}
+			}
+			status := rec.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			dur := time.Since(start)
+			s.metrics.ObserveHTTP(r.Method, routeLabel(r), status, dur)
+			if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics" {
+				s.log.Info("http request", "request_id", reqID, "method", r.Method, "path", r.URL.Path,
+					"status", status, "bytes", rec.bytes, "duration_ms", dur.Milliseconds(), "client_ip", s.clientIP(r))
+			}
+		}()
+
+		if isAPI && !s.applyCORS(rec, r) {
+			return
+		}
+		limit := int64(1 << 20)
+		if strings.HasPrefix(r.URL.Path, "/api/dataplane/") || strings.HasPrefix(r.URL.Path, "/api/security/indicators") {
+			limit = 16 << 20
+		} else if strings.HasPrefix(r.URL.Path, scimPrefix+"/") {
+			limit = 8 << 20 // SCIM group documents with many members
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(rec, r.Body, limit)
+		}
+		next.ServeHTTP(rec, r)
+	})
+}
+
+func routeLabel(r *http.Request) string {
+	if r.Pattern != "" {
+		if _, p, ok := strings.Cut(r.Pattern, " "); ok {
+			return p
+		}
+		return r.Pattern
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		return "unmatched"
+	}
+	return "/ui"
+}
+
+// applyCORS allows credentialed cross-origin access only for explicitly configured origins.
+// The public access-request endpoint is additionally reachable from any origin without
+// credentials (the block page is served on the blocked site's origin).
+func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	h := w.Header()
+	h.Add("Vary", "Origin")
+	if r.URL.Path == "/api/public/requests" || strings.HasPrefix(r.URL.Path, "/api/public/ca/") {
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type")
+		h.Set("Access-Control-Max-Age", "600")
+		return true
+	}
+	if slices.Contains(s.cfg.CORSOrigins, origin) {
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, If-None-Match, X-Requested-With, X-Request-ID")
+		h.Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return false
+		}
+	}
+	return true
+}
+
+// clientIP returns the TCP peer, or the right-most untrusted X-Forwarded-For hop when the peer
+// is a configured trusted reverse proxy.
+func (s *Server) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	peer, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	peer = peer.Unmap()
+	if !s.isTrustedProxy(peer) {
+		return peer.String()
+	}
+	xff := r.Header.Values("X-Forwarded-For")
+	hops := strings.Split(strings.Join(xff, ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		a = a.Unmap()
+		if !s.isTrustedProxy(a) {
+			return a.String()
+		}
+	}
+	return peer.String()
+}
+
+func (s *Server) isTrustedProxy(a netip.Addr) bool {
+	for _, p := range s.cfg.TrustedProxies {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// rateLimiter is a fixed-window per-key limiter with bounded memory.
+type rateLimiter struct {
+	mu     sync.Mutex
+	limit  int
+	window time.Duration
+	hits   map[string]*rlEntry
+}
+
+type rlEntry struct {
+	start time.Time
+	count int
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{limit: limit, window: window, hits: make(map[string]*rlEntry)}
+}
+
+func (l *rateLimiter) Allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.hits) > 20_000 {
+		for k, e := range l.hits {
+			if now.Sub(e.start) > l.window {
+				delete(l.hits, k)
+			}
+		}
+	}
+	e := l.hits[key]
+	if e == nil || now.Sub(e.start) > l.window {
+		l.hits[key] = &rlEntry{start: now, count: 1}
+		return true
+	}
+	if e.count >= l.limit {
+		return false
+	}
+	e.count++
+	return true
+}

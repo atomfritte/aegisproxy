@@ -1,0 +1,268 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  control-plane:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: aegis, POSTGRES_PASSWORD: aegis, POSTGRES_DB: aegis }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aegis" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
+      - run: test -z "$(gofmt -l control-plane)" || (gofmt -l control-plane; exit 1)
+      - run: go -C control-plane vet ./...
+      - run: go -C control-plane test -race -count=1 ./...
+        env:
+          AEGIS_TEST_DATABASE_URL: postgres://aegis:aegis@localhost:5432/aegis?sslmode=disable
+      - run: GOOS=windows GOARCH=amd64 go -C control-plane build -o /dev/null .
+      - name: govulncheck (fails on reachable vulnerabilities)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -C control-plane ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 -checks inherit,-ST1003,-ST1005 ./...
+        working-directory: control-plane
+
+  data-plane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with: { python-version: "3.14" }
+      - run: "python -m pip install --only-binary=:all: -r data-plane/requirements-extra.txt"
+      - run: python -I data-plane/tests/test_dataplane.py
+      - name: pip-audit (installed data-plane environment incl. security overrides)
+        run: |
+          python -m venv /tmp/dp
+          /tmp/dp/bin/pip install -q --upgrade pip
+          /tmp/dp/bin/pip install -q --only-binary=:all: -r data-plane/requirements.txt -r data-plane/requirements-extra.txt
+          /tmp/dp/bin/pip install -q --only-binary=:all: --no-deps -r data-plane/requirements-security.txt
+          python -m pip install pip-audit && pip-audit --path /tmp/dp/lib/python3*/site-packages
+      - name: cross-language block token
+        run: |
+          TOK=$(python -I -c "import sys; sys.path.insert(0,'data-plane'); from aegis_dp.controlplane import sign_block_token; print(sign_block_token('k'*40, {'ip':'10.1.0.5','url':'https://x.example/ü','m':'GET','tid':'t'}))")
+          echo "AEGIS_XLANG_BLOCK_TOKEN=$TOK" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
+      - run: go -C control-plane test -run TestCrossLanguageBlockToken -v ./internal/auth/
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24, cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - run: npm --prefix frontend ci --no-fund
+      - run: npm --prefix frontend audit --omit=dev --audit-level=high
+      - run: npm --prefix frontend run build
+
+  deploy-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - name: helm lint + kubeconform
+        run: |
+          helm lint deploy/helm/aegisproxy --set storage.postgres.url=postgres://u:p@db/aegis
+          helm template t deploy/helm/aegisproxy --set storage.postgres.cnpg.enabled=true --set console.enabled=true > rendered.yaml
+          docker run --rm -v "$PWD":/w ghcr.io/yannh/kubeconform:latest -strict -summary -ignore-missing-schemas /w/rendered.yaml
+      - name: bicep build
+        run: |
+          curl -sSLo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64 && chmod +x bicep
+          ./bicep build deploy/sentinel/aegisproxy-sentinel.bicep --stdout > /dev/null
+      # Syntax, PSScriptAnalyzer (incl. PS 5.1 compatibility) and the Pester suite, which runs the unchanged
+      # installers against an in-memory Windows (deploy/windows/tests/FakeWindows.ps1).
+      - name: Windows installers (PSScriptAnalyzer + Pester)
+        shell: pwsh
+        run: ./deploy/windows/tests/Invoke-InstallerTests.ps1 -OutputDir test-results
+      - run: bash -n deploy/systemd/install-linux.sh scripts/gen-secrets.sh
+
+  # Both Windows installers on real Windows Server runners: services, virtual service accounts, ACLs,
+  # CA roll-out script, proxying through the data-plane service, uninstall.
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: installer unit tests (Pester, fake system - touches nothing on the runner)
+        run: ./deploy/windows/tests/Invoke-InstallerTests.ps1 -OutputDir test-results
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
+      - name: Go tests on Windows (file sharing semantics, paths, service code)
+        run: go -C control-plane test -count=1 ./...
+      - name: Python for all users (services cannot use per-user installations)
+        run: |
+          choco install python312 -y --no-progress --params '"/InstallDir:C:\Python312"'
+          & C:\Python312\python.exe --version
+      - name: data-plane unit tests on Windows CPython
+        run: |
+          & C:\Python312\python.exe -m venv "$env:RUNNER_TEMP\dp-venv"
+          $py = "$env:RUNNER_TEMP\dp-venv\Scripts\python.exe"
+          & $py -m pip install --disable-pip-version-check mitmproxy==12.3.0 yara-x==1.22.0
+          & $py -m pip install --disable-pip-version-check --no-deps -r data-plane/requirements-security.txt
+          & $py -m unittest discover -s data-plane/tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'data-plane unit tests failed' }
+      - name: build the Windows control-plane
+        run: |
+          $env:CGO_ENABLED = '0'
+          go -C control-plane build -trimpath -ldflags "-X main.Version=ci" -o ..\deploy\windows\aegis-control-plane.exe .
+      - name: WinSW 2.12.0 (pinned SHA-256)
+        run: |
+          Invoke-WebRequest -UseBasicParsing https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe -OutFile "$env:RUNNER_TEMP\WinSW-x64.exe"
+          $h = (Get-FileHash "$env:RUNNER_TEMP\WinSW-x64.exe" -Algorithm SHA256).Hash
+          if ($h -ne '05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA') { throw "WinSW hash mismatch: $h" }
+      - name: install the control-plane service
+        run: |
+          $pw = ConvertTo-SecureString 'Ci-Windows-Root-Pass-2026' -AsPlainText -Force
+          # 1 MB audit rotation so that the end-to-end step exercises the built-in rotation on NTFS.
+          ./deploy/windows/Install-AegisControlPlane.ps1 -PublicUrl http://127.0.0.1:8081 -ProxyAddress 127.0.0.1:8080 -BootstrapAdminPassword $pw -SkipFirewall `
+            -ExtraEnvironment @{ AEGIS_AUDIT_ROTATE_MB = '1' }
+          Get-Service AegisControlPlane | Format-List Name, Status, StartType
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/readyz).StatusCode
+          $image = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\AegisControlPlane').ImagePath
+          if ($image -notmatch '^".+\\aegis-control-plane\.exe" service$') { throw "unexpected ImagePath: $image" }
+          $src = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\AegisControlPlane'
+          if ($src.EventMessageFile -notlike '*\System32\EventCreate.exe' -or $src.TypesSupported -ne 7) { throw 'event log source AegisControlPlane not registered' }
+          if (-not [System.Diagnostics.EventLog]::SourceExists('AegisControlPlane')) { throw 'event log source AegisControlPlane unknown to the event log' }
+      - name: install the data-plane service
+        run: |
+          $root = Join-Path $env:ProgramData 'AegisProxy'
+          ./deploy/windows/Install-AegisDataPlane.ps1 -ControlPlaneUrl http://127.0.0.1:8081 -DataPlaneKeyFile "$root\secrets\dataplane.key" `
+            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe C:\Python312\python.exe -SkipFirewall
+          Get-Service AegisDataPlane | Format-List Name, Status, StartType
+      - name: end to end through the Windows services
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Trust the enterprise CA with the product's own roll-out script (fingerprint-pinned download).
+          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/api/public/ca/install-windows.ps1 | Select-Object -ExpandProperty Content | Invoke-Expression
+          $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $h = @{ 'X-Requested-With' = 'aegis-ui' }
+          Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/auth/login -WebSession $s -Headers $h -ContentType application/json -Body '{"username":"admin","password":"Ci-Windows-Root-Pass-2026"}' | Out-Null
+          Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/groups -WebSession $s -Headers $h -ContentType application/json -Body '{"id":"grp-ci","name":"CI","cidrs":["127.0.0.0/8"]}' | Out-Null
+          Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/servers -WebSession $s -Headers $h -ContentType application/json -Body '{"id":"srv-ci","hostname":"runner","ip":"127.0.0.1","group_ids":["grp-ci"]}' | Out-Null
+          $set = Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/policy-sets -WebSession $s -Headers $h -ContentType application/json -Body '{"kind":"standard","spec":{"name":"CI egress","enabled":true,"group_ids":["grp-ci"],"rules":[{"name":"example","action":"ALLOW","host_pattern":"example.com","path_pattern":"/**","methods":["GET"],"enabled":true}]}}'
+          Invoke-RestMethod -Method Post "http://127.0.0.1:8081/api/policy-sets/$($set.id)/publish" -WebSession $s -Headers $h -ContentType application/json -Body '{"comment":"ci"}' | Out-Null
+          Start-Sleep -Seconds 15
+          $allowed = & curl.exe -s -o NUL -w '%{http_code}' --ssl-no-revoke --proxy http://127.0.0.1:8080 https://example.com/
+          $denied  = & curl.exe -s -o NUL -w '%{http_code}' --ssl-no-revoke --proxy http://127.0.0.1:8080 https://www.wikipedia.org/
+          Write-Host "allowed=$allowed denied=$denied"
+          if ($allowed -ne '200') { throw "allowed destination returned $allowed" }
+          if ($denied -notmatch '403|000') { throw "default deny returned $denied" }
+          Start-Sleep -Seconds 10   # telemetry batches are flushed every few seconds
+          $state = Invoke-RestMethod http://127.0.0.1:8081/api/state -WebSession $s -Headers $h
+          if (-not ($state.data_planes | Where-Object healthy)) { throw 'data-plane service does not report' }
+          if (-not ($state.flows | Where-Object { $_.host -eq 'example.com' -and $_.verdict -eq 'ALLOWED' })) { throw 'flow not recorded' }
+          # Built-in audit rotation: Windows cannot rename the open file from outside, the service rotates it itself.
+          $cidrs = (0..119 | ForEach-Object { "10.$([math]::Floor($_ / 256)).$($_ % 256).0/24" })
+          $data = Join-Path $env:ProgramData 'AegisProxy\data'
+          for ($i = 0; $i -lt 4000 -and -not (Get-ChildItem $data -Filter 'audit.jsonl-*.gz' -ErrorAction SilentlyContinue); $i++) {
+            $body = @{ id = 'grp-rot'; name = "rotation $i"; cidrs = @($cidrs[($i % 7)..119] + $cidrs[0..($i % 7)]) } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/groups -WebSession $s -Headers $h -ContentType application/json -Body $body | Out-Null
+            if ($i % 40 -eq 39) { Start-Sleep -Milliseconds 1100 }   # generation names have second precision
+          }
+          Get-ChildItem $data -Filter 'audit.jsonl*' | Format-Table Name, Length
+          if (-not (Get-ChildItem $data -Filter 'audit.jsonl-*.gz')) { throw 'audit log was not rotated and compressed' }
+          $verify = Invoke-RestMethod http://127.0.0.1:8081/api/audit/verify -WebSession $s -Headers $h
+          Write-Host "audit verify: valid=$($verify.valid) events=$($verify.events_checked)"
+          if (-not $verify.valid -or $verify.events_checked -lt $i) { throw "audit chain across rotated generations: $($verify | ConvertTo-Json -Compress)" }
+      - name: a configuration error is reported in the Application event log
+        run: |
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\AegisControlPlane'
+          $saved = (Get-ItemProperty $key).Environment
+          Stop-Service AegisControlPlane
+          Set-ItemProperty $key -Name Environment -Value ([string[]](@($saved | Where-Object { $_ -notlike 'AEGIS_AUDIT_ROTATE_MB=*' }) + 'AEGIS_AUDIT_ROTATE_MB=-1')) -Type MultiString
+          $since = Get-Date
+          Start-Service AegisControlPlane -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+          $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'AegisControlPlane'; Id = 1; StartTime = $since } -ErrorAction SilentlyContinue | Select-Object -First 1
+          Set-ItemProperty $key -Name Environment -Value ([string[]]$saved) -Type MultiString
+          Start-Service AegisControlPlane
+          if (-not $ev -or $ev.Message -notmatch 'AEGIS_AUDIT_ROTATE_MB') { throw "no event log entry with the configuration error: $($ev.Message)" }
+          Write-Host "event log: $($ev.Message)"
+      - name: uninstall
+        if: always()
+        run: |
+          ./deploy/windows/Install-AegisDataPlane.ps1 -Uninstall -Confirm:$false
+          ./deploy/windows/Install-AegisControlPlane.ps1 -Uninstall -Confirm:$false
+          if (Get-Service AegisDataPlane, AegisControlPlane -ErrorAction SilentlyContinue) { throw 'services still installed' }
+          if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\AegisControlPlane') { throw 'event log source still registered' }
+      - name: logs
+        if: failure()
+        run: Get-ChildItem -Recurse "$env:ProgramData\AegisProxy" -Include *.log -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $_"; Get-Content -Tail 80 $_ }
+
+  # Helm chart on Kubernetes with NetworkPolicies enforced (kind + Cilium + CloudNativePG).
+  kubernetes:
+    runs-on: ubuntu-latest
+    needs: [control-plane, data-plane, frontend]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - name: kind v0.33.0 (pinned SHA-256)
+        run: |
+          curl -sSLo /usr/local/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  /usr/local/bin/kind" | sha256sum -c -
+          chmod +x /usr/local/bin/kind
+      - run: make images VERSION=2.1.0
+      - name: cluster with Cilium and CloudNativePG
+        run: |
+          kind create cluster --config deploy/helm/ci/kind-cilium.yaml --wait 0s
+          helm repo add cilium https://helm.cilium.io
+          helm install cilium cilium/cilium --version 1.20.3 -n kube-system --set kubeProxyReplacement=true \
+            --set k8sServiceHost=aegis-control-plane --set k8sServicePort=6443 --set ipam.mode=kubernetes \
+            --set operator.replicas=1 --set hubble.enabled=false
+          kubectl -n kube-system rollout status ds/cilium --timeout=600s
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.1.yaml
+          kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=600s
+          for i in control-plane data-plane console; do kind load docker-image "aegisproxy/$i:2.1.0" --name aegis; done
+      - name: install the chart (policies enforced, exec probes)
+        run: |
+          kubectl create namespace aegis
+          helm install aegis deploy/helm/aegisproxy -n aegis -f deploy/helm/ci/values-ci.yaml --wait --timeout 20m
+          kubectl -n aegis get pods -o wide
+      - name: NetworkPolicy connectivity matrix
+        run: scripts/verify-networkpolicies.sh aegis aegis-aegisproxy
+      - name: diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl -n aegis describe pods | tail -200
+          kubectl -n aegis logs -l app.kubernetes.io/component=control-plane --tail=100 || true
+
+  images:
+    runs-on: ubuntu-latest
+    needs: [control-plane, data-plane, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: make images VERSION=${{ github.sha }}
+      - name: vulnerability scan (fails on fixable critical/high)
+        # Trivy CLI image pinned by digest (no third-party action in the pipeline).
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+        run: |
+          for img in control-plane control-plane-api data-plane console; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+              image --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "aegisproxy/$img:${{ github.sha }}"
+          done
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: aegisproxy/control-plane:${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom-control-plane.spdx.json

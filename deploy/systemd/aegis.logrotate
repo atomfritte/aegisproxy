@@ -1,0 +1,52 @@
+# /etc/logrotate.d/aegis - installed by install-linux.sh
+#
+# Application logs of both services go to the systemd journal by default
+# (journalctl -u aegis-control-plane -u aegis-dataplane); retention is governed by journald.conf
+# (SystemMaxUse=, MaxRetentionSec=) and forwarding by your log shipper. Nothing to rotate there.
+#
+# The audit trail is rotated by renaming: the control-plane notices the rename and reopens the file on
+# the next event (nothing is lost). GET /api/audit/export includes the rotated generations
+# (audit.jsonl-YYYYMMDD[.gz]) in the same directory, so keep them for your retention period.
+# The optional application log file is not reopened and therefore uses "copytruncate".
+
+# Append-only audit trail (AEGIS_AUDIT_LOG). Low volume, long retention for compliance.
+/var/lib/aegis/data/audit.jsonl {
+    su aegis aegis
+    monthly
+    rotate 24
+    dateext
+    dateformat -%Y%m%d
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+}
+
+# Only used when AEGIS_LOG_FILE=/var/log/aegis/control-plane.log is set (default: journald).
+/var/log/aegis/*.log {
+    su aegis aegis
+    daily
+    rotate 14
+    maxsize 200M
+    dateext
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+
+# Data-plane access log (AEGIS_ACCESS_LOG=/var/log/aegis-dataplane/access.log). The worker reopens the file
+# after rotation (WatchedFileHandler), so no copytruncate is needed.
+/var/log/aegis-dataplane/*.log {
+    su aegis-dp aegis-dp
+    daily
+    rotate 30
+    maxsize 1G
+    dateext
+    compress
+    delaycompress
+    missingok
+    notifempty
+}

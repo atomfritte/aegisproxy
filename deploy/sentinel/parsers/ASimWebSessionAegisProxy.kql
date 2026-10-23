@@ -1,0 +1,45 @@
+// ASIM WebSession parser for AegisProxy (schema 0.2.6).
+// Save as a workspace function named "ASimWebSessionAegisProxy" with the parameter (disabled:bool=false)
+// and add it to the _ASim_WebSession / _Im_WebSession custom parser lists to make AegisProxy traffic
+// visible to all built-in ASIM WebSession analytics rules, hunting queries and workbooks.
+let Parser = (disabled: bool = false) {
+    AegisProxy_CL
+    | where not(disabled) and Stream == "traffic"
+    | extend D = Data
+    | extend
+        EventCount = int(1),
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated,
+        EventType = "HTTPsession",
+        EventResult = iff(Outcome == "success", "Success", "Failure"),
+        EventResultDetails = tostring(StatusCode),
+        EventSeverity = case(Severity == "medium", "Medium", Severity == "low", "Low", "Informational"),
+        EventOriginalUid = EventId,
+        EventProduct = "AegisProxy",
+        EventVendor = "AegisProxy",
+        EventSchema = "WebSession",
+        EventSchemaVersion = "0.2.6",
+        Dvc = Node,
+        DvcAction = iff(Outcome == "success", "Allow", "Deny"),
+        DvcOriginalAction = tostring(D.verdict),
+        SrcIpAddr = ServerIP,
+        SrcHostname = ServerName,
+        DstHostname = Destination,
+        DstIpAddr = tostring(D.resolved_ip),
+        DstPortNumber = toint(D.port),
+        UrlOriginal = Url,
+        HttpRequestMethod = Method,
+        HttpStatusCode = tostring(StatusCode),
+        HttpUserAgent = tostring(D.user_agent),
+        HttpContentType = tostring(D.content_type),
+        SrcBytes = tolong(D.bytes_sent),
+        DstBytes = tolong(D.bytes_received),
+        NetworkApplicationProtocol = toupper(tostring(D.scheme)),
+        ThreatName = coalesce(tostring(D.av_signature), ThreatIndicator),
+        ThreatCategory = tostring(D.threat_category),
+        FileSHA256 = tostring(D.content_sha256)
+    | extend Dst = DstHostname, Src = SrcIpAddr, IpAddr = SrcIpAddr, UserAgent = HttpUserAgent, Rule = RuleName,
+        Hostname = SrcHostname, Duration = toint(D.latency_ms)
+    | project-away D, Data
+};
+Parser(disabled = disabled)

@@ -1,0 +1,22 @@
+# Helm values for the CI Kubernetes test (kind + Cilium + CloudNativePG), NetworkPolicies enforced.
+publicUrl: http://127.0.0.1:38081
+secrets:
+  bootstrapAdminPassword: Ci-Kind-Root-Pass-2026
+storage:
+  postgres:
+    cnpg: { enabled: true, instances: 2, storageSize: 1Gi }
+controlPlane:
+  replicas: 2
+  resources: { requests: { cpu: 50m, memory: 128Mi } }
+console:
+  enabled: true
+dataPlane:
+  replicas: 2
+  resources: { requests: { cpu: 50m, memory: 256Mi } }
+  service: { type: NodePort, nodePort: 30080 }
+clamav:
+  replicas: 1
+networkPolicy:
+  enabled: true
+probes:
+  mode: exec

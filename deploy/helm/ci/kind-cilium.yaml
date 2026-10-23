@@ -1,0 +1,11 @@
+# kind cluster for the CI NetworkPolicy test: Cilium (eBPF, policy enforcement) instead of kindnet.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: aegis
+networking:
+  disableDefaultCNI: true
+  kubeProxyMode: "none"
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - { containerPort: 30080, hostPort: 38080, listenAddress: "127.0.0.1" }

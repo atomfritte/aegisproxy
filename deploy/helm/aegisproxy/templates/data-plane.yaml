@@ -1,0 +1,167 @@
+{{- $dp := .Values.dataPlane }}
+{{- $sel := dict "root" . "component" "data-plane" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aegis.fullname" . }}-data-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+spec:
+  {{- if not $dp.autoscaling.enabled }}
+  replicas: {{ $dp.replicas }}
+  {{- end }}
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aegis.selector" $sel | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with $dp.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "aegis.imagePullSecrets" . | nindent 6 }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "aegis.selector" $sel | nindent 14 }}
+      containers:
+        - name: data-plane
+          image: {{ include "aegis.image" (dict "root" . "image" $dp.image) }}
+          imagePullPolicy: {{ $dp.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - { name: proxy, containerPort: 8080, protocol: TCP }
+            - { name: ops, containerPort: 9091, protocol: TCP }
+          env:
+            - { name: CONTROL_PLANE_URL, value: {{ printf "http://%s:%v" (include "aegis.cpService" .) .Values.controlPlane.service.port | quote }} }
+            - { name: AEGIS_PUBLIC_URL, value: {{ .Values.publicUrl | quote }} }
+            - { name: DASHBOARD_URL, value: {{ .Values.dashboardUrl | default .Values.publicUrl | quote }} }
+            - { name: AEGIS_FAIL_MODE, value: {{ $dp.failMode | quote }} }
+            - { name: AEGIS_BODY_SIZE_LIMIT, value: {{ $dp.bodySizeLimit | quote }} }
+            - { name: AEGIS_CLAMD_TIMEOUT_SECONDS, value: {{ $dp.clamdTimeoutSeconds | quote }} }
+            {{- with $dp.accessLog }}
+            - { name: AEGIS_ACCESS_LOG, value: {{ . | quote }} }
+            - { name: AEGIS_ACCESS_LOG_FORMAT, value: {{ $dp.accessLogFormat | default "squid" | quote }} }
+            {{- end }}
+            - name: AEGIS_WORKER_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            {{- if .Values.clamav.enabled }}
+            - { name: AEGIS_CLAMD_ADDRESS, value: {{ printf "tcp://%s-clamav:3310" (include "aegis.fullname" .) | quote }} }
+            {{- end }}
+            - name: AEGIS_DATAPLANE_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: dataplane-key } }
+            {{- with $dp.extraEnv }}{{ toYaml . | nindent 12 }}{{- end }}
+          volumeMounts:
+            - { name: ca, mountPath: /certs, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          livenessProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["python3", "/opt/aegis/healthcheck.py", "healthz"] }
+            timeoutSeconds: 5
+            {{- else }}
+            httpGet: { path: /healthz, port: ops }
+            {{- end }}
+            periodSeconds: 15
+          readinessProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["python3", "/opt/aegis/healthcheck.py", "readyz"] }
+            timeoutSeconds: 5
+            {{- else }}
+            httpGet: { path: /readyz, port: ops }
+            {{- end }}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources: {{- toYaml $dp.resources | nindent 12 }}
+      volumes:
+        - name: ca
+          secret: { secretName: {{ include "aegis.caSecretName" . }}, defaultMode: 0440 }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+      {{- with $dp.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dp.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dp.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-proxy
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+  {{- with $dp.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $dp.service.type }}
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  {{- if ne $dp.service.type "ClusterIP" }}
+  externalTrafficPolicy: {{ $dp.service.externalTrafficPolicy }}
+  {{- end }}
+  sessionAffinity: {{ $dp.service.sessionAffinity }}
+  {{- if eq $dp.service.sessionAffinity "ClientIP" }}
+  sessionAffinityConfig:
+    clientIP: { timeoutSeconds: {{ $dp.service.sessionAffinityTimeoutSeconds }} }
+  {{- end }}
+  {{- with $dp.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: proxy
+      port: {{ $dp.service.port }}
+      targetPort: proxy
+      protocol: TCP
+      {{- if and $dp.service.nodePort (ne $dp.service.type "ClusterIP") }}
+      nodePort: {{ $dp.service.nodePort }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-data-plane-ops
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+spec:
+  type: ClusterIP
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  ports:
+    - { name: ops, port: 9091, targetPort: ops, protocol: TCP }
+{{- if $dp.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "aegis.fullname" . }}-data-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ $dp.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+{{- end }}
+{{- if $dp.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "aegis.fullname" . }}-data-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: {{ include "aegis.fullname" . }}-data-plane }
+  minReplicas: {{ $dp.autoscaling.minReplicas }}
+  maxReplicas: {{ $dp.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ $dp.autoscaling.targetCPUUtilizationPercentage }} }
+{{- end }}

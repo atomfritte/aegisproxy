@@ -1,0 +1,89 @@
+{{- if .Values.clamav.enabled }}
+{{- $cv := .Values.clamav }}
+{{- $sel := dict "root" . "component" "clamav" }}
+# ClamAV (clamd) — each replica keeps its own signature database (freshclam runs inside the pod).
+# The official image starts as root and drops to the clamav user; it is therefore not compatible
+# with the "restricted" Pod Security Standard (use the "baseline" level for this namespace or a
+# pre-hardened clamd image).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "aegis.fullname" . }}-clamav
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clamav
+spec:
+  serviceName: {{ include "aegis.fullname" . }}-clamav
+  replicas: {{ $cv.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aegis.selector" $sel | nindent 8 }}
+    spec:
+      {{- include "aegis.imagePullSecrets" . | nindent 6 }}
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: clamav
+          image: {{ include "aegis.image" (dict "root" . "image" $cv.image) }}
+          imagePullPolicy: {{ $cv.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          ports:
+            - { name: clamd, containerPort: 3310, protocol: TCP }
+          startupProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["clamdcheck.sh"] }
+            timeoutSeconds: 20
+            {{- else }}
+            tcpSocket: { port: clamd }
+            {{- end }}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["clamdcheck.sh"] }
+            timeoutSeconds: 20
+            {{- else }}
+            tcpSocket: { port: clamd }
+            {{- end }}
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["clamdcheck.sh"] }
+            periodSeconds: 60
+            timeoutSeconds: 20
+          resources: {{- toYaml $cv.resources | nindent 12 }}
+          volumeMounts:
+            - { name: signatures, mountPath: /var/lib/clamav }
+      {{- if not $cv.persistence.enabled }}
+      volumes:
+        - name: signatures
+          emptyDir: {}
+      {{- end }}
+  {{- if $cv.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: signatures
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $cv.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $cv.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-clamav
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clamav
+spec:
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  ports:
+    - { name: clamd, port: 3310, targetPort: clamd, protocol: TCP }
+{{- end }}

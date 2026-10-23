@@ -1,0 +1,251 @@
+# AegisProxy Helm chart — default values.
+# Production checklist: set publicUrl (https), storage.type=postgres with an HA database,
+# ca.existingSecret (created with `aegis-control-plane gen-ca`), ingress with TLS, and review networkPolicy.
+
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# Externally reachable https URL of the console/API (AEGIS_PUBLIC_URL). Used in block pages,
+# install scripts and notification deep links. Never derived from request headers.
+publicUrl: "https://aegis.example.com"
+# Console URL if hosted elsewhere (defaults to publicUrl).
+dashboardUrl: ""
+# host:port servers use as their HTTP(S) proxy, shown in onboarding snippets (AEGIS_PROXY_ADDRESS).
+# Defaults to the host of publicUrl with port 8080; set it to the data-plane LoadBalancer address.
+proxyAddress: ""
+
+secrets:
+  # Use an existing Secret with keys: jwt-secret, dataplane-key, encryption-key, [encryption-key-previous],
+  # [bootstrap-admin-password], [metrics-token]
+  existingSecret: ""
+  # Otherwise values are taken from here or generated once and preserved across upgrades.
+  jwtSecret: ""
+  dataplaneKey: ""
+  bootstrapAdminPassword: ""
+  metricsToken: ""
+  # Encrypts secrets stored in the configuration (AES-256-GCM). Generated once and kept; an existingSecret
+  # must contain the key "encryption-key". Back it up: without it the control-plane refuses to start until the
+  # encrypted values are blanked and re-entered (docs/operations.md#encryption-key).
+  encryptionKey: ""
+  # Only during a key rotation: the previous key (decrypt only). Every replica re-encrypts with encryptionKey at
+  # start; remove it after the rotation (docs/operations.md#encryption-key).
+  encryptionKeyPrevious: ""
+
+ca:
+  # Existing Secret with keys mitmproxy-ca.pem (private key + certificate) and mitmproxy-ca-cert.pem.
+  # Recommended for production: `aegis-control-plane gen-ca ./ca` (RSA-3072, pathlen 0), then
+  #   kubectl create secret generic aegis-ca --from-file=./ca/mitmproxy-ca.pem --from-file=./ca/mitmproxy-ca-cert.pem
+  existingSecret: ""
+  # Quick start: let Helm generate a CA (RSA-2048) once; it is preserved across upgrades and kept on uninstall.
+  generate: true
+  commonName: "AegisProxy Enterprise Root CA"
+  validityDays: 3650
+
+storage:
+  # postgres: active-active control-plane cluster (any number of replicas)
+  # file:     single replica with a PersistentVolumeClaim (evaluation / small sites)
+  type: postgres
+  postgres:
+    # Secret with key "database-url" (or set url). Use sslmode=verify-full for external databases.
+    existingSecret: ""
+    existingSecretKey: database-url
+    url: ""
+    # Create a CloudNativePG cluster (requires the CNPG operator: https://cloudnative-pg.io).
+    cnpg:
+      enabled: false
+      instances: 3
+      storageSize: 10Gi
+      storageClass: ""
+  file:
+    size: 2Gi
+    storageClass: ""
+  flowRetention: 168h
+  eventRetention: 2160h
+
+controlPlane:
+  image:
+    repository: aegisproxy/control-plane   # all-in-one image (API + bundled console)
+    tag: ""                                 # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+  replicas: 2
+  # CIDRs of the ingress controller / load balancers whose X-Forwarded-For is trusted.
+  trustedProxies: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  internalDomains: ""          # AEGIS_INTERNAL_DOMAINS (empty = built-in defaults)
+  corsOrigins: ""              # origins of a console hosted on another origin
+  cookieSameSite: strict
+  sessionTTL: 8h
+  demoMode: false
+  # Scratch volume (/data) in postgres mode: threat-intel cache, audit.jsonl, log-export spools and
+  # "file" export sinks. Size it for the sum of the export sinks' spool_mb (default 256 MB each).
+  # The emptyDir survives container restarts, not pod rescheduling.
+  scratchSizeLimit: 4Gi
+  logLevel: info
+  threatIntelAutoUpdate: true
+  feedHttpProxy: ""
+  extraEnv: []
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { memory: 1Gi }
+  service:
+    type: ClusterIP
+    port: 8081
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  podAnnotations: {}
+  # Extra pod labels, e.g. azure.workload.identity/use: "true" for passwordless Sentinel export on AKS.
+  podLabels: {}
+  # Dedicated ServiceAccount (the API token is never mounted). For AKS workload identity annotate it with
+  # azure.workload.identity/client-id: <client id> and federate it in Entra ID (docs/log-export.md).
+  serviceAccount:
+    create: false
+    name: ""
+    annotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Separately hosted console (nginx, static SPA). Optional: the control-plane image already bundles it.
+console:
+  enabled: false
+  image:
+    repository: aegisproxy/console
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 2
+  # Empty: nginx proxies /api/ to the control-plane service (same origin, no CORS needed).
+  # Otherwise the API origin, e.g. https://aegis-api.example.com (add the console origin to controlPlane.corsOrigins).
+  apiBaseUrl: ""
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { memory: 128Mi }
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    # SSE live telemetry stream (ingress-nginx)
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  host: aegis.example.com
+  tlsSecretName: ""
+  # Host for the separate console (console.enabled=true); empty = not exposed via ingress.
+  consoleHost: ""
+  consoleTlsSecretName: ""
+
+dataPlane:
+  image:
+    repository: aegisproxy/data-plane
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 3
+  # Local access log of each worker (AEGIS_ACCESS_LOG): "" = off, stdout (collected by the cluster's
+  # log agent), or syslog://host:514 / syslog+tcp://host:514. Format: squid | combined | json.
+  accessLog: ""
+  accessLogFormat: squid
+  failMode: closed
+  bodySizeLimit: 1g
+  clamdTimeoutSeconds: 60
+  extraEnv: []
+  service:
+    type: LoadBalancer
+    port: 8080
+    nodePort: null
+    # Local preserves the client source IP — required for server identification by IP/CIDR.
+    externalTrafficPolicy: Local
+    # Source-IP affinity keeps a client on one worker (redirect-object grants are per worker).
+    sessionAffinity: ClientIP
+    sessionAffinityTimeoutSeconds: 10800
+    loadBalancerSourceRanges: []
+    annotations: {}
+  resources:
+    requests: { cpu: 250m, memory: 384Mi }
+    limits: { memory: 2Gi }
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+clamav:
+  enabled: true
+  image:
+    repository: clamav/clamav
+    tag: "1.5"
+    pullPolicy: IfNotPresent
+  replicas: 2
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 100m, memory: 1536Mi }
+    limits: { memory: 3Gi }
+
+# Health probes: "http" (kubelet connects to the pod) or "exec" (the probe runs inside the container).
+# Use exec when NetworkPolicies are also enforced for node-to-pod traffic (Cilium host firewall,
+# policy-enforcement=always, some eBPF dataplanes), so probes never depend on a network path.
+probes:
+  mode: http
+
+networkPolicy:
+  enabled: true
+  # Namespace labels of the ingress controller allowed to reach the control-plane/console.
+  ingressNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+  # Client networks allowed to use the proxy (empty = any source).
+  proxyClientCIDRs: []
+  # Additional NetworkPolicyPeers allowed to reach every component's ports, e.g. a monitoring
+  # namespace (Prometheus scraping) or node CIDRs for kubelet probes on CNIs that enforce policy on
+  # host traffic:
+  #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+  #   - ipBlock: { cidr: 10.0.0.0/16 }
+  extraIngressFrom: []
+  # Destinations the data-plane may never reach directly (defence in depth against SSRF into the
+  # cluster/internal networks). Remove ranges that host explicitly whitelisted internal services.
+  dataPlaneEgressDeny:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+  # CloudNativePG instances (storage.postgres.cnpg.enabled): PostgreSQL only from the control-plane and
+  # the other instances, the instance manager (8000) only from the operator namespace.
+  cnpgOperatorNamespace: cnpg-system
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+  # PrometheusRule with the recommended alerts (requires the Prometheus Operator CRDs).
+  prometheusRule:
+    enabled: false
+    labels: {}
+    minHealthyDataPlanes: 1
+    policyStaleSeconds: 120
+    loginFailures: 50
+    feedStaleSeconds: 172800
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: { type: RuntimeDefault }
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: ["ALL"] }

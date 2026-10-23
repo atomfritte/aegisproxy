@@ -1,0 +1,8 @@
+# AegisProxy data-plane — the addon itself only uses the Python standard library.
+# Tested with mitmproxy 12.3.0 on Python 3.12–3.14. For production installs outside the container image,
+# generate a hash-pinned lock file (pip-compile --generate-hashes) and install with --require-hashes.
+mitmproxy==12.3.0
+# Then (with --no-deps): requirements-security.txt - fixed releases of dependencies that mitmproxy's
+# upper bounds exclude (currently Brotli 1.2.1 for CVE-2026-111497). Include them in your lock file.
+# Optional: YARA rule scanning (see requirements-extra.txt)
+# yara-x==1.22.0

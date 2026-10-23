@@ -1,0 +1,124 @@
+# AegisProxy — high-availability reference deployment on one Docker host (for evaluation / testing
+# the cluster mode). Production HA spreads these components over several hosts or uses Kubernetes
+# (deploy/helm) with a replicated PostgreSQL (Patroni, CloudNativePG or a managed service).
+#
+#   cd deploy/compose/ha && cp ../../../.env.example .env && ../../../scripts/gen-secrets.sh >> .env
+#   docker compose up -d --build
+#
+#   Console via load balancer:      http://127.0.0.1:8081   (bundled console, 2 control-plane replicas)
+#   Standalone console (nginx):     http://127.0.0.1:8082   (separately hosted frontend, proxies /api)
+#   Proxy via load balancer:        <host>:8080             (2 data-plane workers, source-IP affinity)
+#   HAProxy stats:                  http://127.0.0.1:8404/stats
+name: aegisproxy-ha
+
+x-hardening: &hardening
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+
+x-cp-env: &cp-env
+  AEGIS_STORAGE: postgres
+  AEGIS_DATABASE_URL: postgres://aegis:${AEGIS_DB_PASSWORD:?run scripts/gen-secrets.sh}@postgres:5432/aegis?sslmode=disable
+  AEGIS_PUBLIC_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+  AEGIS_PROXY_ADDRESS: ${AEGIS_PROXY_ADDRESS:-}
+  AEGIS_JWT_SECRET: ${AEGIS_JWT_SECRET:?run scripts/gen-secrets.sh}
+  AEGIS_ENCRYPTION_KEY: ${AEGIS_ENCRYPTION_KEY:?run scripts/gen-secrets.sh}
+  AEGIS_ENCRYPTION_KEY_PREVIOUS: ${AEGIS_ENCRYPTION_KEY_PREVIOUS:-}  # only during a key rotation
+  AEGIS_DATAPLANE_KEY: ${AEGIS_DATAPLANE_KEY:?run scripts/gen-secrets.sh}
+  AEGIS_BOOTSTRAP_ADMIN_PASSWORD: ${AEGIS_BOOTSTRAP_ADMIN_PASSWORD:-}
+  AEGIS_TRUSTED_PROXIES: 172.16.0.0/12
+  AEGIS_DEMO_MODE: ${AEGIS_DEMO_MODE:-false}
+
+x-dp-env: &dp-env
+  CONTROL_PLANE_URL: http://lb:8081
+  AEGIS_DATAPLANE_KEY: ${AEGIS_DATAPLANE_KEY:?run scripts/gen-secrets.sh}
+  AEGIS_PUBLIC_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+  DASHBOARD_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+  AEGIS_CLAMD_ADDRESS: tcp://clamav:3310
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_DB: aegis
+      POSTGRES_PASSWORD: ${AEGIS_DB_PASSWORD:?run scripts/gen-secrets.sh}
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ca-init:
+    <<: *hardening
+    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    build: { context: ../../.., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
+    command: ["gen-ca", "/certs"]
+    volumes: ["aegis-ca:/certs"]
+    restart: "no"
+
+  control-plane-1: &cp
+    <<: *hardening
+    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    depends_on:
+      ca-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    environment: *cp-env
+    volumes: ["aegis-ca:/certs:ro"]
+    tmpfs: ["/data:size=64m,uid=65532,gid=65532,mode=0700"]
+
+  control-plane-2:
+    <<: *cp
+
+  lb:
+    image: haproxy:3.2-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [control-plane-1, control-plane-2]
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports:
+      - "127.0.0.1:8081:8081"
+      - "${AEGIS_PROXY_BIND:-0.0.0.0:8080}:8080"
+      - "127.0.0.1:8404:8404"
+
+  data-plane-1: &dp
+    <<: *hardening
+    image: aegisproxy/data-plane:${AEGIS_VERSION:-2.1.0}
+    build: { context: ../../../data-plane }
+    depends_on:
+      lb: { condition: service_started }
+    environment:
+      <<: *dp-env
+      AEGIS_WORKER_ID: data-plane-1
+    volumes: ["aegis-ca:/certs:ro"]
+    tmpfs: ["/tmp:size=128m,mode=1777"]
+
+  data-plane-2:
+    <<: *dp
+    environment:
+      <<: *dp-env
+      AEGIS_WORKER_ID: data-plane-2
+
+  # Separately hosted console (static nginx image) — same-origin via /api reverse proxy.
+  console:
+    <<: *hardening
+    image: aegisproxy/console:${AEGIS_VERSION:-2.1.0}
+    build: { context: ../../../frontend }
+    environment:
+      AEGIS_API_UPSTREAM: http://lb:8081
+    tmpfs: ["/tmp:size=16m,uid=101,gid=101"]
+    ports: ["127.0.0.1:8082:8080"]
+
+  clamav:
+    image: clamav/clamav:1.5
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    volumes: ["clamav-db:/var/lib/clamav"]
+
+volumes:
+  pg-data:
+  aegis-ca:
+  clamav-db:

@@ -1,0 +1,32 @@
+extensions:
+  bearertokenauth/hec:
+    scheme: "Splunk"
+    token: "otel-hec-token-0123456789"
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  splunk_hec:
+    endpoint: 0.0.0.0:8088
+    auth:
+      authenticator: bearertokenauth/hec
+    tls:
+      cert_file: /tls/server.pem
+      key_file: /tls/server.key
+    hec_metadata_to_otel_attrs:
+      source: com.splunk.source
+      sourcetype: com.splunk.sourcetype
+      index: com.splunk.index
+      host: host.name
+exporters:
+  file:
+    path: /out/hec.jsonl
+    append: true
+    flush_interval: 200ms
+  debug:
+    verbosity: basic
+service:
+  extensions: [bearertokenauth/hec, health_check]
+  pipelines:
+    logs:
+      receivers: [splunk_hec]
+      exporters: [file, debug]

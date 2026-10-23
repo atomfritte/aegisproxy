@@ -1,0 +1,30 @@
+{{- if and (eq .Values.storage.type "postgres") .Values.storage.postgres.cnpg.enabled }}
+{{- $pg := .Values.storage.postgres.cnpg }}
+# Highly available PostgreSQL managed by the CloudNativePG operator (synchronous replication,
+# automated failover). The operator creates the Secret "<name>-app" with the connection URI.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "aegis.cnpgName" . }}
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  instances: {{ $pg.instances }}
+  {{- if gt (int $pg.instances) 1 }}
+  minSyncReplicas: 1
+  maxSyncReplicas: 1
+  {{- end }}
+  bootstrap:
+    initdb:
+      database: aegis
+      owner: aegis
+  storage:
+    size: {{ $pg.storageSize }}
+    {{- with $pg.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+{{- end }}

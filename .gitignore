@@ -1,0 +1,25 @@
+# secrets & runtime state
+.env
+certs/
+control-plane/data/
+**/secrets/
+*.pem
+*.key
+# build output
+dist/
+frontend/dist/
+frontend/node_modules/
+control-plane/aegis-control-plane
+control-plane/aegis-control-plane.exe
+# python
+__pycache__/
+*.pyc
+# editors
+.idea/
+.vscode/
+*.swp
+.vite/
+# test binaries and Windows builds
+*.test
+*.test.exe
+*.exe

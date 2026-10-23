@@ -1,0 +1,217 @@
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.5.0' }
+# Pester tests for Install-AegisConsole-IIS.ps1 against the fake Windows in FakeWindows.ps1 and the fake
+# WebAdministration module in fakes\.
+
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'FakeWindows.ps1')
+    $script:Installer = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\Install-AegisConsole-IIS.ps1')).ProviderPath
+    $script:SavedModulePath = $env:PSModulePath
+    $env:PSModulePath = (Join-Path $PSScriptRoot 'fakes') + [System.IO.Path]::PathSeparator + $env:PSModulePath
+    $script:Thumb = '3F2A9C0B11D4E5F60718293A4B5C6D7E8F901A2B'
+
+    function Add-FakeCertificate {
+        param([string]$Thumbprint, [string[]]$DnsNames, [bool]$HasPrivateKey = $true, [int]$ValidDays = 365)
+        $global:FakeWin.Certificates[$Thumbprint] = [pscustomobject]@{
+            Thumbprint = $Thumbprint; HasPrivateKey = $HasPrivateKey; NotAfter = $global:FakeWin.Now.AddDays($ValidDays)
+            DnsNameList = @($DnsNames | ForEach-Object { [pscustomobject]@{ Unicode = $_ } })
+        }
+    }
+}
+
+AfterAll {
+    $env:PSModulePath = $SavedModulePath
+    Remove-Module -Name WebAdministration -Force -ErrorAction SilentlyContinue
+}
+
+Describe 'Install-AegisConsole-IIS.ps1' {
+    BeforeEach {
+        Initialize-FakeWindows -Root (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+        Add-FakeWindowsMock
+        Mock Get-Item -ParameterFilter { "$LiteralPath" -like 'Cert:*' } {
+            $global:FakeWin.Certificates[("$LiteralPath" -split '\\')[-1]]
+        }
+        Mock Test-Path -ParameterFilter { "$LiteralPath" -like 'IIS:*' } {
+            $global:FakeWin.Iis.AppPools.ContainsKey(("$LiteralPath" -split '\\')[-1])
+        }
+        Mock Test-Path -ParameterFilter { "$LiteralPath" -like '*rewrite.dll' } { $global:FakeWin.RewriteDll }
+        Mock Set-ItemProperty -ParameterFilter { "$LiteralPath" -like 'IIS:*' } {
+            $parts = "$LiteralPath" -split '\\'
+            $target = if ($parts[1] -eq 'AppPools') { $global:FakeWin.Iis.AppPools[$parts[2]] } else { $global:FakeWin.Iis.Sites[$parts[2]] }
+            $target["$Name"] = $Value
+        }
+
+        $script:Dist = Join-Path $FakeWin.Root 'dist'
+        New-Item -ItemType Directory -Path (Join-Path $Dist 'assets') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Dist 'index.html') -Value '<!doctype html><title>AegisProxy</title>'
+        Set-Content -LiteralPath (Join-Path (Join-Path $Dist 'assets') 'index-abc123.js') -Value 'console.log(1)'
+        Set-Content -LiteralPath (Join-Path $Dist 'config.js') -Value 'window.__AEGIS_CONFIG__ = { apiBaseUrl: "" };'
+        $script:Site = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'inetpub\aegis-console'))
+        Add-FakeCertificate -Thumbprint $Thumb -DnsNames @('aegis-console.corp.example')
+        $script:Base = @{ DistDir = $Dist; HostName = 'aegis-console.corp.example'; CertificateThumbprint = $Thumb }
+    }
+    AfterEach { Remove-FakeWindows }
+
+    Context 'validation' {
+        It 'rejects <Name> = <Value>' -TestCases @(
+            @{ Name = 'HostName'; Value = 'aegis console' }, @{ Name = 'HostName'; Value = 'a/b' },
+            @{ Name = 'CertificateThumbprint'; Value = 'not-a-thumbprint' }, @{ Name = 'HttpsPort'; Value = 0 }
+        ) {
+            $p = $Base.Clone(); $p[$Name] = $Value
+            { & $Installer @p } | Should -Throw -ExceptionType ([System.Management.Automation.ParameterBindingException])
+        }
+
+        It 'requires a built console' {
+            Remove-Item -LiteralPath (Join-Path $Dist 'index.html')
+            { & $Installer @Base } | Should -Throw '*does not contain index.html*'
+        }
+
+        It 'rejects the API URL <Url>' -TestCases @(
+            @{ Url = 'http://aegis-api.corp.example'; Message = '*must use https://*' },
+            @{ Url = 'https://api.corp.example/;script-src *'; Message = '*URL characters only*' },
+            @{ Url = 'https://api.corp.example/"};alert(1)//'; Message = '*URL characters only*' },
+            @{ Url = 'javascript:alert(1)'; Message = '*URL characters only*' }
+        ) {
+            { & $Installer @Base -ApiBaseUrl $Url } | Should -Throw $Message
+        }
+
+        It 'allows an http API only with -AllowHttpApi' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ ApiBaseUrl = 'http://aegis-api.lab:8081'; AllowHttpApi = $true })).ExitCode | Should -Be 0
+        }
+
+        It 'refuses a certificate that is <Case>' -TestCases @(
+            @{ Case = 'missing'; Setup = { $global:FakeWin.Certificates.Clear() }; Message = '*not found in Cert:\LocalMachine\My*' },
+            @{ Case = 'without private key'; Setup = { $global:FakeWin.Certificates[$Thumb].HasPrivateKey = $false }; Message = '*has no private key*' },
+            @{ Case = 'expired'; Setup = { $global:FakeWin.Certificates[$Thumb].NotAfter = $global:FakeWin.Now.AddDays(-1) }; Message = '*expired*' }
+        ) {
+            & $Setup
+            { & $Installer @Base } | Should -Throw $Message
+        }
+
+        It 'normalizes a thumbprint copied with spaces and lower case' {
+            $spaced = (($Thumb.ToLowerInvariant() -split '(.{4})' | Where-Object { $_ }) -join ' ')
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ CertificateThumbprint = $spaced })).ExitCode | Should -Be 0
+            $FakeWin.Iis.Sites['AegisConsole'].Bindings[0].Certificate | Should -Be "My\$Thumb"
+        }
+
+        It 'warns when the certificate does not cover the host name (wildcards cover one label)' {
+            Add-FakeCertificate -Thumbprint $Thumb -DnsNames @('*.corp.example')
+            (Invoke-Installer -Path $Installer -Parameters $Base).Output | Should -Not -Match 'do not cover'
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ HostName = 'a.b.corp.example' })).Output | Should -Match 'do not cover a.b.corp.example'
+        }
+
+        It 'stops when the URL Rewrite module is missing unless -SkipUrlRewriteCheck' {
+            $FakeWin.RewriteDll = $false
+            { & $Installer @Base } | Should -Throw '*URL Rewrite module missing*'
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipUrlRewriteCheck = $true })).Output | Should -Match 'HTTP 500.19'
+        }
+
+        It 'accepts URL Rewrite registered in the registry and reports its version' {
+            $FakeWin.RewriteDll = $false
+            $FakeWin.Registry['HKLM:\SOFTWARE\Microsoft\IIS Extensions\URL Rewrite'] = @{ Version = '7.2.2' }
+            (Invoke-Installer -Path $Installer -Parameters $Base).Output | Should -Match 'URL Rewrite module found \(version 7.2.2\)'
+        }
+    }
+
+    Context 'deployment with a separate API origin' {
+        BeforeEach {
+            New-Item -ItemType Directory -Path (Join-Path $Site 'assets') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path (Join-Path $Site 'assets') 'index-old999.js') -Value 'stale'
+            $script:Run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ ApiBaseUrl = 'https://aegis-api.corp.example:8443/'; AddHttpBinding = $true })
+        }
+
+        It 'completes and prints the CORS setting for the control-plane' {
+            $Run.ExitCode | Should -Be 0
+            $Run.Output | Should -Match 'AEGIS_CORS_ORIGINS=https://aegis-console.corp.example '
+        }
+
+        It 'installs the IIS role services' {
+            foreach ($f in @('Web-Server', 'Web-Static-Content', 'Web-Filtering', 'Web-Http-Logging')) { $FakeWin.Iis.Features | Should -Contain $f }
+        }
+
+        It 'creates a No-Managed-Code pool with ApplicationPoolIdentity' {
+            $pool = $FakeWin.Iis.AppPools['AegisConsole']
+            $pool.managedRuntimeVersion | Should -Be ''
+            $pool.managedPipelineMode | Should -Be 'Integrated'
+            $pool.'processModel.identityType' | Should -Be 'ApplicationPoolIdentity'
+            $pool.'processModel.loadUserProfile' | Should -BeFalse
+            $pool.enable32BitAppOnWin64 | Should -BeFalse
+            $pool.State | Should -Be 'Started'
+        }
+
+        It 'mirrors the build (stale hashed assets removed)' {
+            Test-Path -LiteralPath (Join-Path $Site 'index.html') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path (Join-Path $Site 'assets') 'index-abc123.js') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path (Join-Path $Site 'assets') 'index-old999.js') | Should -BeFalse
+        }
+
+        It 'adds only the API origin to the CSP connect-src and keeps web.config well-formed' {
+            $text = [System.IO.File]::ReadAllText((Join-Path $Site 'web.config'))
+            $xml = [xml]$text
+            $csp = ($xml.configuration.'system.webServer'.httpProtocol.customHeaders.add | Where-Object name -eq 'Content-Security-Policy').value
+            $csp | Should -Match "connect-src 'self' https://aegis-api.corp.example:8443;"
+            $csp | Should -Match "frame-ancestors 'none'"
+            [System.IO.File]::ReadAllBytes((Join-Path $Site 'web.config'))[0] | Should -Be ([byte][char]'<')
+        }
+
+        It 'writes config.js with the API base URL' {
+            [System.IO.File]::ReadAllText((Join-Path $Site 'config.js')) | Should -Match ([regex]::Escape('window.__AEGIS_CONFIG__ = { apiBaseUrl: "https://aegis-api.corp.example:8443" };'))
+        }
+
+        It 'binds HTTPS with SNI and the certificate, plus an http binding that redirects' {
+            $iisSite = $FakeWin.Iis.Sites['AegisConsole']
+            $iisSite.physicalPath | Should -Be $Site
+            $iisSite.applicationPool | Should -Be 'AegisConsole'
+            $iisSite.State | Should -Be 'Started'
+            $https = @($iisSite.Bindings | Where-Object Protocol -eq 'https')
+            $https.Count | Should -Be 1
+            $https[0].Port | Should -Be 443
+            $https[0].HostHeader | Should -Be 'aegis-console.corp.example'
+            $https[0].SslFlags | Should -Be 1
+            $https[0].Certificate | Should -Be "My\$Thumb"
+            @($iisSite.Bindings | Where-Object { $_.Protocol -eq 'http' -and $_.Port -eq 80 }).Count | Should -Be 1
+        }
+
+        It 'serves anonymous requests with the pool identity' {
+            $FakeWin.Iis.Config['MACHINE/WEBROOT/APPHOST|AegisConsole|system.webServer/security/authentication/anonymousAuthentication|userName'] | Should -Be ''
+        }
+
+        It 'restricts the site directory to SYSTEM, Administrators and the pool identity (read)' {
+            foreach ($path in @($Site, (Join-Path $Site 'index.html'), (Join-Path $Site 'web.config'))) {
+                Get-PrincipalList $path | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'IIS AppPool\AegisConsole') -Because $path
+            }
+            (Get-FakeAccess (Join-Path $Site 'config.js'))['IIS AppPool\AegisConsole'] | Should -Be 'RX'
+        }
+    }
+
+    Context 'same-origin deployment and re-runs' {
+        It 'keeps the CSP unchanged and writes an empty apiBaseUrl' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            [System.IO.File]::ReadAllText((Join-Path $Site 'web.config')) | Should -Be ([System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\iis\web.config')))
+            [System.IO.File]::ReadAllText((Join-Path $Site 'config.js')) | Should -Match 'apiBaseUrl: ""'
+        }
+
+        It 'replaces the certificate on a re-run without duplicating bindings or the pool' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $renewed = 'AAAABBBBCCCCDDDDEEEEFFFF0000111122223333'
+            Add-FakeCertificate -Thumbprint $renewed -DnsNames @('aegis-console.corp.example')
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ CertificateThumbprint = $renewed })).ExitCode | Should -Be 0
+            $bindings = @($FakeWin.Iis.Sites['AegisConsole'].Bindings)
+            $bindings.Count | Should -Be 1
+            $bindings[0].Certificate | Should -Be "My\$renewed"
+        }
+
+        It 'uses a non-default HTTPS port' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ HttpsPort = 8443 })
+            $run.ExitCode | Should -Be 0
+            $FakeWin.Iis.Sites['AegisConsole'].Bindings[0].Port | Should -Be 8443
+            $run.Output | Should -Match 'URL\s+: https://aegis-console.corp.example:8443/'
+        }
+
+        It 'changes nothing with -WhatIf' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ WhatIf = $true })).ExitCode | Should -Be 0
+            $FakeWin.Iis.Sites.Count | Should -Be 0
+            $FakeWin.Iis.AppPools.Count | Should -Be 0
+            Test-Path -LiteralPath $Site | Should -BeFalse
+        }
+    }
+}

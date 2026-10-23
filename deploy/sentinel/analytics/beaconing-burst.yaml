@@ -1,0 +1,38 @@
+id: 51e5d4d4-7281-5333-b74e-c94177684fe8
+name: AegisProxy - Possible C2 beaconing (burst of blocked requests)
+description: |
+  One server produced more blocked requests per minute than the configured threshold. Typical for malware beaconing to unknown C2 domains, worm-like scanning or broken deployments.
+severity: High
+requiredDataConnectors: []
+queryFrequency: 15m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CommandAndControl
+  - Discovery
+relevantTechniques:
+  - T1071
+  - T1046
+query: |
+  AegisProxy_CL
+  | where Stream == "security" and tostring(Data.type) == "BLOCK_BURST"
+  | summarize Bursts = count(), LastDetail = arg_max(TimeGenerated, Message) by ServerName, ServerIP
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: ServerName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: ServerIP
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1d
+    matchingMethod: AnyAlert
+version: 1.0.0
+kind: Scheduled

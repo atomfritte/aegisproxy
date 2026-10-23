@@ -1,0 +1,104 @@
+"""Environment configuration for the data-plane worker."""
+
+from __future__ import annotations
+
+import os
+import socket
+from dataclasses import dataclass, field
+from typing import List
+
+KNOWN_LEAKED_KEYS = {"aegis-dp-internal-key-2026-v1"}
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def _read_secret(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    path = os.environ.get(name + "_FILE", "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError as exc:
+            raise ConfigError(f"{name}_FILE: {exc}") from exc
+    return ""
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+
+
+@dataclass
+class Config:
+    control_plane_url: str
+    dataplane_key: str
+    worker_id: str
+    public_url: str = ""
+    dashboard_url: str = ""
+    control_plane_ca_file: str = ""
+    fail_mode: str = "closed"  # closed | open (when no policy bundle could ever be loaded)
+    proxy_mode: str = "regular"
+    clamd_address: str = ""  # tcp://host:3310 or unix:///path/clamd.sock ("" = disabled)
+    clamd_timeout: float = 60.0
+    magic_hosts: List[str] = field(default_factory=lambda: ["aegis.ca", "mitm.it"])
+    ops_addr: str = "0.0.0.0:9091"
+    sync_interval: float = 2.0
+    threat_sync_interval: float = 30.0
+    flush_interval: float = 0.5
+    access_log: str = ""  # off | stdout | stderr | /path | syslog://host:514 | syslog+tcp://host:514 | syslog:///dev/log
+    access_log_format: str = "squid"  # squid | combined | json
+    access_log_rotate_mb: int = 0  # > 0: the worker rotates a file destination itself (default on Windows)
+    access_log_keep: int = 10
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        key = _read_secret("AEGIS_DATAPLANE_KEY")
+        if not key:
+            raise ConfigError(
+                "AEGIS_DATAPLANE_KEY (or AEGIS_DATAPLANE_KEY_FILE) is required: it authenticates this worker "
+                "to the control-plane and signs block tokens. Use the same value as the control-plane."
+            )
+        if key in KNOWN_LEAKED_KEYS or len(key) < 32:
+            raise ConfigError("AEGIS_DATAPLANE_KEY must be a random secret of at least 32 characters (openssl rand -hex 32)")
+        fail_mode = os.environ.get("AEGIS_FAIL_MODE", "closed").strip().lower()
+        if fail_mode not in ("closed", "open"):
+            raise ConfigError("AEGIS_FAIL_MODE must be 'closed' or 'open'")
+        proxy_mode = os.environ.get("AEGIS_PROXY_MODE", "regular").strip().lower()
+        if proxy_mode not in ("regular", "transparent"):
+            raise ConfigError("AEGIS_PROXY_MODE must be 'regular' or 'transparent'")
+        access_format = os.environ.get("AEGIS_ACCESS_LOG_FORMAT", "squid").strip().lower()
+        if access_format not in ("squid", "combined", "json"):
+            raise ConfigError("AEGIS_ACCESS_LOG_FORMAT must be squid, combined or json")
+        rotate_mb = _env_int("AEGIS_ACCESS_LOG_ROTATE_MB", 100 if os.name == "nt" else 0)
+        keep = _env_int("AEGIS_ACCESS_LOG_KEEP", 10)
+        if not 0 <= rotate_mb <= 1_048_576 or not 1 <= keep <= 1000:
+            raise ConfigError("AEGIS_ACCESS_LOG_ROTATE_MB must be 0-1048576 and AEGIS_ACCESS_LOG_KEEP 1-1000")
+        magic = [h.strip().lower() for h in os.environ.get("AEGIS_MAGIC_HOSTS", "aegis.ca,mitm.it").split(",") if h.strip()]
+        return cls(
+            control_plane_url=os.environ.get("CONTROL_PLANE_URL", "http://localhost:8081").rstrip("/"),
+            dataplane_key=key,
+            worker_id=os.environ.get("AEGIS_WORKER_ID", "").strip() or socket.gethostname(),
+            public_url=os.environ.get("AEGIS_PUBLIC_URL", "").rstrip("/"),
+            dashboard_url=os.environ.get("DASHBOARD_URL", "").rstrip("/"),
+            control_plane_ca_file=os.environ.get("AEGIS_CONTROL_PLANE_CA_FILE", "").strip(),
+            fail_mode=fail_mode,
+            proxy_mode=proxy_mode,
+            clamd_address=os.environ.get("AEGIS_CLAMD_ADDRESS", "").strip(),
+            clamd_timeout=float(_env_int("AEGIS_CLAMD_TIMEOUT_SECONDS", 60)),
+            magic_hosts=magic,
+            ops_addr=os.environ.get("AEGIS_OPS_ADDR", "0.0.0.0:9091").strip(),
+            sync_interval=float(_env_int("AEGIS_SYNC_INTERVAL_SECONDS", 2)),
+            threat_sync_interval=float(_env_int("AEGIS_THREAT_SYNC_INTERVAL_SECONDS", 30)),
+            access_log=os.environ.get("AEGIS_ACCESS_LOG", "").strip(),
+            access_log_format=access_format,
+            access_log_rotate_mb=rotate_mb,
+            access_log_keep=keep,
+        )

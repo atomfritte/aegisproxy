@@ -1,0 +1,179 @@
+{{- $cp := .Values.controlPlane }}
+{{- $sel := dict "root" . "component" "control-plane" }}
+{{- if eq .Values.storage.type "file" }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "aegis.fullname" . }}-control-plane-data
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.storage.file.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.file.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aegis.fullname" . }}-control-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: {{ include "aegis.cpReplicas" . }}
+  {{- if eq .Values.storage.type "file" }}
+  strategy: { type: Recreate }
+  {{- else }}
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  {{- end }}
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aegis.selector" $sel | nindent 8 }}
+        {{- with $cp.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with $cp.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "aegis.imagePullSecrets" . | nindent 6 }}
+      {{- if or $cp.serviceAccount.create $cp.serviceAccount.name }}
+      serviceAccountName: {{ $cp.serviceAccount.name | default (printf "%s-control-plane" (include "aegis.fullname" .)) }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "aegis.selector" $sel | nindent 14 }}
+      containers:
+        - name: control-plane
+          image: {{ include "aegis.image" (dict "root" . "image" $cp.image) }}
+          imagePullPolicy: {{ $cp.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - { name: http, containerPort: 8081, protocol: TCP }
+          env:
+            - { name: AEGIS_PUBLIC_URL, value: {{ .Values.publicUrl | quote }} }
+            - { name: AEGIS_DASHBOARD_URL, value: {{ .Values.dashboardUrl | default .Values.publicUrl | quote }} }
+            {{- with .Values.proxyAddress }}
+            - { name: AEGIS_PROXY_ADDRESS, value: {{ . | quote }} }
+            {{- end }}
+            - { name: AEGIS_STORAGE, value: {{ .Values.storage.type | quote }} }
+            - { name: AEGIS_FLOW_RETENTION, value: {{ .Values.storage.flowRetention | quote }} }
+            - { name: AEGIS_EVENT_RETENTION, value: {{ .Values.storage.eventRetention | quote }} }
+            - { name: AEGIS_TRUSTED_PROXIES, value: {{ $cp.trustedProxies | quote }} }
+            - { name: AEGIS_COOKIE_SAMESITE, value: {{ $cp.cookieSameSite | quote }} }
+            - { name: AEGIS_SESSION_TTL, value: {{ $cp.sessionTTL | quote }} }
+            - { name: AEGIS_DEMO_MODE, value: {{ $cp.demoMode | quote }} }
+            - { name: AEGIS_LOG_LEVEL, value: {{ $cp.logLevel | quote }} }
+            - { name: AEGIS_THREATINTEL_AUTOUPDATE, value: {{ $cp.threatIntelAutoUpdate | quote }} }
+            - { name: AEGIS_SHUTDOWN_DELAY, value: "10s" }
+            {{- with $cp.internalDomains }}
+            - { name: AEGIS_INTERNAL_DOMAINS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with $cp.corsOrigins }}
+            - { name: AEGIS_CORS_ORIGINS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with $cp.feedHttpProxy }}
+            - { name: AEGIS_FEED_HTTP_PROXY, value: {{ . | quote }} }
+            {{- end }}
+            - name: AEGIS_JWT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: jwt-secret } }
+            - name: AEGIS_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: encryption-key } }
+            - name: AEGIS_ENCRYPTION_KEY_PREVIOUS
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: encryption-key-previous, optional: true } }
+            - name: AEGIS_DATAPLANE_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: dataplane-key } }
+            - name: AEGIS_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: bootstrap-admin-password, optional: true } }
+            - name: AEGIS_METRICS_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.secretName" . }}, key: metrics-token, optional: true } }
+            {{- if eq .Values.storage.type "postgres" }}
+            - name: AEGIS_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ include "aegis.dbSecretName" . }}, key: {{ include "aegis.dbSecretKey" . }} } }
+            {{- end }}
+            {{- with $cp.extraEnv }}{{ toYaml . | nindent 12 }}{{- end }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: ca, mountPath: /certs, readOnly: true }
+          startupProbe:
+            # Allows up to 5 minutes for the database to become reachable on first rollout.
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["/app/aegis-control-plane", "healthcheck", "healthz"] }
+            {{- else }}
+            httpGet: { path: /healthz, port: http }
+            {{- end }}
+            periodSeconds: 5
+            failureThreshold: 66
+          livenessProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["/app/aegis-control-plane", "healthcheck", "healthz"] }
+            {{- else }}
+            httpGet: { path: /healthz, port: http }
+            {{- end }}
+            periodSeconds: 15
+          readinessProbe:
+            {{- if eq .Values.probes.mode "exec" }}
+            exec: { command: ["/app/aegis-control-plane", "healthcheck", "readyz"] }
+            {{- else }}
+            httpGet: { path: /readyz, port: http }
+            {{- end }}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources: {{- toYaml $cp.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if eq .Values.storage.type "file" }}
+          persistentVolumeClaim: { claimName: {{ include "aegis.fullname" . }}-control-plane-data }
+          {{- else }}
+          emptyDir: { sizeLimit: {{ $cp.scratchSizeLimit | default "4Gi" }} }
+          {{- end }}
+        - name: ca
+          secret:
+            secretName: {{ include "aegis.caSecretName" . }}
+            # The control-plane only needs the public certificate.
+            items:
+              - { key: mitmproxy-ca-cert.pem, path: mitmproxy-ca-cert.pem }
+      {{- with $cp.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cp.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cp.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.cpService" . }}
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  type: {{ $cp.service.type }}
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  ports:
+    - { name: http, port: {{ $cp.service.port }}, targetPort: http, protocol: TCP }
+{{- if and $cp.podDisruptionBudget.enabled (gt (int (include "aegis.cpReplicas" .)) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "aegis.fullname" . }}-control-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ $cp.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+{{- end }}

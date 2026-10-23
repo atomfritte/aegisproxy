@@ -1,0 +1,169 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Control-plane: reachable from the ingress controller, data-plane workers and the console only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis.fullname" . }}-control-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "aegis.selector" (dict "root" . "component" "control-plane") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {{- toYaml $np.ingressNamespaceSelector | nindent 14 }}
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "data-plane") | nindent 14 }}
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "console") | nindent 14 }}
+      ports:
+        - { port: 8081, protocol: TCP }
+    {{- with $np.extraIngressFrom }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 8081, protocol: TCP }
+    {{- end }}
+---
+# Data-plane: proxy port from client networks, ops port from within the namespace; egress to the
+# internet but not to internal ranges (defence in depth on top of the addon's destination checks).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis.fullname" . }}-data-plane
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "aegis.selector" (dict "root" . "component" "data-plane") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { port: 8080, protocol: TCP }
+      {{- with $np.proxyClientCIDRs }}
+      from:
+        {{- range . }}
+        - ipBlock: { cidr: {{ . }} }
+        {{- end }}
+      {{- end }}
+    - from:
+        - podSelector: {}
+      ports:
+        - { port: 9091, protocol: TCP }
+    {{- with $np.extraIngressFrom }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 8080, protocol: TCP }
+        - { port: 9091, protocol: TCP }
+    {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "control-plane") | nindent 14 }}
+      ports:
+        - { port: 8081, protocol: TCP }
+    - to:
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "clamav") | nindent 14 }}
+      ports:
+        - { port: 3310, protocol: TCP }
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with $np.dataPlaneEgressDeny }}
+            except: {{- toYaml . | nindent 14 }}
+            {{- end }}
+        - ipBlock: { cidr: "::/0" }
+---
+# ClamAV: only the data-plane may submit scans.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis.fullname" . }}-clamav
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "aegis.selector" (dict "root" . "component" "clamav") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "data-plane") | nindent 14 }}
+      ports:
+        - { port: 3310, protocol: TCP }
+    {{- with $np.extraIngressFrom }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 3310, protocol: TCP }
+    {{- end }}
+{{- if .Values.console.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis.fullname" . }}-console
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "aegis.selector" (dict "root" . "component" "console") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {{- toYaml $np.ingressNamespaceSelector | nindent 14 }}
+      ports:
+        - { port: 8080, protocol: TCP }
+    {{- with $np.extraIngressFrom }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 8080, protocol: TCP }
+    {{- end }}
+{{- end }}
+{{- if and (eq .Values.storage.type "postgres") .Values.storage.postgres.cnpg.enabled }}
+---
+# CloudNativePG instances: SQL only from the control-plane and replication peers; the instance
+# manager API (status, backups, failover) only from the operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis.fullname" . }}-postgres
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: {{ include "aegis.cnpgName" . }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- include "aegis.selector" (dict "root" . "component" "control-plane") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "aegis.cnpgName" . }}
+      ports:
+        - { port: 5432, protocol: TCP }
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "aegis.cnpgName" . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.cnpgOperatorNamespace }}
+      ports:
+        - { port: 8000, protocol: TCP }
+        - { port: 5432, protocol: TCP }
+    {{- with $np.extraIngressFrom }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 8000, protocol: TCP }
+        - { port: 9187, protocol: TCP }
+    {{- end }}
+{{- end }}
+{{- end }}

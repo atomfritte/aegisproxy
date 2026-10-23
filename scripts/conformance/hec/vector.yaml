@@ -1,0 +1,15 @@
+sources:
+  hec_ack:
+    type: splunk_hec
+    address: 0.0.0.0:8088
+    valid_tokens: ["vector-ack-token-0123456789"]
+    acknowledgements:
+      enabled: true
+sinks:
+  out:
+    type: file
+    inputs: [hec_ack]
+    path: /out/hec_ack.jsonl
+    encoding: { codec: json }
+    acknowledgements:
+      enabled: true

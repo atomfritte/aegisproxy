@@ -1,0 +1,33 @@
+// ASIM AuditEvent parser for AegisProxy administration events (schema 0.1).
+// Save as a workspace function named "ASimAuditEventAegisProxy" with the parameter (disabled:bool=false).
+let Parser = (disabled: bool = false) {
+    AegisProxy_CL
+    | where not(disabled) and Stream == "audit"
+    | extend D = Data
+    | extend
+        EventCount = int(1),
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated,
+        EventType = case(Action has_any ("CREATED", "PROVISIONED", "REGISTERED", "SUBMITTED"), "Create",
+                         Action has_any ("DELETED", "DECOMMISSIONED", "REVOKED"), "Delete",
+                         Action has "LOGIN", "Other",
+                         "Set"),
+        EventResult = iff(Action endswith "DENIED", "Failure", "Success"),
+        EventOriginalType = Action,
+        EventOriginalUid = EventId,
+        EventProduct = "AegisProxy",
+        EventVendor = "AegisProxy",
+        EventSchema = "AuditEvent",
+        EventSchemaVersion = "0.1",
+        Operation = Action,
+        Object = tostring(D.entity_name),
+        ObjectType = tostring(D.entity_type),
+        ActorUsername = Actor,
+        ActorUsernameType = "Simple",
+        Dvc = Node,
+        EventMessage = Message,
+        OriginalObjectType = tostring(D.category)
+    | extend User = ActorUsername
+    | project-away D, Data
+};
+Parser(disabled = disabled)

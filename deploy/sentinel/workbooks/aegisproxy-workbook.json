@@ -1,0 +1,158 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "## AegisProxy egress gateway\nTraffic, threat protection and administration of the server egress proxy. Data: `AegisProxy_CL` (log export destination \"Microsoft Sentinel\")."
+      },
+      "name": "title"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "6b1f2c8e-0000-4000-8000-000000000001",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "type": 4,
+            "isRequired": true,
+            "value": {
+              "durationMs": 86400000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 2592000000
+                }
+              ],
+              "allowCustom": true
+            }
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"traffic\"\n| summarize Requests = count() by Verdict = tostring(Data.verdict)\n| order by Requests desc",
+        "size": 0,
+        "title": "Requests by verdict",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "tiles"
+      },
+      "name": "verdict-tiles"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"traffic\"\n| summarize count() by bin(TimeGenerated, 15m), Verdict = tostring(Data.verdict)",
+        "size": 0,
+        "title": "Requests over time",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "verdict-timechart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"traffic\" and Outcome == \"failure\"\n| summarize Blocked = count(), Servers = dcount(ServerName) by Destination, Verdict = tostring(Data.verdict)\n| top 20 by Blocked",
+        "size": 0,
+        "title": "Top blocked destinations",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "top-blocked",
+      "customWidth": "50"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"traffic\" and Outcome == \"failure\"\n| summarize Blocked = count(), Destinations = dcount(Destination) by ServerName, ServerIP\n| top 20 by Blocked",
+        "size": 0,
+        "title": "Servers with most blocked requests",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "top-servers",
+      "customWidth": "50"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"security\"\n| project TimeGenerated, Severity, Type = tostring(Data.type), ServerName, Destination, Message\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "Security events",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "security"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"audit\"\n| summarize Events = count() by Action, Actor\n| order by Events desc",
+        "size": 0,
+        "title": "Administrative activity",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "admin",
+      "customWidth": "50"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AegisProxy_CL\n| where Stream == \"audit\" and Action in (\"SERVER_QUARANTINED\", \"SERVER_RELEASED\", \"BREAK_GLASS_LOGIN\", \"POLICY_SET_EMERGENCY_PUBLISH\")\n| project TimeGenerated, Action, Actor, Message\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "Quarantine and break-glass events",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "quarantine",
+      "customWidth": "50"
+    }
+  ],
+  "fallbackResourceIds": [],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

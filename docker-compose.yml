@@ -1,0 +1,91 @@
+# AegisProxy — single-host deployment (Docker Compose)
+#
+#   cp .env.example .env && ./scripts/gen-secrets.sh >> .env   # once
+#   docker compose up -d --build
+#
+# Console/API: http://127.0.0.1:8081 (publish via a TLS reverse proxy, see docs/deployment/docker-compose.md)
+# Proxy:       <host>:8080   (configure servers with http_proxy/https_proxy)
+#
+# For high availability (PostgreSQL, multiple replicas, load balancer) see deploy/compose/ha/.
+name: aegisproxy
+
+x-hardening: &hardening
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  # One-shot: provisions the enterprise root CA into the shared (read-only for everybody else) volume.
+  ca-init:
+    <<: *hardening
+    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    build: { context: ., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
+    command: ["gen-ca", "/certs"]
+    volumes: ["aegis-ca:/certs"]
+    restart: "no"
+
+  control-plane:
+    <<: *hardening
+    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    depends_on:
+      ca-init: { condition: service_completed_successfully }
+    environment:
+      AEGIS_PUBLIC_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+      AEGIS_PROXY_ADDRESS: ${AEGIS_PROXY_ADDRESS:-}
+      AEGIS_JWT_SECRET: ${AEGIS_JWT_SECRET:?set AEGIS_JWT_SECRET in .env (scripts/gen-secrets.sh)}
+      AEGIS_ENCRYPTION_KEY: ${AEGIS_ENCRYPTION_KEY:-}   # generated in the data volume when empty
+      AEGIS_ENCRYPTION_KEY_PREVIOUS: ${AEGIS_ENCRYPTION_KEY_PREVIOUS:-}   # only during a key rotation (docs/operations.md)
+      AEGIS_DATAPLANE_KEY: ${AEGIS_DATAPLANE_KEY:?set AEGIS_DATAPLANE_KEY in .env (scripts/gen-secrets.sh)}
+      AEGIS_BOOTSTRAP_ADMIN_PASSWORD: ${AEGIS_BOOTSTRAP_ADMIN_PASSWORD:-}
+      AEGIS_METRICS_TOKEN: ${AEGIS_METRICS_TOKEN:-}
+      AEGIS_TRUSTED_PROXIES: ${AEGIS_TRUSTED_PROXIES:-}
+      AEGIS_INTERNAL_DOMAINS: ${AEGIS_INTERNAL_DOMAINS:-.internal.corp,.local,.localdomain,.internal,.lan,.home.arpa,.corp}
+      AEGIS_DEMO_MODE: ${AEGIS_DEMO_MODE:-false}
+      AEGIS_LOG_FORMAT: json
+    volumes:
+      - aegis-data:/data
+      - aegis-ca:/certs:ro
+    ports:
+      - "${AEGIS_CONSOLE_BIND:-127.0.0.1:8081}:8081"
+
+  data-plane:
+    <<: *hardening
+    image: aegisproxy/data-plane:${AEGIS_VERSION:-2.1.0}
+    build: { context: ./data-plane }
+    depends_on:
+      control-plane: { condition: service_healthy }
+      clamav: { condition: service_started }
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8081
+      AEGIS_DATAPLANE_KEY: ${AEGIS_DATAPLANE_KEY:?set AEGIS_DATAPLANE_KEY in .env}
+      AEGIS_PUBLIC_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+      DASHBOARD_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
+      AEGIS_CLAMD_ADDRESS: tcp://clamav:3310
+      AEGIS_FAIL_MODE: closed
+    volumes:
+      - aegis-ca:/certs:ro
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    ports:
+      - "${AEGIS_PROXY_BIND:-0.0.0.0:8080}:8080"
+
+  clamav:
+    image: clamav/clamav:1.5
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - clamav-db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh"]
+      interval: 60s
+      timeout: 15s
+      start_period: 300s
+
+volumes:
+  aegis-data:
+  aegis-ca:
+  clamav-db:

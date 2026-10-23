@@ -1,0 +1,33 @@
+id: cf10670b-6ddc-57ab-b189-469eb3ea3191
+name: AegisProxy - Break-glass account used
+description: |
+  An emergency (break-glass) administrator signed in with a password while single sign-on is mandatory. Verify that the use was authorized.
+severity: High
+requiredDataConnectors: []
+queryFrequency: 15m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - PrivilegeEscalation
+  - Persistence
+relevantTechniques:
+  - T1078
+query: |
+  AegisProxy_CL
+  | where Stream == "audit" and Action == "BREAK_GLASS_LOGIN"
+  | project TimeGenerated, Actor, Message, Node
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: Actor
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1d
+    matchingMethod: AnyAlert
+version: 1.0.0
+kind: Scheduled

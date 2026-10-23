@@ -1,0 +1,38 @@
+id: 6b7450fb-75ce-5664-8f22-b896f03a5c84
+name: AegisProxy - Credentials or secrets blocked in outbound request
+description: |
+  Data loss prevention (built-in detectors or an ICAP DLP engine) blocked an outbound request containing credentials, keys or other secrets.
+severity: High
+requiredDataConnectors: []
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+  - CredentialAccess
+relevantTechniques:
+  - T1048
+  - T1552
+query: |
+  AegisProxy_CL
+  | where Stream == "traffic" and tostring(Data.verdict) == "DLP_BLOCKED"
+  | summarize Requests = count(), Findings = make_set(tostring(Data.dlp_findings), 10), Destinations = make_set(Destination, 10) by ServerName, ServerIP
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: ServerName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: ServerIP
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1d
+    matchingMethod: AnyAlert
+version: 1.0.0
+kind: Scheduled

@@ -1,0 +1,37 @@
+id: 267a2038-b935-501a-b25b-5476cdd5ed10
+name: AegisProxy - Server contacted a threat-intelligence listed destination
+description: |
+  A server tried to reach a domain, URL or IP address listed by a threat-intelligence source (feeds, TAXII/MISP, Defender indicators). Repeated attempts indicate a compromised host or malicious software.
+severity: Medium
+requiredDataConnectors: []
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CommandAndControl
+relevantTechniques:
+  - T1071
+query: |
+  AegisProxy_CL
+  | where Stream == "traffic" and tostring(Data.verdict) == "THREAT_BLOCKED"
+  | summarize Attempts = count(), Destinations = make_set(Destination, 20), Categories = make_set(tostring(Data.threat_category), 10), Sources = make_set(ThreatSource, 10) by ServerName, ServerIP
+  | where Attempts >= 1
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: ServerName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: ServerIP
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1d
+    matchingMethod: AnyAlert
+version: 1.0.0
+kind: Scheduled

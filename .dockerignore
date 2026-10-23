@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/.git
+**/__pycache__
+**/*.pyc
+control-plane/aegis-control-plane
+control-plane/data
+certs
+.env
+*.log
+deploy
+docs

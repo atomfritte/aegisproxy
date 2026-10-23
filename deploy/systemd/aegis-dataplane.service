@@ -1,0 +1,117 @@
+# AegisProxy data-plane worker: mitmproxy 12.3.0 (mitmdump) + AegisProxy policy addon.
+# Installed by deploy/systemd/install-linux.sh to /etc/systemd/system/aegis-dataplane.service.
+# Variable reference: docs/configuration.md - operations guide: docs/deployment/linux.md
+#
+# Layout:
+#   /opt/aegis/data-plane/venv/                 Python >= 3.12 virtualenv with mitmproxy==12.3.0
+#   /opt/aegis/data-plane/aegis_addon.py        addon entry point (+ aegis_dp/ package)
+#   /etc/aegis/dataplane.env                    non-secret settings (CONTROL_PLANE_URL, AEGIS_CLAMD_ADDRESS, ...)
+#   /etc/aegis/secrets/dataplane.key            shared secret with the control-plane (root:root 0600)
+#   /etc/aegis/ca/mitmproxy-ca.pem              enterprise CA private key + certificate (root:root 0600)
+#
+# Both secrets are passed with LoadCredential= (copied by PID 1 into a ramfs readable only by this unit).
+# mitmproxy needs a *writable* confdir (it writes mitmproxy-dhparam.pem next to the CA), so ExecStartPre
+# stages a private copy of the CA into the runtime directory /run/aegis-dataplane/confdir (tmpfs, 0700,
+# removed when the service stops) - the same approach as data-plane/entrypoint.sh in the container image.
+#
+# The arguments are identical to data-plane/entrypoint.sh. The addon additionally enforces
+# connection_strategy=lazy, ssl_insecure=false and rawtcp=false at runtime.
+#
+# Listening on a port < 1024 (e.g. 80) needs a drop-in with
+#   [Service]
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Ports 3128/8080 need no capabilities. AEGIS_PROXY_MODE=transparent is not supported by this unit.
+
+[Unit]
+Description=AegisProxy data-plane worker (mitmproxy)
+Wants=network-online.target
+After=network-online.target aegis-control-plane.service clamav-daemon.service clamd@scan.service
+
+[Service]
+Type=exec
+User=aegis-dp
+Group=aegis-dp
+
+# Defaults (entrypoint.sh semantics); /etc/aegis/dataplane.env overrides them.
+Environment=AEGIS_LISTEN_HOST=0.0.0.0
+Environment=AEGIS_LISTEN_PORT=8080
+Environment=AEGIS_BODY_SIZE_LIMIT=1g
+Environment=AEGIS_MITM_LOG_LEVEL=info
+Environment=AEGIS_OPS_ADDR=127.0.0.1:9091
+Environment=AEGIS_FAIL_MODE=closed
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 HOME=%t/aegis-dataplane
+EnvironmentFile=/etc/aegis/dataplane.env
+
+LoadCredential=dataplane:/etc/aegis/secrets/dataplane.key
+LoadCredential=ca:/etc/aegis/ca/mitmproxy-ca.pem
+Environment=AEGIS_DATAPLANE_KEY_FILE=%d/dataplane
+
+RuntimeDirectory=aegis-dataplane
+RuntimeDirectoryMode=0700
+# Optional access log file: AEGIS_ACCESS_LOG=/var/log/aegis-dataplane/access.log
+LogsDirectory=aegis-dataplane
+LogsDirectoryMode=0750
+UMask=0077
+ExecStartPre=/usr/bin/install -d -m 0700 %t/aegis-dataplane/confdir
+ExecStartPre=/usr/bin/install -m 0600 %d/ca %t/aegis-dataplane/confdir/mitmproxy-ca.pem
+ExecStart=/opt/aegis/data-plane/venv/bin/mitmdump \
+    -s /opt/aegis/data-plane/aegis_addon.py \
+    --set confdir=%t/aegis-dataplane/confdir \
+    --listen-host ${AEGIS_LISTEN_HOST} \
+    --listen-port ${AEGIS_LISTEN_PORT} \
+    --set connection_strategy=lazy \
+    --set rawtcp=false \
+    --set onboarding=false \
+    --set block_global=false \
+    --set ssl_insecure=false \
+    --set tls_version_server_min=TLS1_2 \
+    --set body_size_limit=${AEGIS_BODY_SIZE_LIMIT} \
+    --set termlog_verbosity=${AEGIS_MITM_LOG_LEVEL}
+# mitmdump shuts down gracefully on SIGINT/SIGTERM.
+KillSignal=SIGINT
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# --- sandboxing ---------------------------------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# AF_UNIX: clamd via unix:///run/clamav/clamd.ctl (sockets stay connectable under ProtectSystem=strict).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute must stay OFF for the data-plane. CPython itself needs no W+X memory, but
+# mitmproxy's TLS stack uses pyOpenSSL callbacks (verify, ALPN, SNI) that are created with cffi's
+# ffi.callback(); with the cffi wheels installed by pip these require a writable+executable mapping.
+# Verified with mitmproxy 12.3.0 / cffi 2.1.1 under PR_SET_MDWE (what MemoryDenyWriteExecute=yes enforces):
+#   MemoryError: Cannot allocate write+execute memory for ffi.callback()
+# i.e. every intercepted TLS connection would fail. Re-test before enabling it with other builds.
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+KeyringMode=private
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2 @@
+# Optional engines installed into the data-plane image (binary wheels only).
+yara-x==1.22.0

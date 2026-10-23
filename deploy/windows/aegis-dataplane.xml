@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AegisProxy data-plane - WinSW service definition TEMPLATE
+  ==========================================================
+  Rendered by Install-AegisDataPlane.ps1 into <InstallDir>\aegis-dataplane.xml, next to the WinSW
+  executable which the script copies to <InstallDir>\aegis-dataplane.exe (WinSW 2.x locates its
+  configuration by the executable's base name). Do not install this template directly.
+
+  WinSW: https://github.com/winsw/winsw (MIT), release 2.x, asset "WinSW-x64.exe" (self-contained).
+
+  Placeholders (replaced by the script, values are XML-escaped):
+    @@MITMDUMP_EXE@@        <InstallDir>\venv\Scripts\mitmdump.exe  (python.org CPython >= 3.12 venv,
+                            pip install mitmproxy==12.3.0 - NOT the PyInstaller bundle, see docs)
+    @@ADDON_SCRIPT@@        <InstallDir>\app\aegis_addon.py
+    @@CONFDIR@@             <DataRoot>\confdir - private, writable mitmproxy confdir holding the staged
+                            CA (mitmproxy-ca.pem = key + certificate); mitmproxy writes its dhparam file here
+    @@LISTEN_HOST@@         proxy listen address              (entrypoint.sh: AEGIS_LISTEN_HOST, 0.0.0.0)
+    @@LISTEN_PORT@@         proxy listen port                 (entrypoint.sh: AEGIS_LISTEN_PORT, 8080)
+    @@BODY_SIZE_LIMIT@@     mitmproxy body_size_limit         (entrypoint.sh: AEGIS_BODY_SIZE_LIMIT, 1g)
+    @@MITM_LOG_LEVEL@@      mitmproxy termlog_verbosity       (entrypoint.sh: AEGIS_MITM_LOG_LEVEL, info)
+    @@WORKDIR@@             working directory (<InstallDir>\app)
+    @@LOG_DIR@@             WinSW log directory (<DataRoot>\logs)
+    @@CONTROL_PLANE_URL@@   CONTROL_PLANE_URL
+    @@DATAPLANE_KEY_FILE@@  AEGIS_DATAPLANE_KEY_FILE (<DataRoot>\secrets\dataplane.key, service-readable only)
+    @@OPS_ADDR@@            AEGIS_OPS_ADDR (/healthz, /readyz, /metrics)
+    @@FAIL_MODE@@           AEGIS_FAIL_MODE (closed | open)
+    @@EXTRA_ENV@@           optional <env/> elements: AEGIS_CLAMD_ADDRESS, AEGIS_CONTROL_PLANE_CA_FILE,
+                            AEGIS_PUBLIC_URL, DASHBOARD_URL, AEGIS_WORKER_ID, -ExtraEnvironment
+
+  Service account: WinSW installs the service as LocalSystem; Install-AegisDataPlane.ps1 switches the
+  logon account BEFORE the first start with "sc.exe config AegisDataPlane obj= NT SERVICE\AegisDataPlane"
+  (virtual account, default) or to NT AUTHORITY\LocalService (-ServiceAccount LocalService). This works
+  identically with WinSW 2.x and 3.x; the <serviceaccount> element is therefore intentionally not used
+  (its virtual-account support differs between WinSW versions).
+
+  The arguments reproduce data-plane/entrypoint.sh exactly. The addon additionally enforces
+  connection_strategy=lazy, ssl_insecure=false and rawtcp=false at runtime.
+-->
+<service>
+  <id>AegisDataPlane</id>
+  <name>AegisProxy Data-Plane</name>
+  <description>AegisProxy outbound HTTP/HTTPS proxy worker (mitmproxy 12.3.0 + AegisProxy policy addon).</description>
+
+  <executable>@@MITMDUMP_EXE@@</executable>
+  <arguments>-s "@@ADDON_SCRIPT@@" --set "confdir=@@CONFDIR@@" --listen-host @@LISTEN_HOST@@ --listen-port @@LISTEN_PORT@@ --set connection_strategy=lazy --set rawtcp=false --set onboarding=false --set block_global=false --set ssl_insecure=false --set tls_version_server_min=TLS1_2 --set body_size_limit=@@BODY_SIZE_LIMIT@@ --set termlog_verbosity=@@MITM_LOG_LEVEL@@</arguments>
+  <workingdirectory>@@WORKDIR@@</workingdirectory>
+
+  <startmode>Automatic</startmode>
+  <!-- Deliberately no <depend>AegisControlPlane</depend>: a hard dependency would stop the proxy on every
+       control-plane restart/upgrade. The worker enforces the last known policy while the control-plane is
+       unavailable and fails closed (503) only before its very first successful policy sync. -->
+
+  <!-- Graceful shutdown: WinSW sends Ctrl+C, mitmdump drains, hard kill after the timeout. -->
+  <stoptimeout>20 sec</stoptimeout>
+
+  <!-- Recovery: restart after crashes; reset the failure counter after one hour. -->
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- stdout/stderr of mitmdump + WinSW wrapper log, rotated by size (20 MB x 10 files). -->
+  <logpath>@@LOG_DIR@@</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>20480</sizeThreshold>
+    <keepFiles>10</keepFiles>
+  </log>
+
+  <!-- Python runtime: isolated (no user site-packages), unbuffered logs, read-only program directory. -->
+  <env name="PYTHONNOUSERSITE" value="1"/>
+  <env name="PYTHONDONTWRITEBYTECODE" value="1"/>
+  <env name="PYTHONUNBUFFERED" value="1"/>
+  <env name="PYTHONUTF8" value="1"/>
+
+  <!-- AegisProxy data-plane configuration (docs/configuration.md). Secrets only as *_FILE paths. -->
+  <env name="CONTROL_PLANE_URL" value="@@CONTROL_PLANE_URL@@"/>
+  <env name="AEGIS_DATAPLANE_KEY_FILE" value="@@DATAPLANE_KEY_FILE@@"/>
+  <env name="AEGIS_OPS_ADDR" value="@@OPS_ADDR@@"/>
+  <env name="AEGIS_FAIL_MODE" value="@@FAIL_MODE@@"/>
+  <env name="AEGIS_PROXY_MODE" value="regular"/>
+  @@EXTRA_ENV@@
+</service>

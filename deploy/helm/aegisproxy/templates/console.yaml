@@ -1,0 +1,78 @@
+{{- if .Values.console.enabled }}
+{{- $c := .Values.console }}
+{{- $sel := dict "root" . "component" "console" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aegis.fullname" . }}-console
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  replicas: {{ $c.replicas }}
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aegis.selector" $sel | nindent 8 }}
+    spec:
+      {{- include "aegis.imagePullSecrets" . | nindent 6 }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: console
+          image: {{ include "aegis.image" (dict "root" . "image" $c.image) }}
+          imagePullPolicy: {{ $c.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - { name: http, containerPort: 8080, protocol: TCP }
+          env:
+            {{- if $c.apiBaseUrl }}
+            - { name: AEGIS_API_BASE_URL, value: {{ $c.apiBaseUrl | quote }} }
+            {{- else }}
+            - { name: AEGIS_API_UPSTREAM, value: {{ printf "http://%s:%v" (include "aegis.cpService" .) .Values.controlPlane.service.port | quote }} }
+            {{- end }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          {{- if eq .Values.probes.mode "exec" }}
+          readinessProbe:
+            exec: { command: ["wget", "-qO-", "http://127.0.0.1:8080/healthz"] }
+          livenessProbe:
+            exec: { command: ["wget", "-qO-", "http://127.0.0.1:8080/healthz"] }
+          {{- else }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          {{- end }}
+          resources: {{- toYaml $c.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-console
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  ports:
+    - { name: http, port: 8080, targetPort: http, protocol: TCP }
+{{- if $c.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "aegis.fullname" . }}-console
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ $c.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels: {{- include "aegis.selector" $sel | nindent 6 }}
+{{- end }}
+{{- end }}

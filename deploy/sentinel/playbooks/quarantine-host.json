@@ -1,0 +1,233 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "title": "AegisProxy - Quarantine host",
+    "description": "Quarantines the hosts of a Microsoft Sentinel incident in AegisProxy (all outbound access blocked) and comments on the incident. Uses an AegisProxy service account (role INFOSEC_APPROVER) whose API key is stored in Azure Key Vault."
+  },
+  "parameters": {
+    "PlaybookName": {
+      "type": "string",
+      "defaultValue": "AegisProxy-QuarantineHost"
+    },
+    "AegisProxyUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "Base URL of the AegisProxy control-plane, e.g. https://aegis.corp.example"
+      }
+    },
+    "KeyVaultName": {
+      "type": "string",
+      "metadata": {
+        "description": "Key Vault holding the AegisProxy API key"
+      }
+    },
+    "ApiKeySecretName": {
+      "type": "string",
+      "defaultValue": "aegisproxy-api-key"
+    }
+  },
+  "variables": {
+    "sentinelConnection": "[concat('azuresentinel-', parameters('PlaybookName'))]",
+    "keyvaultConnection": "[concat('keyvault-', parameters('PlaybookName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('sentinelConnection')]",
+      "location": "[resourceGroup().location]",
+      "kind": "V1",
+      "properties": {
+        "displayName": "[variables('sentinelConnection')]",
+        "customParameterValues": {},
+        "parameterValueType": "Alternative",
+        "api": {
+          "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/azuresentinel')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('keyvaultConnection')]",
+      "location": "[resourceGroup().location]",
+      "kind": "V1",
+      "properties": {
+        "displayName": "[variables('keyvaultConnection')]",
+        "parameterValueType": "Alternative",
+        "alternativeParameterValues": {
+          "vaultName": "[parameters('KeyVaultName')]"
+        },
+        "api": {
+          "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/keyvault')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('PlaybookName')]",
+      "location": "[resourceGroup().location]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/connections', variables('sentinelConnection'))]",
+        "[resourceId('Microsoft.Web/connections', variables('keyvaultConnection'))]"
+      ],
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "$connections": {
+              "defaultValue": {},
+              "type": "Object"
+            },
+            "AegisProxyUrl": {
+              "type": "String",
+              "defaultValue": "[parameters('AegisProxyUrl')]"
+            }
+          },
+          "triggers": {
+            "Microsoft_Sentinel_incident": {
+              "type": "ApiConnectionWebhook",
+              "inputs": {
+                "body": {
+                  "callback_url": "@{listCallbackUrl()}"
+                },
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                  }
+                },
+                "path": "/incident-creation"
+              }
+            }
+          },
+          "actions": {
+            "Get_API_key": {
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['keyvault']['connectionId']"
+                  }
+                },
+                "method": "get",
+                "path": "[concat('/secrets/@{encodeURIComponent(''', parameters('ApiKeySecretName'), ''')}/value')]"
+              },
+              "runtimeConfiguration": {
+                "secureData": {
+                  "properties": [
+                    "outputs"
+                  ]
+                }
+              }
+            },
+            "For_each_host": {
+              "type": "Foreach",
+              "foreach": "@triggerBody()?['object']?['properties']?['relatedEntities']",
+              "runAfter": {
+                "Get_API_key": [
+                  "Succeeded"
+                ]
+              },
+              "actions": {
+                "Is_host": {
+                  "type": "If",
+                  "expression": {
+                    "and": [
+                      {
+                        "equals": [
+                          "@items('For_each_host')?['kind']",
+                          "Host"
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Quarantine": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "POST",
+                        "uri": "@{parameters('AegisProxyUrl')}/api/servers/quarantine",
+                        "headers": {
+                          "Authorization": "Bearer @{body('Get_API_key')?['value']}",
+                          "Content-Type": "application/json"
+                        },
+                        "body": {
+                          "hostname": "@{coalesce(items('For_each_host')?['properties']?['fqdn'], items('For_each_host')?['properties']?['hostName'])}",
+                          "quarantined": true,
+                          "reason": "Microsoft Sentinel incident @{triggerBody()?['object']?['properties']?['incidentNumber']}: @{triggerBody()?['object']?['properties']?['title']}"
+                        }
+                      },
+                      "runtimeConfiguration": {
+                        "secureData": {
+                          "properties": [
+                            "inputs"
+                          ]
+                        }
+                      }
+                    },
+                    "Comment_on_incident": {
+                      "type": "ApiConnection",
+                      "runAfter": {
+                        "Quarantine": [
+                          "Succeeded",
+                          "Failed"
+                        ]
+                      },
+                      "inputs": {
+                        "host": {
+                          "connection": {
+                            "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                          }
+                        },
+                        "method": "post",
+                        "path": "/Incidents/Comment",
+                        "body": {
+                          "incidentArmId": "@triggerBody()?['object']?['id']",
+                          "message": "<p>AegisProxy quarantine of @{items('For_each_host')?['properties']?['hostName']}: HTTP @{outputs('Quarantine')?['statusCode']}</p>"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "azuresentinel": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('sentinelConnection'))]",
+                "connectionName": "[variables('sentinelConnection')]",
+                "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/azuresentinel')]",
+                "connectionProperties": {
+                  "authentication": {
+                    "type": "ManagedServiceIdentity"
+                  }
+                }
+              },
+              "keyvault": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('keyvaultConnection'))]",
+                "connectionName": "[variables('keyvaultConnection')]",
+                "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/keyvault')]",
+                "connectionProperties": {
+                  "authentication": {
+                    "type": "ManagedServiceIdentity"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
