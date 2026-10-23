@@ -3,7 +3,7 @@
 #   docker build -t aegisproxy/control-plane:2.1.0 --build-arg VERSION=2.1.0 .
 # For split deployments use control-plane/Dockerfile (API only) and frontend/Dockerfile (console only).
 
-FROM node:24-alpine AS ui
+FROM node:25-alpine AS ui
 WORKDIR /src
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
