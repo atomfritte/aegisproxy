@@ -18,7 +18,7 @@ jobs:
           --health-cmd "pg_isready -U aegis" --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - run: test -z "$(gofmt -l control-plane)" || (gofmt -l control-plane; exit 1)
       - run: go -C control-plane vet ./...
@@ -51,7 +51,7 @@ jobs:
         run: |
           TOK=$(python -I -c "import sys; sys.path.insert(0,'data-plane'); from aegis_dp.controlplane import sign_block_token; print(sign_block_token('k'*40, {'ip':'10.1.0.5','url':'https://x.example/ü','m':'GET','tid':'t'}))")
           echo "AEGIS_XLANG_BLOCK_TOKEN=$TOK" >> "$GITHUB_ENV"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - run: go -C control-plane test -run TestCrossLanguageBlockToken -v ./internal/auth/
 
@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: installer unit tests (Pester, fake system - touches nothing on the runner)
         run: ./deploy/windows/tests/Invoke-InstallerTests.ps1 -OutputDir test-results
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - name: Go tests on Windows (file sharing semantics, paths, service code)
         run: go -C control-plane test -count=1 ./...
