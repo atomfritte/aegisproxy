@@ -1,125 +1,295 @@
-# AegisProxy Enterprise
+<div align="center">
 
-Zero-trust **egress gateway for server fleets** — a default-deny HTTP(S) proxy built on mitmproxy with
-path-level whitelisting, self-service access requests, layered threat protection and a highly available Go
-control-plane.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+  <img src="docs/assets/logo-light.svg" alt="AegisProxy" width="372">
+</picture>
 
+### Zero-trust egress control for server fleets
+
+Every outbound HTTP(S) request of your servers passes a default-deny proxy that knows **which server** asks,
+**which exact path** it wants and **who approved it** — with self-service requests, change management,
+threat protection and a complete audit trail.
+
+![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.26-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
+
+[Quick start](#quick-start) · [Screenshots](#a-tour-of-the-console) · [Deployment](#deployment) ·
+[Documentation](#documentation) · [Security](SECURITY.md)
+
+<br>
+
+<img src="docs/images/overview-dark.png" alt="AegisProxy console: overview with pending approvals, security posture, traffic and policy health" width="100%">
+
+</div>
+
+---
+
+## Why AegisProxy
+
+Servers rarely need "the internet" — they need a handful of package mirrors, APIs and download paths. Classic
+proxies allow whole domains and leave the rest to firewall tickets. AegisProxy closes that gap:
+
+- **Least privilege down to the path.** Rules match host *and* path (`github.com/hashicorp/terraform/releases/**`),
+  methods and expiry. Redirects to CDN objects are followed precisely instead of opening the whole CDN.
+- **Know the server, not just the IP.** Requests are attributed to registered servers and groups (by address or
+  per-server proxy token), so policies, approvals and logs speak in terms of your fleet.
+- **Self-service instead of tickets.** A blocked request shows a block page (browser) or a copy-paste message
+  (CLI) with a signed block token; the responsible team approves with one click, scoped and time-limited.
+- **Changes like code.** Versioned policy sets with drafts, diffs, impact simulation against real traffic,
+  optional four-eyes review, recertification and one-click rollback.
+- **Threat protection on every allowed request.** Threat intelligence (abuse.ch, Spamhaus, TAXII 2.1, MISP,
+  Microsoft Defender), ClamAV, YARA-X, ICAP engines and DLP — fail-open or fail-closed, per policy.
+- **Built for enterprises.** SSO and SCIM, RBAC with need-to-know, keyed hash-chained audit trail, secrets
+  encrypted at rest, SIEM export, active-active HA on PostgreSQL, and installers for Kubernetes, Linux and
+  Windows Server.
+
+## How it works
+
+```mermaid
+flowchart LR
+    FLEET["<b>Your servers</b><br/>CI runners · Kubernetes nodes<br/>GPU clusters · databases"]
+    W["<b>Data-plane workers</b><br/>mitmproxy + AegisProxy addon<br/>TLS inspection · policy<br/>AV · YARA · ICAP · DLP"]
+    NET(("Internet"))
+    API["<b>Control-plane</b> (1..N replicas)<br/>API · policy engine · threat intel<br/>audit · log export · web console"]
+    DB[("File storage or<br/>PostgreSQL (HA)")]
+    IDP["Entra ID / OIDC<br/>SCIM"]
+    TI["Threat feeds<br/>TAXII · MISP · Defender"]
+    SIEM["SIEM / observability<br/>Splunk · Sentinel · syslog · OTLP"]
+
+    FLEET -- "HTTP(S) proxy :8080" --> W
+    W -- "allowed only" --> NET
+    W <-- "policy bundle / telemetry" --> API
+    API --- DB
+    IDP -. SSO .-> API
+    TI -. indicators .-> API
+    API -. events .-> SIEM
 ```
-servers ──http(s)_proxy──▶ data-plane (mitmproxy + Aegis addon) ──▶ internet
-                               │ policy, threat intel, telemetry
-                               ▼
-                         control-plane (Go, 1..N replicas) ◀── console (React) / API
-                               │
-                         file storage  or  PostgreSQL (HA)
+
+The **data-plane** is a fleet of stateless proxy workers. Each one pulls a compiled policy bundle and threat
+intelligence from the control-plane, decides every request locally (no round trip per request) and streams
+telemetry back. The **control-plane** is a single Go binary that serves the API and the console and stores its
+state in a file (single node) or PostgreSQL (active-active). Deny is the default, and on a missing policy the
+workers fail closed.
+
+## A tour of the console
+
+The screenshots show the console with its built-in sample data (`AEGIS_DEMO_MODE=true`).
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/live-traffic.png" alt="Live traffic"><br><b>Live traffic</b> — every request with server, verdict and matched rule; turn a blocked request into a rule.</td>
+    <td width="50%"><img src="docs/images/change-request.png" alt="Change request"><br><b>Change requests</b> — rule-level diff, impact on recorded traffic and four-eyes approval.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/access-request.png" alt="Access request"><br><b>Access requests</b> — submitted from the block page or CLI, with SLA, suggested least-privilege rule and verified server identity.</td>
+    <td><img src="docs/images/block-page-designer.png" alt="Block page designer"><br><b>Block page designer</b> — branded pages per server group, in English and German, with live preview.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/threat-protection.png" alt="Threat protection"><br><b>Threat protection</b> — threat intelligence, antivirus, DLP and YARA findings with protection layers at a glance.</td>
+    <td><img src="docs/images/security-posture.png" alt="Security posture"><br><b>Security posture</b> — 25 hardening checks of the deployment with concrete remediation.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/audit-trail.png" alt="Audit trail"><br><b>Audit trail</b> — every change and approval, hash-chained and verifiable, exportable as JSON Lines.</td>
+    <td valign="top"><b>And more</b> — fleet and dynamic label groups, learning sessions that compile recorded traffic into rules, bandwidth per group, TLS exceptions, corporate PKI, single sign-on, service accounts, log export and Microsoft Defender settings.</td>
+  </tr>
+</table>
+
+### What a blocked server sees
+
+Command-line clients get a plain-text explanation they can act on, including a one-liner to request access
+(output of a real request, token shortened):
+
+```text
+$ curl -x http://proxy.corp.example:8080 http://example.com/
+================================================================================
+ AEGISPROXY — ACCESS BLOCKED (HTTP 403)
+================================================================================
+ Server          : unregistered-172.24.0.1 (172.24.0.1)
+ Server groups   : unassigned
+ Blocked URL     : [GET] http://example.com/
+ Trace ID        : flw-0dcefac7125a4ca9
+ Reason          : BLOCKED — No matching whitelist rule (default deny)
+--------------------------------------------------------------------------------
+ REQUEST ACCESS
+  In a browser:
+    http://localhost:8081/?portal=block&bt=v1.eyJpcCI6…
+
+  From this server (replace the reason):
+    curl -sX POST http://localhost:8081/api/public/requests \
+      -H "Content-Type: application/json" \
+      -d '{"block_token":"v1.eyJpcCI6…", "requester": "root@unregistered-172.24.0.1", "reason": "ENTER_REASON_HERE", "requested_scope": "prefix_with_objects", "duration": "1h"}'
+--------------------------------------------------------------------------------
+ INSTALL THE ROOT CA
+    Linux:   curl -fsSL http://localhost:8081/api/public/ca/install-linux.sh | sudo bash
+    Windows: iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 | iex
+================================================================================
 ```
+
+Browsers get the branded HTML block page with a request form instead.
 
 ## Features
 
-**Policy management** ([guide](docs/policy-management.md))
-- **Policy sets**: versioned rule collections per server group, server or the whole fleet (baseline), with owners,
-  tags, priorities and recertification dates.
-- **Change management**: drafts, rule-level diffs, impact simulation against recorded traffic, optional
-  **four-eyes review** via change requests, emergency publish, version history and one-click rollback.
-- **Access request workflow**: SLA, assignment, discussion, bulk review, granted durations, extend and revoke.
-- **Fleet management**: labels and label-based dynamic groups, onboarding snippets, CSV import/export,
-  discovery of unregistered sources, effective-policy view per server, **quarantine** for incident response.
-- **Branded block pages** per group (logo, colors, texts in English/German, support contacts, offered
-  self-service options) with live preview.
+<details open>
+<summary><b>Policy and change management</b> · <a href="docs/policy-management.md">guide</a></summary>
 
-**Fine-grained egress policy**
-- Default deny; ALLOW/BLOCK rules with host + path patterns (`github.com/microsoft/**`), method lists,
-  companions and expiry.
-- **Redirect lineage**: an allowed request that redirects to a CDN object (`objects.githubusercontent.com/…`)
-  authorizes exactly that object for two minutes — no need to open the whole CDN.
-- **Learning sessions**: record a reference server, compile the traffic into rules, publish to whole groups.
-- **TLS no-break exceptions** for pinned/mTLS endpoints, scoped by group, never for strict-isolation tiers.
+- **Policy sets** per server group, server or the whole fleet (baseline): versioned, with owners, tags,
+  priorities and recertification dates.
+- **Rules** with host and path patterns, method lists, companions and expiry; deny is the default.
+- **Redirect lineage**: an allowed download that redirects to a CDN object authorizes exactly that object for
+  two minutes.
+- **Drafts, diffs and impact simulation** against recorded traffic; optional **four-eyes review**, emergency
+  publish (Super Admins, flagged in the audit), version history and rollback.
+- **Learning sessions** record a reference server and compile its traffic into rules.
+- **Guardrails**: Team Leads cannot remove, disable or re-scope InfoSec baselines.
+- **TLS no-break exceptions** for pinned or mutual-TLS endpoints, never for strict-isolation tiers.
+- **Policy as code**: export and import policy sets as drafts.
+</details>
 
-**Self-service with verified identity**
-- Browser block page and CLI message with a **data-plane–signed block token**; access requests are routed to
-  InfoSec / Team Leads (Microsoft Teams, Slack) and approved with RBAC.
+<details>
+<summary><b>Self-service access requests</b></summary>
 
-**Threat protection** ([details](docs/threat-protection.md))
-- Threat-intelligence feeds (abuse.ch, Spamhaus DROP, Emerging Threats, URLhaus domains, …) + custom IOCs
+- Browser block page and CLI message with a **data-plane-signed block token**, so the requesting server is
+  verified, not claimed.
+- Queues with SLA, assignment, discussion, bulk review, granted durations, extension and revocation.
+- Notifications to Microsoft Teams and Slack; approvals land in a group's approvals policy set.
+- Branded block page templates per group, English and German, with self-service options you choose.
+</details>
+
+<details>
+<summary><b>Threat protection</b> · <a href="docs/threat-protection.md">details</a></summary>
+
+- Threat-intelligence feeds (abuse.ch, Spamhaus DROP, Emerging Threats, URLhaus and more) and custom indicators
   for domains, URLs, IPs/CIDRs and file hashes — checked on host names, URLs, **resolved IPs** and downloads.
-- Your threat-intelligence platform via **TAXII 2.1 / MISP**, and **Microsoft Defender for Endpoint** indicators.
-- **ClamAV**, **YARA** (YARA-X) and **ICAP** to commercial antivirus, sandbox and DLP engines; **download control**
-  by file type, **DLP** for secrets in outbound requests, anomaly detection for block bursts.
-- **Defender device risk / isolation** and SOAR playbooks quarantine compromised servers at the proxy.
-- Protocol guard: no raw TCP through CONNECT, Host/SNI consistency (domain fronting), DNS-rebinding
-  protection with IP pinning, cloud-metadata and internal ranges blocked, IP-literal and port policy.
+- Your threat-intelligence platform via **TAXII 2.1** or **MISP**, and **Microsoft Defender for Endpoint**
+  indicators; Defender device risk and isolation can quarantine servers at the proxy.
+- **ClamAV**, **YARA** (YARA-X) and **ICAP** (RESPMOD/REQMOD) for commercial antivirus, sandbox and DLP engines;
+  download control by file type; **DLP** detectors for secrets in outbound requests.
+- Every content encoding is decoded with bomb limits before scanning; nothing undecodable passes.
+- Protocol guard: no raw TCP through CONNECT, Host/SNI consistency (domain fronting), DNS-rebinding protection
+  with IP pinning, cloud-metadata and internal ranges blocked, IP-literal and port policy.
+- **Quarantine** a server in one click or automatically (Defender risk, SOAR playbooks via service accounts).
+</details>
 
-**Enterprise operations**
-- **Identity** ([details](docs/identity.md)): single sign-on with Microsoft Entra ID or any OIDC provider (PKCE,
-  group-based roles and scopes, just-in-time provisioning), alerted break-glass accounts, expiring and
-  CIDR-restricted **service accounts** for automation.
-- RBAC (Super Admin, InfoSec, Team Lead, Auditor), tamper-evident audit trail with complete export, secrets
-  encrypted at rest (AES-256-GCM, key rotation), **security posture** score, interception CA issued by the
-  corporate PKI.
-- **Log export** ([details](docs/log-export.md)): audit, traffic ("browsing") and security records to syslog
-  (rsyslog, syslog-ng, QRadar LEEF, ArcSight CEF), OpenTelemetry (OTLP), Splunk HEC, Elasticsearch/OpenSearch,
-  Microsoft Sentinel, Datadog, Grafana Loki, signed webhooks and files — batched, with a durable spool
-  (at-least-once). Squid-format access logs on every worker. Microsoft Sentinel solution (Bicep, ASIM parsers,
-  analytics rules, workbook, quarantine playbook) and a Splunk CIM add-on.
-- Active-active control-plane on PostgreSQL, stateless data-plane workers, Prometheus metrics, health probes,
-  graceful draining.
-- Deployment options: Docker Compose, Compose HA, Kubernetes (Helm + CloudNativePG), Linux (systemd),
-  Windows Server (native service) — console bundled or hosted separately.
+<details>
+<summary><b>Identity, audit and compliance</b> · <a href="docs/identity.md">identity</a> · <a href="docs/compliance.md">compliance</a></summary>
 
-## Quick start (Docker Compose)
+- Single sign-on with **Microsoft Entra ID** or any OIDC provider (PKCE, client secret or `private_key_jwt`),
+  group-to-role and group-to-scope mapping, **SCIM 2.0** provisioning and deprovisioning (Entra ID, Okta).
+- Roles: Super Admin, InfoSec Approver, Team Lead (need-to-know on their groups), Auditor (read-only);
+  alerted break-glass accounts; expiring, CIDR-bound **service accounts** for automation.
+- **Keyed, hash-chained audit trail** (HMAC-SHA256) with complete export and verification; built-in rotation.
+- Secrets encrypted at rest (AES-256-GCM, key rotation); interception CA as a subordinate of your corporate PKI.
+- **Security posture** page with 25 hardening checks; mapping to ISO/IEC 27001, NIST SP 800-53,
+  BSI IT-Grundschutz and SOC 2 with an auditor checklist.
+</details>
+
+<details>
+<summary><b>Integrations and operations</b> · <a href="docs/log-export.md">log export</a> · <a href="docs/operations.md">operations</a></summary>
+
+- **Log export** of audit, traffic and security records to syslog (rsyslog, syslog-ng, QRadar LEEF, ArcSight
+  CEF), OpenTelemetry (OTLP), **Splunk HEC** (with indexer acknowledgement), Elasticsearch/OpenSearch,
+  **Microsoft Sentinel** (client secret, managed identity or AKS workload identity; Azure Government and China),
+  Datadog, Grafana Loki, signed webhooks and files — batched, with a durable spool (at-least-once).
+- Microsoft Sentinel solution (Bicep, ASIM parsers, analytics rules, workbook, quarantine playbook) and a
+  Splunk add-on with CIM mappings; Squid-format access logs on every worker.
+- Active-active control-plane on PostgreSQL, stateless workers, Prometheus metrics and alert rules, health
+  probes, graceful draining; OpenAPI 3.1 description of the complete API.
+</details>
+
+## Quick start
+
+Try AegisProxy on one host with Docker Compose (Docker with the Compose plugin and `openssl`):
 
 ```bash
 cp .env.example .env
-./scripts/gen-secrets.sh >> .env
+./scripts/gen-secrets.sh >> .env          # JWT, data-plane and encryption keys
 docker compose up -d --build
 docker run --rm -v aegisproxy_aegis-data:/data alpine cat /data/secrets/initial-admin-password
 ```
 
-Open http://127.0.0.1:8081 and sign in as `admin`. Then point a test server at `http://<host>:8080` and install
-the CA with `curl -fsSL http://<host>:8081/api/public/ca/install-linux.sh | sudo bash`.
+Open **http://127.0.0.1:8081** and sign in as `admin` with that password. Change it right away (user menu or
+<kbd>Ctrl</kbd>+<kbd>K</kbd> → *Change password*), then delete the file and send a first request through the
+proxy on port **8080** — it is blocked, because nothing is allowed yet:
 
-Want sample data? Set `AEGIS_DEMO_MODE=true` on a fresh volume (public demo credentials — evaluation only).
+```bash
+docker run --rm -v aegisproxy_aegis-data:/data alpine rm /data/secrets/initial-admin-password
+curl -x http://127.0.0.1:8080 http://example.com/      # → 403 with the message shown above
+```
+
+Then, in the console:
+
+1. **Groups → New group**: e.g. *Build servers* with the address range of your servers.
+2. **Servers → Register** a server (host name and IP), or let requests from the group's range be attributed.
+3. **Policy sets → New policy set** for the group, add an *Allow* rule such as `example.com` with path `/**`,
+   and **Publish**. Workers pick it up within seconds.
+4. On the server: `export https_proxy=http://<host>:8080 http_proxy=http://<host>:8080` and trust the
+   enterprise CA with `curl -fsSL http://<host>:8081/api/public/ca/install-linux.sh | sudo bash`
+   (Windows: `install-windows.ps1`).
+5. Watch the result in **Live traffic**; blocked requests can be requested and approved from there.
+
+Want to look around first? Start on a fresh volume with `AEGIS_DEMO_MODE=true` for sample data (public demo
+accounts such as `admin` / `admin123` — evaluation only, never in production).
+
+> [!IMPORTANT]
+> For anything beyond a test, publish the console through TLS (`AEGIS_PUBLIC_URL=https://…`), keep the
+> generated secrets in a secret store and follow the hardening checklist in [docs/security.md](docs/security.md).
+
+## Deployment
+
+| Option | Use it for | Guide |
+|---|---|---|
+| Docker Compose | single host, evaluation, small sites | [docker-compose.md](docs/deployment/docker-compose.md) |
+| Docker Compose HA | PostgreSQL, two control-planes, two workers behind HAProxy | [high-availability.md](docs/deployment/high-availability.md) |
+| Kubernetes (Helm) | production; CloudNativePG, NetworkPolicies, PrometheusRule, workload identity; Kubernetes ≥ 1.27 | [kubernetes.md](docs/deployment/kubernetes.md) |
+| Linux (systemd) | VMs and bare metal; hardened units, hash-pinned offline installs | [linux.md](docs/deployment/linux.md) |
+| Windows Server | native control-plane service, worker under WinSW, console on IIS | [windows.md](docs/deployment/windows.md) |
+| Separate console | console on its own host or CDN | [separate-console.md](docs/deployment/separate-console.md) |
+
+Ports: **8080** proxy (servers), **8081** API and console (administrators, workers), **9091** worker health and
+metrics. Release images are signed with cosign and carry an SBOM; see the
+[deployment overview](docs/deployment/README.md) for sizing and topologies.
 
 ## Documentation
 
 | Topic | Document |
 |---|---|
-| Architecture, policy evaluation, HA design, data storage | [docs/architecture.md](docs/architecture.md) |
-| Policy sets, change management, requests, fleet, block pages | [docs/policy-management.md](docs/policy-management.md) |
-| Log export to SIEM / observability platforms | [docs/log-export.md](docs/log-export.md) |
-| Deployment options and sizing | [docs/deployment/](docs/deployment/README.md) |
-| Docker Compose · HA · Kubernetes · Linux · Windows · separate console | [compose](docs/deployment/docker-compose.md) · [HA](docs/deployment/high-availability.md) · [Kubernetes](docs/deployment/kubernetes.md) · [Linux](docs/deployment/linux.md) · [Windows](docs/deployment/windows.md) · [console](docs/deployment/separate-console.md) |
-| Configuration reference (all environment variables) | [docs/configuration.md](docs/configuration.md) |
-| Threat protection: threat intel, TAXII/MISP, Defender, YARA, ICAP, DLP, quarantine | [docs/threat-protection.md](docs/threat-protection.md) |
-| Identity: single sign-on, break-glass accounts, service accounts | [docs/identity.md](docs/identity.md) |
-| Security model, encryption at rest, fixed findings, hardening checklist | [docs/security.md](docs/security.md) |
-| Threat model (STRIDE) | [docs/threat-model.md](docs/threat-model.md) |
-| Compliance mapping (ISO 27001, NIST SP 800-53, BSI IT-Grundschutz, SOC 2) and auditor checklist | [docs/compliance.md](docs/compliance.md) |
-| Operations: rollout, monitoring, audit trail, posture, backup, upgrades, key rotation, corporate PKI, troubleshooting | [docs/operations.md](docs/operations.md) |
-| API reference | [docs/api.md](docs/api.md) |
-| Tests and verification | [docs/testing.md](docs/testing.md) |
-
-## Repository layout
-
-```
-control-plane/        Go control-plane (API, store, threat intel, auth)
-data-plane/           mitmproxy addon (aegis_dp package), entrypoint, tests
-frontend/             React/TypeScript console (+ nginx image for separate hosting)
-deploy/compose/ha/    HA reference deployment (PostgreSQL, HAProxy, 2+2 replicas)
-deploy/helm/          Helm chart
-deploy/systemd/       Linux units, env templates, installer
-deploy/windows/       Windows service installers, WinSW template, IIS config
-deploy/nginx/         TLS reverse-proxy example
-docs/                 documentation
-scripts/              helper scripts (secret generation)
-```
+| Architecture, policy evaluation, HA design, data storage | [architecture.md](docs/architecture.md) |
+| Policy sets, change management, requests, fleet, block pages | [policy-management.md](docs/policy-management.md) |
+| Threat protection: threat intel, TAXII/MISP, Defender, YARA, ICAP, DLP, quarantine | [threat-protection.md](docs/threat-protection.md) |
+| Identity: single sign-on, SCIM, break-glass and service accounts | [identity.md](docs/identity.md) |
+| Log export to SIEM and observability platforms | [log-export.md](docs/log-export.md) |
+| Configuration reference (all environment variables) | [configuration.md](docs/configuration.md) |
+| Operations: rollout, monitoring, audit, backup, upgrades, key rotation, corporate PKI, troubleshooting | [operations.md](docs/operations.md) |
+| Security model, encryption at rest, hardening checklist | [security.md](docs/security.md) · [SECURITY.md](SECURITY.md) |
+| Threat model (STRIDE) | [threat-model.md](docs/threat-model.md) |
+| Compliance mapping and auditor checklist | [compliance.md](docs/compliance.md) |
+| API reference (OpenAPI 3.1) | [api.md](docs/api.md) |
+| Tests and verification results | [testing.md](docs/testing.md) |
 
 ## Development
 
 ```bash
-make test                      # Go (race), Python, frontend build, Helm lint
-make build                     # binaries + console
-make images                    # container images
-npm --prefix frontend run dev  # console dev server on :5173 (proxies /api to :8081)
+make test                 # Go (race detector), Python, console build, Helm lint
+make build                # control-plane binary and console
+make images               # container images
+make test-installers      # Windows installers against an in-memory Windows model (Pester, Docker)
+make test-windows-wine    # Windows builds under Wine, incl. PostgreSQL cluster tests (Docker)
+make test-conformance     # Splunk HEC, Sentinel and public Microsoft endpoints vs. reference implementations
+npm --prefix frontend run dev   # console dev server on :5173 (proxies /api to :8081)
 ```
 
-Requirements: Go ≥ 1.26, Python ≥ 3.12 with mitmproxy 12.3 (data-plane), Node ≥ 22, Docker.
+Requirements: Go ≥ 1.26, Python ≥ 3.12 with mitmproxy 12.3, Node.js 24, Docker. Repository layout:
+
+```
+control-plane/      Go control-plane: API, policy engine, store, threat intel, identity, export
+data-plane/         mitmproxy addon (aegis_dp), entrypoint, tests
+frontend/           React/TypeScript console (+ nginx image for separate hosting)
+deploy/             Helm chart, Compose HA, systemd, Windows, nginx, Sentinel and Splunk packages
+docs/               documentation
+scripts/            secret generation, Wine and conformance harnesses, live integration tests
+```
+
+## Security
+
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). The security model, the
+results of the independent review and the hardening checklist are in [docs/security.md](docs/security.md).
