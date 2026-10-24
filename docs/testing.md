@@ -10,11 +10,12 @@ make test            # all of the below
 |---|---|---|
 | Go unit + API tests | `go -C control-plane test -race ./...` | log export (CEF/LEEF/ECS formats and escaping, filters, syslog over TCP and UDP, OTLP, Splunk HEC, Elasticsearch bulk incl. partial rejections, Sentinel token flow, Datadog, Loki, signed webhooks, files, permanent vs. transient errors, ordered spool replay across a restart, link-local refusal, API secret redaction and metrics), policy sets (draft/publish, four-eyes review, emergency publish, versions, rollback, withdraw), Team Lead guardrail protection inside sets, baseline scope never matching unregistered sources, approvals sets with extend/revoke and governance caps, quarantine, dynamic label groups and effective policy, impact simulation, schema-v3 migration, atomic CSV import with dry run, block page template validation, renderer escaping/localization, policy/fleet/block-page API flows, password hashing (incl. legacy migration), JWT tampering / `alg=none` / revocation, block tokens, login throttling, RBAC (Team Lead restrictions), feed parsing and matching, policy evaluation order, TLS-bypass scoping and strict isolation, rule validation, request de-duplication and single review, user-management guard rails, security events and burst detection, legacy state migration, cookie sessions, CSRF, data-plane auth/ETags, block-token attestation, install-script host pinning, built-in audit log rotation (timestamped generations, delayed compression, no rotation while an export or verification reads, complete chain across generations, crash leftovers) |
 | PostgreSQL cluster tests | `AEGIS_TEST_DATABASE_URL=postgres://… go -C control-plane test ./internal/store/` | two nodes on one database: replication via LISTEN/NOTIFY, 20 concurrent writes across nodes (no lost updates, linear audit chain), duplicate detection across nodes, telemetry and session-revocation replication, import of a 1.x state file, change request submitted on one node and approved on the other, rule-hit and quarantine replication, migration of a 2.0 cluster document by a joining 2.1 node |
-| Data-plane unit tests | `python3 -I data-plane/tests/test_dataplane.py` | access log formats (Squid/combined/JSON), file and TCP-syslog destinations incl. unreachable server, size-based file rotation (Windows default) and its configuration, quarantine, `*`-scope semantics, branded block pages (locale negotiation, group template selection, escaping, single-pass substitution, logo validation, threat variant), path canonicalization, evaluation order (mirrors the Go cases), identity resolution, TLS bypass scope, CONNECT semantics, redirect grants, learning sessions, threat-intel matching, block-token format, DLP detectors, file-type detection, clamd INSTREAM against a fake clamd |
+| Data-plane unit tests | `python3 -I data-plane/tests/test_dataplane.py` (without mitmproxy the hook tests are skipped); in the hash-locked environment `python -I data-plane/tests/run_no_skips.py` (a skipped test fails) | mitmproxy hook sequences (fail-closed hooks, buffering budget, redirect grants, ICAP, YARA), access log formats (Squid/combined/JSON), file and TCP-syslog destinations incl. unreachable server, size-based file rotation (Windows default) and its configuration, quarantine, `*`-scope semantics, branded block pages (locale negotiation, group template selection, escaping, single-pass substitution, logo validation, threat variant), path canonicalization, evaluation order (mirrors the Go cases), identity resolution, TLS bypass scope, CONNECT semantics, redirect grants, learning sessions, threat-intel matching, block-token format, DLP detectors, file-type detection, clamd INSTREAM against a fake clamd |
 | Windows builds under Wine | `scripts/wine/run-go-tests.sh <dir> --cluster`, `exe_e2e.py`, `dp_e2e.py` (see [`scripts/wine/README.md`](../scripts/wine/README.md)) | the Go suites compiled for `windows/amd64` incl. PostgreSQL cluster tests; `aegis-control-plane.exe` as console process and as SCM service; the data-plane on python.org's Windows CPython with the `win_amd64` wheels, HTTPS through the proxy |
 | Integration conformance | `scripts/conformance/run.sh <dir>` (see [`scripts/conformance/README.md`](../scripts/conformance/README.md)) | Splunk HEC against the OpenTelemetry Collector and Vector (indexer acknowledgement), Sentinel against the official Azure SDKs and API definition, public Entra ID / Defender / Datadog endpoints (`-tags live`) - no license, no tenant |
 | Cross-language block token | `AEGIS_XLANG_BLOCK_TOKEN=$(python3 …) go test -run TestCrossLanguage ./internal/auth/` | Python-signed token verified by Go |
 | Frontend | `npm --prefix frontend run build` | TypeScript type check + production build |
+| Console regression suite | `frontend/e2e/run.sh <control-plane binary> frontend/dist` | the built console in headless Chromium against fresh control planes, as Super Admin, InfoSec, Team Lead, Auditor and anonymous user (see below) |
 | Helm | `helm lint deploy/helm/aegisproxy` + `kubeconform -strict` | all value combinations render valid manifests |
 
 A disposable database for the cluster tests:
@@ -23,6 +24,46 @@ A disposable database for the cluster tests:
 docker run -d --rm --name aegis-pg -e POSTGRES_PASSWORD=test -e POSTGRES_USER=aegis -p 55432:5432 postgres:17-alpine
 export AEGIS_TEST_DATABASE_URL='postgres://aegis:test@127.0.0.1:55432/aegis?sslmode=disable'
 ```
+
+### Console regression suite
+
+`frontend/e2e/` drives the production console build with Playwright for Python. `run.sh` builds nothing: it
+starts one fresh control plane per suite on a free loopback port (temporary data directory, random JWT secret
+and data-plane key, the given console build as `AEGIS_UI_DIR`), the mock OpenID Connect provider
+(`mock_idp.py`, standard library only), runs the suites and stops every process it started (by PID).
+
+| Suite | Control plane | Covers |
+|---|---|---|
+| `fleet_requests.py` | demo mode | server registration with labels, onboarding token and install snippets, label filters, quarantine and release, CSV import dry run and apply, CSV/JSON export, bulk labels, discovered sources, dynamic groups with live preview, delete refused while referenced, access request approval/extension/revocation, comments and assignment, bulk reject, learning session to published policy set, command palette, decommissioning; Team Lead need-to-know and duration caps; Auditor read-only |
+| `identity_protection.py` | demo mode + mock IdP | SSO connection test (failure and success), write-only client secret, SSO login round trip with `sso_error`, break-glass sign-in when password sign-in is off, service accounts (key shown once, rotation, disable, delete), Defender settings (Super Admin only), YARA rule sets with server-side lint errors, ICAP/YARA protection policy, TAXII 2.1 feeds, posture page, policy-as-code export/import as drafts, audit export (JSONL), public portal; Auditor read-only states |
+| `azure_integrations.py` | bootstrap admin, no demo data | Sentinel destinations with managed / workload identity and client secret (drawer validation, nothing secret stored), Defender permission texts and the commercial cloud preset |
+
+Every suite also fails on an uncaught JavaScript error in the page. Locally (or `make test-console-e2e PY=/tmp/e2e/bin/python`):
+
+```bash
+go -C control-plane build -o /tmp/aegis-cp . && npm --prefix frontend ci && npm --prefix frontend run build
+python3 -m venv /tmp/e2e && /tmp/e2e/bin/pip install --require-hashes --only-binary=:all: -r frontend/e2e/requirements.txt
+/tmp/e2e/bin/python -m playwright install chromium     # or AEGIS_E2E_CHROME=/usr/bin/google-chrome-stable
+PYTHON=/tmp/e2e/bin/python frontend/e2e/run.sh /tmp/aegis-cp frontend/dist
+```
+
+`AEGIS_E2E_OUT` keeps the control-plane logs, the suite output and a full-page screenshot of every failed step
+(default: a new temporary directory, printed at the end); `AEGIS_E2E_SUITES` selects a subset.
+
+### CI and release gates
+
+- `ci.yml` runs on every branch push and pull request: Go tests with race detector and PostgreSQL cluster
+  tests, gofmt, vet, staticcheck, govulncheck, a Windows cross-build; the data-plane tests in the hash-locked
+  environment of `install-linux.sh` (`data-plane/requirements-lock.txt` with mitmproxy and YARA-X) through
+  `run_no_skips.py`, so a missing dependency fails the job instead of skipping the hook tests, plus `pip-audit`
+  of that environment; the console build with `npm audit` and the console regression suite (`console-e2e`,
+  screenshots and logs uploaded as an artifact on failure); Helm lint/kubeconform, Bicep, PSScriptAnalyzer and
+  Pester; Windows Server 2022/2025 with the hash-locked data-plane environment (tests without skips, installer
+  with `-RequirementsFile data-plane/requirements-lock.txt`) and both services end to end; the chart on kind with
+  Cilium-enforced NetworkPolicies; the images with a Trivy scan.
+- `release.yml` (tags `v*`) publishes nothing unless the tag equals `v` + the version in the `Makefile`,
+  `frontend/package.json` and the chart's `appVersion`, and the complete `ci.yml` (called as a reusable workflow)
+  passes for the tagged commit. Tag pushes do not trigger `ci.yml` separately.
 
 ## End-to-end verification performed for 2.0
 

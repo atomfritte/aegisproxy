@@ -10,7 +10,7 @@ WINE_WORK ?= /tmp/aegis-wine
 CONFORMANCE_WORK ?= /tmp/aegis-conformance
 PWSH_IMAGE ?= mcr.microsoft.com/powershell:7.5-ubuntu-24.04
 
-.PHONY: all build build-control-plane build-windows build-console test test-go test-go-cluster test-python test-frontend lint-helm test-installers test-windows-wine test-conformance images clean
+.PHONY: all build build-control-plane build-windows build-console test test-go test-go-cluster test-python test-frontend test-console-e2e lint-helm test-installers test-windows-wine test-conformance images clean
 
 all: test build
 
@@ -41,6 +41,10 @@ test-python:
 
 test-frontend:
 	npm --prefix frontend run build
+
+# Console regression suite (Playwright for Python from frontend/e2e/requirements.txt + Chromium; see docs/testing.md)
+test-console-e2e: build-control-plane build-console
+	PYTHON=$(PY) frontend/e2e/run.sh dist/aegis-control-plane frontend/dist
 
 # Windows installers (Pester against an in-memory Windows model; needs Docker)
 test-installers:

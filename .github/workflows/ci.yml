@@ -1,7 +1,9 @@
 name: ci
 on:
   push:
+    branches: ["**"]   # tag pushes run these gates through release.yml
   pull_request:
+  workflow_call:       # release.yml: no image is published unless every job here passes
 
 permissions:
   contents: read
@@ -40,12 +42,15 @@ jobs:
         with: { persist-credentials: false }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with: { python-version: "3.14" }
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r data-plane/requirements-extra.txt"
-      - run: python -I data-plane/tests/test_dataplane.py
-      - name: pip-audit (the hash-locked data-plane environment of install-linux.sh, incl. security overrides)
+      - name: hash-locked data-plane environment (install-linux.sh lock - mitmproxy, YARA-X, security overrides)
         run: |
           python -m venv /tmp/dp
           /tmp/dp/bin/pip install -q --require-hashes --no-deps --only-binary=:all: -r data-plane/requirements-lock.txt
+      # Hook tests need mitmproxy and the YARA tests YARA-X: a skipped test fails the job here.
+      - name: data-plane tests (no skips allowed)
+        run: /tmp/dp/bin/python -I data-plane/tests/run_no_skips.py
+      - name: pip-audit (the hash-locked data-plane environment)
+        run: |
           python -m venv /tmp/audit
           /tmp/audit/bin/pip install -q --require-hashes --only-binary=:all: -r .github/requirements-audit.txt
           /tmp/audit/bin/pip-audit --path /tmp/dp/lib/python3*/site-packages
@@ -67,6 +72,39 @@ jobs:
       - run: npm --prefix frontend ci --no-fund
       - run: npm --prefix frontend audit --omit=dev --audit-level=high
       - run: npm --prefix frontend run build
+
+  # Browser regression suite (frontend/e2e): the built console against fresh control planes, as every role.
+  console-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 24, cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with: { python-version: "3.14" }
+      - run: go -C control-plane build -o "$RUNNER_TEMP/aegis-control-plane" .
+      - run: npm --prefix frontend ci --no-fund
+      - run: npm --prefix frontend run build
+      - name: Playwright (hash-locked) and Chromium
+        run: |
+          python -m venv "$RUNNER_TEMP/e2e"
+          "$RUNNER_TEMP/e2e/bin/pip" install -q --require-hashes --only-binary=:all: -r frontend/e2e/requirements.txt
+          "$RUNNER_TEMP/e2e/bin/python" -m playwright install --with-deps chromium
+      - name: console regression suite
+        run: frontend/e2e/run.sh "$RUNNER_TEMP/aegis-control-plane" frontend/dist
+        env:
+          PYTHON: ${{ runner.temp }}/e2e/bin/python
+          AEGIS_E2E_OUT: ${{ runner.temp }}/e2e-out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: console-e2e
+          path: ${{ runner.temp }}/e2e-out
+          retention-days: 7
 
   deploy-artifacts:
     runs-on: ubuntu-24.04
@@ -100,7 +138,8 @@ jobs:
       - name: Windows installers (PSScriptAnalyzer + Pester)
         shell: pwsh
         run: ./deploy/windows/tests/Invoke-InstallerTests.ps1 -OutputDir test-results
-      - run: bash -n deploy/systemd/install-linux.sh scripts/gen-secrets.sh
+      - name: shell syntax (bash -n checks one file per call)
+        run: for f in deploy/systemd/install-linux.sh scripts/gen-secrets.sh frontend/e2e/run.sh; do bash -n "$f"; done
 
   # Both Windows installers on real Windows Server runners: services, virtual service accounts, ACLs,
   # CA roll-out script, proxying through the data-plane service, uninstall.
@@ -133,11 +172,11 @@ jobs:
         run: |
           & 'C:\Program Files\Python312\python.exe' -m venv "$env:RUNNER_TEMP\dp-venv"
           $py = "$env:RUNNER_TEMP\dp-venv\Scripts\python.exe"
-          & $py -m pip install --disable-pip-version-check mitmproxy==12.3.0
-          & $py -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r data-plane/requirements-extra.txt
-          & $py -m pip install --disable-pip-version-check --no-deps -r data-plane/requirements-security.txt
-          & $py -m unittest discover -s data-plane/tests -v
-          if ($LASTEXITCODE -ne 0) { throw 'data-plane unit tests failed' }
+          # The hash-locked environment of the installers (win_amd64 wheels of mitmproxy, pydivert, YARA-X, ... are in the lock).
+          & $py -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary=:all: -r data-plane/requirements-lock.txt
+          if ($LASTEXITCODE -ne 0) { throw 'hash-locked data-plane install failed' }
+          & $py -I data-plane/tests/run_no_skips.py
+          if ($LASTEXITCODE -ne 0) { throw 'data-plane unit tests failed (or were skipped)' }
       - name: build the Windows control-plane
         run: |
           $env:CGO_ENABLED = '0'
@@ -178,8 +217,10 @@ jobs:
       - name: install the data-plane service
         run: |
           $root = Join-Path $env:ProgramData 'AegisProxy'
+          # The documented hash-pinned installation (lock file instead of the default mitmproxy==12.3.0 from PyPI).
           ./deploy/windows/Install-AegisDataPlane.ps1 -ControlPlaneUrl http://127.0.0.1:8081 -DataPlaneKeyFile "$root\secrets\dataplane.key" `
-            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe 'C:\Program Files\Python312\python.exe' -SkipFirewall
+            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe 'C:\Program Files\Python312\python.exe' -SkipFirewall `
+            -RequirementsFile data-plane/requirements-lock.txt -PipArgs '--only-binary=:all:'
           Get-Service AegisDataPlane | Format-List Name, Status, StartType
       - name: end to end through the Windows services
         run: |
