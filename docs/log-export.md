@@ -54,35 +54,73 @@ high → 3, critical → 2; OTLP severity numbers 9 / 10 / 13 / 17 / 21.
 ## Delivery guarantees
 
 - Every destination has its own in-memory queue (20,000 records), batches records (`batch_size`, default 500;
-  `flush_seconds`, default 2) and never blocks the proxy or the API.
+  `flush_seconds`, default 2) and never blocks the proxy or the API. Changing, pausing or deleting a destination
+  never waits for it either: the new configuration takes over at once, the old one hands over its records in the
+  background.
 - When the queue is full (the destination is slower than the record rate), **audit and security** records are
   written to the spool instead (behind the records already spooled, so they may arrive slightly out of order);
   **traffic** records are dropped. Drops are counted as `dropped` and reported as the destination's last error
   (at most once a minute).
-- When a destination is unavailable (network error, HTTP 408/429/5xx), batches are written to a durable
+- When a destination is unavailable (network error, HTTP 408/429/5xx), records are written to a durable
   **spool** on disk (`AEGIS_EXPORT_SPOOL_DIR/<sink id>`, size limit `spool_mb`, default 256 MB) and replayed **in
-  order** with exponential backoff (1 s … 5 min). The spool survives restarts — delivery is **at least once**.
-  Elasticsearch/OpenSearch use deterministic document IDs, so replays do not create duplicates.
-- When the spool limit is reached the oldest segment is discarded and counted as `dropped`.
+  order** with exponential backoff (1 s … 5 min). Spool writes that contain audit or security records are flushed
+  to stable storage (fsync) before they count as handled. The spool keeps the records themselves, not the
+  encoded payload: they are encoded when sent, so changing the endpoint, format, index or source type keeps
+  them (they arrive in the new format at the new destination). Spools written by release 2.0 hold encoded
+  payloads; they are resent unchanged while format, index and source type stay the same (a changed endpoint is
+  fine) and moved to the dead-letter file otherwise.
+- **Audit records are delivered at least once, also across crashes.** Every destination carrying the audit stream
+  keeps a cursor (`audit-cursor.json` in its spool directory): the newest audit event up to which every event was
+  delivered, written to the spool (fsynced) or dead-lettered. At start it replays the local audit trail after the
+  cursor — events that were still in memory when the process was killed or the host lost power are sent again.
+  The replay goes through the normal delivery (spool, backoff, dead-letter). After a crash a few events that
+  had already arrived may be sent again (Elasticsearch/OpenSearch skip them by document ID; other destinations
+  should de-duplicate on the event `id` if exact counts matter). A new or re-enabled destination starts at the
+  newest audit event (no history). If an audit event is ever lost while running (for example the spool cannot
+  be written), the cursor stays where it was and the next start delivers the events again. This requires a
+  persistent `AEGIS_EXPORT_SPOOL_DIR` (the default is inside `DATA_DIR`): on an ephemeral directory the cursor is
+  lost with the container and the destination restarts at the newest event.
+- **Security and traffic records** are delivered at least once while the control plane runs and across graceful
+  restarts (queued records are sent or spooled on shutdown); records still in memory when the process crashes
+  are lost. Security events remain visible in the console.
+- Shutdown sends the queued records in `batch_size` requests for at most 5 s; whatever is left goes to the spool.
+- When the spool limit is reached the oldest segment is evicted: its records count as `dropped`, its audit and
+  security records are moved to the dead-letter file, an error is logged (at most once a minute) and an
+  `EXPORT_DELIVERY` security event is raised. A single record larger than 32 MB cannot be spooled and is
+  dead-lettered the same way.
 - Permanent rejections (HTTP 4xx such as invalid credentials or a mapping error) are counted as `failed` (records)
-  and `discarded_batches` and not retried; the error is shown in the console. Destinations that carry audit or
-  security records keep each rejected batch in `AEGIS_EXPORT_SPOOL_DIR/<sink id>/dead-letter.jsonl` (one JSON
-  object per batch: time, sink, error and the encoded records; 32 MB, one older generation `.1`) so it can be
-  inspected and replayed after fixing the cause. Deleting the destination deletes its spool directory and with
-  it the dead-letter file.
+  and `discarded_batches` and not retried; the error is shown in the console. Elasticsearch/OpenSearch reject
+  documents one by one: only the rejected documents count as `failed` and are dead-lettered (with the error of
+  each document), the others count as delivered.
+- **Dead-letter file:** destinations that carry audit or security records keep records they cannot deliver in
+  `AEGIS_EXPORT_SPOOL_DIR/<sink id>/dead-letter.jsonl` — one JSON object per batch: time, sink, error, the
+  records as text and, when the destination named them, `record_errors` per record. Each write is fsynced; the
+  file rotates at 32 MB and five older generations are kept (`.1` … `.5`, about 190 MB in total). It is never
+  written through a symbolic link. Dead-lettered records are counted as `dead_lettered` and raise an
+  `EXPORT_DELIVERY` security event (severity high; critical when the dead-letter file is not writable and the
+  records are lost), de-duplicated for 15 minutes. Inspect and replay them after fixing the cause. Deleting the
+  destination deletes its spool directory and with it the cursor and the dead-letter file.
 - Splunk HEC with indexer acknowledgement: a batch counts as delivered once Splunk confirms it was indexed. A
   delivery attempt waits at most 30 s; when the acknowledgement takes longer, later attempts keep polling the
   same `ackId` instead of resending the batch. Only if no acknowledgement arrives within 2 minutes of sending is
-  the batch resent (at least once, as Splunk recommends).
+  the batch resent (at least once, as Splunk recommends). Records that are still unacknowledged after 5 resends
+  (`AEGIS_EXPORT_HEC_ACK_ATTEMPTS`) are moved to the dead-letter file and an `EXPORT_DELIVERY` security event is
+  raised, so that one batch the indexers never confirm does not block the destination. Once a token has
+  answered with an `ackId`, a success response without `ackId` or with a non-zero `code` counts as a failed
+  attempt (retried), not as delivered.
 - In a cluster, every control-plane replica exports the records it produced itself (audit events of the writes it
-  performed, flows and security events reported by the workers connected to it) — no duplicates across replicas.
-  Status and counters in the console are those of the replica that answers the request; Prometheus metrics are
-  per replica.
+  performed, flows and security events reported by the workers connected to it) — no duplicates across replicas
+  in normal operation. Each replica replays only its own audit trail (its local `AEGIS_AUDIT_LOG`), so give every
+  replica a persistent spool directory and audit log; after a crash the replayed events may duplicate ones that
+  had already arrived, as above. Status and counters in the console are those of the replica that answers the
+  request; Prometheus metrics are per replica.
 
 Prometheus metrics: `aegis_export_records_sent_total`, `aegis_export_records_failed_total`,
-`aegis_export_records_dropped_total`, `aegis_export_batches_discarded_total`, `aegis_export_queue_records`,
+`aegis_export_records_dropped_total`, `aegis_export_batches_discarded_total`,
+`aegis_export_records_dead_lettered_total`, `aegis_export_records_replayed_total`, `aegis_export_queue_records`,
 `aegis_export_spool_bytes`, `aegis_export_sink_healthy` (label `sink`). Suggested alert:
-`aegis_export_spool_bytes > 0 for 15m`, `increase(aegis_export_records_dropped_total[1h]) > 0` or
+`aegis_export_spool_bytes > 0 for 15m`, `increase(aegis_export_records_dropped_total[1h]) > 0`,
+`increase(aegis_export_records_dead_lettered_total[1h]) > 0` or
 `increase(aegis_export_batches_discarded_total[1h]) > 0`.
 
 ## Security
@@ -147,8 +185,9 @@ Intrusion Detection (Splunk Enterprise Security works without custom searches).
 (`X-Splunk-Request-Channel`, a GUID per destination). When the token has acknowledgement enabled, Splunk answers
 with an `ackId`; AegisProxy then polls `/services/collector/ack` and counts the batch as delivered only once
 Splunk confirms it was indexed. Without a confirmation within two minutes the batch stays in the spool and is
-resent (at-least-once, so a rare duplicate is possible). Behind a load balancer the acknowledgement queries
-follow the balancer's stickiness cookie to the same indexer.
+resent (at-least-once, so a rare duplicate is possible); after 5 unacknowledged resends
+(`AEGIS_EXPORT_HEC_ACK_ATTEMPTS`) the records are moved to the dead-letter file instead. Behind a load balancer
+the acknowledgement queries follow the balancer's stickiness cookie to the same indexer.
 
 ### Elasticsearch / OpenSearch
 

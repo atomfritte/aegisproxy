@@ -331,8 +331,8 @@ func TestPermanentAndPartialErrors(t *testing.T) {
 	drv, _ := newDriver(s, meta, "")
 	rec, _ := drv.encode(FlowEvent(flow(models.VerdictAllowed)))
 	err = drv.send(context.Background(), [][]byte{rec, rec, rec})
-	if pe, ok := err.(*partialError); !ok || pe.rejected != 1 {
-		t.Fatalf("partial: %v", err)
+	if pe, ok := err.(*partialError); !ok || len(pe.rejected) != 1 || !strings.Contains(pe.rejected[2], "mapper_parsing_exception: bad") || pe.retryFrom != 3 {
+		t.Fatalf("partial: %#v", err)
 	}
 }
 

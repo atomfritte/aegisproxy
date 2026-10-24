@@ -11,15 +11,15 @@ import (
 	"aegisproxy/control-plane/internal/models"
 )
 
-// Event is one record handed to the exporter.
+// Event is one record handed to the exporter (spooled as JSON).
 type Event struct {
-	Stream   string
-	Time     time.Time
-	ID       string
-	Severity string // info | low | medium | high | critical
-	Audit    *models.AuditEvent
-	Flow     *models.TrafficFlow
-	Security *models.SecurityEvent
+	Stream   string                `json:"stream"`
+	Time     time.Time             `json:"time"`
+	ID       string                `json:"id"`
+	Severity string                `json:"severity"` // info | low | medium | high | critical
+	Audit    *models.AuditEvent    `json:"audit,omitempty"`
+	Flow     *models.TrafficFlow   `json:"flow,omitempty"`
+	Security *models.SecurityEvent `json:"security,omitempty"`
 }
 
 // AuditEvent, FlowEvent and SecurityEvent build exporter events from the domain models.

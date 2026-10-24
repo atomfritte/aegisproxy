@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -217,8 +218,16 @@ func run(ctx context.Context) error {
 	if pg, ok := cluster.(interface{ NodeID() string }); ok && cluster != nil {
 		nodeID = pg.NodeID()
 	}
+	hecAckAttempts := 0
+	if v := os.Getenv("AEGIS_EXPORT_HEC_ACK_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hecAckAttempts = n
+		} else {
+			logger.Warn("ignoring invalid AEGIS_EXPORT_HEC_ACK_ATTEMPTS (positive number expected)", "value", v)
+		}
+	}
 	exporter := export.New(export.Options{SpoolDir: cfg.ExportSpoolDir, ExportDir: cfg.ExportDir, Node: nodeID,
-		Host: hostname, Version: Version, Logger: logger})
+		Host: hostname, Version: Version, Logger: logger, AuditReplay: true, HECAckAttempts: hecAckAttempts})
 	defer exporter.Close() // runs after the store has been closed (LIFO): queued records go to the spool
 
 	st, err := store.NewStore(store.Options{
@@ -240,6 +249,12 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("state store: %w", err)
 	}
 	defer st.Close()
+	// Sinks replay audit records a crash may have lost from this node's audit trail and raise
+	// delivery alerts as security events; both are detached before the store closes.
+	exporter.SetAuditSource(st)
+	exporter.SetAlertHandler(st.RecordExportAlert)
+	defer exporter.SetAuditSource(nil)
+	defer exporter.SetAlertHandler(nil)
 
 	authMgr := auth.NewAuthManager(cfg.JWTSecret, cfg.SessionTTL)
 	authMgr.SetRevocationChecker(st)

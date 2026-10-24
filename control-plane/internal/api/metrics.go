@@ -138,6 +138,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_records_failed_total", "sink", st.ID), st.Failed)
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_records_dropped_total", "sink", st.ID), st.Dropped)
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_batches_discarded_total", "sink", st.ID), st.DiscardedBatches)
+		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_records_dead_lettered_total", "sink", st.ID), st.DeadLettered)
+		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_records_replayed_total", "sink", st.ID), st.Replayed)
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_queue_records", "sink", st.ID), st.Queued)
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_spool_bytes", "sink", st.ID), st.SpoolBytes)
 		up := 0
