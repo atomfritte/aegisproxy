@@ -128,10 +128,10 @@ What the installer does (idempotent - a re-run upgrades and keeps secrets, CA, s
    `/etc/aegis/control-plane.env` from the template (sets `AEGIS_PUBLIC_URL`), the unit and a credentials drop-in
    `aegis-control-plane.service.d/10-credentials.conf` for the optional secrets that exist.
 6. Data-plane: finds Python ≥ 3.12 (`--python`, `--install-deps` installs it with apt/dnf), creates the venv,
-   `pip install mitmproxy==12.3.0 yara-x==1.22.0` plus the security overrides of `requirements-security.txt`
-   (binary wheels, glibc ≥ 2.28; `--no-yara` skips the YARA
-   engine) or `--requirements` with a **complete** hash-pinned lock file (see below),
-   copies the addon, byte-compiles
+   installs the shipped hash lock `data-plane/requirements-lock.txt` (mitmproxy 12.3.0, YARA-X 1.22.0, every
+   transitive dependency and the security overrides of `requirements-security.txt`, binary wheels only,
+   glibc ≥ 2.28; `--no-yara` drops YARA-X from it) or your own **complete** lock with `--requirements` (see
+   below), copies the addon, byte-compiles
    it, runs an import check, creates `/etc/aegis/dataplane.env` (`CONTROL_PLANE_URL`, `AEGIS_CLAMD_ADDRESS`) and
    installs the unit.
 7. Installs `/etc/logrotate.d/aegis`; on SELinux hosts labels the venv `bin/` directory `bin_t` and restores
@@ -140,21 +140,32 @@ What the installer does (idempotent - a re-run upgrades and keeps secrets, CA, s
    `/readyz` (worker), prints the CA fingerprint, key locations, admin password location and ClamAV,
    firewall and SELinux hints.
 
-**Hash-pinned data-plane installation** (recommended for production, together with an internal mirror):
+**Hash-pinned data-plane installation** (the default): every package pip downloads must match a SHA-256 hash
+of `data-plane/requirements-lock.txt`, so a compromised or spoofed package index cannot substitute code that
+then runs as root during the installation and inside the worker. With an internal mirror:
+
+```bash
+sudo deploy/systemd/install-linux.sh --component data-plane --pip-args "--no-index --find-links /srv/wheels"
+```
+
+The mirror must carry the wheels of the lock for the host's platform and Python version
+(`pip download --require-hashes --no-deps --only-binary=:all: -r data-plane/requirements-lock.txt -d /srv/wheels`
+on a host of the same platform). Your own lock, e.g. with other versions or an internal package:
 
 ```bash
 # on a build host with uv (its --override raises packages above declared upper bounds)
 printf 'mitmproxy==12.3.0\nyara-x==1.22.0\n' > requirements.in
-uv pip compile --python-version 3.12 --generate-hashes \
+uv pip compile --python-version 3.12 --generate-hashes --only-binary :all: \
     --override data-plane/requirements-security.txt requirements.in -o requirements-lock.txt
 sudo deploy/systemd/install-linux.sh --component data-plane --requirements requirements-lock.txt \
     --pip-args "--no-index --find-links /srv/wheels"
 ```
 
-The installer installs the lock with `--require-hashes --no-deps` (the security baseline raises Brotli above
+The installer installs a lock with `--require-hashes --no-deps` (the security baseline raises Brotli above
 mitmproxy's declared upper bound, which pip's resolver would otherwise refuse), then aborts if a package is
 below the baseline of `data-plane/requirements-security.txt` or if `pip check` reports anything other than
-these deliberate overrides (an incomplete lock file).
+these deliberate overrides (an incomplete lock file). Only when the shipped lock is missing (a partial copy of
+the repository) does it fall back to unpinned `pip install mitmproxy==12.3.0 yara-x==1.22.0`, with a warning.
 
 Review `/etc/aegis/control-plane.env` and `/etc/aegis/dataplane.env` afterwards and apply changes with
 `systemctl restart aegis-control-plane aegis-dataplane`. Settings in the env files override the unit's
@@ -395,7 +406,7 @@ the proxy) - see [`windows.md`](windows.md#10-rolling-out-the-ca-and-proxy-setti
 |---|---|
 | Control-plane | `sudo ./deploy/systemd/install-linux.sh --component control-plane --binary <new>` (restarts the service; workers keep enforcing meanwhile) |
 | Console | rebuild `frontend/dist`, re-run with `--ui-dir` (atomic directory swap) |
-| Data-plane | re-run with `--component data-plane` and the new `data-plane` folder; a new Python minor version recreates the venv; mitmproxy upgrades via the pinned version / `--requirements` |
+| Data-plane | re-run with `--component data-plane` and the new `data-plane` folder; a new Python minor version recreates the venv; mitmproxy upgrades via the shipped lock / `--requirements` |
 | Unit files | re-running the installer overwrites them; keep local changes in drop-ins (`systemctl edit ...`) |
 | Cluster | one node at a time, wait for `/readyz`; control-plane before workers |
 
@@ -490,7 +501,7 @@ sudo systemd-run --pty --uid=aegis --gid=aegis -p EnvironmentFile=/etc/aegis/con
 - [ ] Units unchanged or changed only via drop-ins; `systemd-analyze security aegis-control-plane aegis-dataplane` reviewed.
 - [ ] Firewall: proxy port only from server subnets, console only from admin networks/workers/LBs, ops/metrics only from monitoring.
 - [ ] `/metrics` protected (token + nginx ACL).
-- [ ] Data-plane installed from a hash-pinned, mirrored package set (`--requirements`, `--pip-args "--no-index --find-links ..."`).
+- [ ] Data-plane installed from a hash-pinned, mirrored package set (shipped lock or `--requirements`, `--pip-args "--no-index --find-links ..."`).
 - [ ] SELinux enforcing (RHEL) with the documented labels; AppArmor/SELinux denials monitored.
 - [ ] `AEGIS_FAIL_MODE=closed`; Protection Policy reviewed (threat intel and AV `block`, `block_private_destinations`, `block_raw_tcp`, `allowed_ports`).
 - [ ] ClamAV signatures auto-updated; `StreamMaxLength` ≥ `av_max_scan_bytes`.

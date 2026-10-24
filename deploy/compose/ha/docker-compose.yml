@@ -9,6 +9,9 @@
 #   Standalone console (nginx):     http://127.0.0.1:8082   (separately hosted frontend, proxies /api)
 #   Proxy via load balancer:        <host>:8080             (2 data-plane workers, source-IP affinity)
 #   HAProxy stats:                  http://127.0.0.1:8404/stats
+#
+# The AegisProxy images are always built locally from this checkout ("pull_policy: build"); "docker compose
+# pull" only fetches the digest-pinned third-party images.
 name: aegisproxy-ha
 
 x-hardening: &hardening
@@ -59,15 +62,17 @@ services:
   # aegis-ca-public with the certificate alone.
   ca-init:
     <<: *hardening
-    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
     build: { context: ../../.., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
+    pull_policy: build
     command: ["gen-ca", "/certs", "/public"]
     volumes: ["aegis-ca:/certs", "aegis-ca-public:/public"]
     restart: "no"
 
   control-plane-1: &cp
     <<: *hardening
-    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
+    pull_policy: never   # built by ca-init
     depends_on:
       ca-init: { condition: service_completed_successfully }
       postgres: { condition: service_healthy }
@@ -91,8 +96,9 @@ services:
 
   data-plane-1: &dp
     <<: *hardening
-    image: aegisproxy/data-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-data-plane:v${AEGIS_VERSION:-2.1.0}
     build: { context: ../../../data-plane }
+    pull_policy: build
     depends_on:
       lb: { condition: service_started }
     environment:
@@ -110,18 +116,36 @@ services:
   # Separately hosted console (static nginx image) — same-origin via /api reverse proxy.
   console:
     <<: *hardening
-    image: aegisproxy/console:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-console:v${AEGIS_VERSION:-2.1.0}
     build: { context: ../../../frontend }
+    pull_policy: build
     environment:
       AEGIS_API_UPSTREAM: http://lb:8081
     tmpfs: ["/tmp:size=16m,uid=101,gid=101"]
     ports: ["127.0.0.1:8082:8080"]
 
+  # Unprivileged start as in the single-host docker-compose.yml and the Helm chart (the image's /init needs root).
   clamav:
+    <<: *hardening
     image: clamav/clamav:1.5@sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e   # pinned by digest (tag kept for readability)
-    restart: unless-stopped
-    security_opt: ["no-new-privileges:true"]
+    user: "100:101"
+    entrypoint: ["/sbin/tini", "--", "/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -f /var/lib/clamav/main.cvd ] && [ ! -f /var/lib/clamav/main.cld ]; then
+          echo "Updating initial database"
+          sed -e 's|^\(TestDatabases \)|#\1|' -e '$$a TestDatabases no' -e 's|^\(NotifyClamd \)|#\1|' \
+            /etc/clamav/freshclam.conf > /tmp/freshclam_initial.conf
+          freshclam --foreground --stdout --config-file=/tmp/freshclam_initial.conf
+          rm -f /tmp/freshclam_initial.conf
+        fi
+        freshclam --checks="$${FRESHCLAM_CHECKS:-1}" --daemon --foreground --stdout &
+        rm -f /tmp/clamd.sock
+        exec clamd --foreground
     volumes: ["clamav-db:/var/lib/clamav"]
+    tmpfs:
+      - /tmp:size=64m,uid=100,gid=101,mode=0700
+      - /var/log/clamav:size=128m,uid=100,gid=101,mode=0750
 
 volumes:
   pg-data:

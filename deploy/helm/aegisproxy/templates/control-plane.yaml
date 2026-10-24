@@ -73,7 +73,11 @@ spec:
             - { name: AEGIS_TRUSTED_PROXIES, value: {{ $cp.trustedProxies | quote }} }
             {{- $proxyHosts := list }}
             {{- if and .Values.console.enabled (not .Values.console.apiBaseUrl) }}
-            {{- $proxyHosts = append $proxyHosts (printf "%s-console-headless.%s.svc.%s" (include "aegis.fullname" .) .Release.Namespace .Values.clusterDomain) }}
+            {{- /* absolute names (trailing dot): the pod's DNS search list is never consulted */}}
+            {{- $proxyHosts = append $proxyHosts (printf "%s-console-headless.%s.svc.%s." (include "aegis.fullname" .) .Release.Namespace (trimSuffix "." .Values.clusterDomain)) }}
+            {{- end }}
+            {{- if .Values.ingress.trustedController.enabled }}
+            {{- $proxyHosts = append $proxyHosts (include "aegis.trustedControllerHost" .) }}
             {{- end }}
             {{- range splitList "," $cp.trustedProxyHosts }}{{ if trim . }}{{ $proxyHosts = append $proxyHosts (trim .) }}{{ end }}{{ end }}
             {{- with $proxyHosts }}

@@ -92,8 +92,9 @@ Data-plane
   --clamd-address ADDR         AEGIS_CLAMD_ADDRESS, e.g. unix:///run/clamav/clamd.ctl or tcp://127.0.0.1:3310
   --python PATH                Python >= 3.12 used to create the venv
   --pip-args "ARGS"            extra pip arguments, e.g. "--no-index --find-links /srv/wheels"
-  --requirements FILE          hash-pinned requirements file (pip --require-hashes); add yara-x to it for YARA;
-                               it must pin the baseline of data-plane/requirements-security.txt (Brotli>=1.2.1)
+  --requirements FILE          your own hash-pinned requirements file (pip --require-hashes) instead of the shipped
+                               data-plane/requirements-lock.txt; add yara-x to it for YARA; it must pin the
+                               baseline of data-plane/requirements-security.txt (Brotli>=1.2.1)
   --no-yara                    do not install the YARA-X engine (YARA rule sets then report "unavailable")
   --install-deps               install missing OS packages (python3 venv) with apt/dnf
 
@@ -428,12 +429,34 @@ if want_dp; then
         fi
     fi
     [ -x "$VENV/bin/python" ] || { log "Creating virtualenv $VENV"; "$PY" -m venv "$VENV"; }
-    [ -n "$REQUIREMENTS" ] || warn "Supply chain: prefer an offline, hash-pinned install from a vetted mirror (--requirements <lock from uv pip compile --generate-hashes --override requirements-security.txt> --pip-args \"--no-index --find-links DIR\")."
+    # Default: the shipped lock file pins mitmproxy, YARA-X and every dependency by hash, binary wheels only
+    # (no source builds as root). --requirements replaces it with your own lock.
+    REQ_TMP=""; LOCK_ARGS=()
+    if [ -z "$REQUIREMENTS" ] && [ -f "$DP_SRC/requirements-lock.txt" ]; then
+        REQUIREMENTS=$DP_SRC/requirements-lock.txt; LOCK_ARGS=(--only-binary=:all:)
+        if [ -n "${NO_YARA:-}" ]; then
+            # Same lock without the yara-x requirement and its hash lines (leftovers of a failed run removed first).
+            rm -f "$DP_DIR"/.requirements.??????
+            REQ_TMP=$(umask 077; mktemp "$DP_DIR/.requirements.XXXXXX")
+            "$PY" -I - "$REQUIREMENTS" > "$REQ_TMP" <<'PY'
+import re, sys
+skip = False
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line[:1] not in (" ", "\t"):
+        skip = re.match(r"yara[-_]x\b", line, re.I) is not None
+    if not skip:
+        sys.stdout.write(line)
+PY
+            REQUIREMENTS=$REQ_TMP
+        fi
+        log "Installing the hash-locked dependencies of data-plane/requirements-lock.txt (binary wheels only)"
+    fi
+    [ -n "$REQUIREMENTS" ] || warn "Supply chain: $DP_SRC/requirements-lock.txt is missing, so mitmproxy and its dependencies are installed without hash pinning. Prefer --requirements <lock from uv pip compile --generate-hashes --override requirements-security.txt> --pip-args \"--no-index --find-links DIR\"."
     PIP_ARGS=(install --disable-pip-version-check --no-input --require-virtualenv)
     if [ -n "$REQUIREMENTS" ]; then
         # A complete lock file pins every dependency; --no-deps lets it raise packages above mitmproxy's upper
         # bounds (security baseline). Completeness is checked with "pip check" below.
-        PIP_ARGS+=(--require-hashes --no-deps -r "$REQUIREMENTS")
+        PIP_ARGS+=(--require-hashes --no-deps "${LOCK_ARGS[@]}" -r "$REQUIREMENTS")
     else
         PIP_ARGS+=("mitmproxy==$MITMPROXY_VERSION")
         # YARA-X ships binary wheels (no Rust toolchain needed); never fall back to a source build.
@@ -488,6 +511,7 @@ for line in bad:
 sys.exit(1 if bad else 0)
 PY
     fi
+    [ -z "$REQ_TMP" ] || rm -f "$REQ_TMP"
     INSTALLED=$("$VENV/bin/python" -c 'import mitmproxy.version as v; print(v.VERSION)')
     [ "$INSTALLED" = "$MITMPROXY_VERSION" ] || warn "Installed mitmproxy $INSTALLED (expected $MITMPROXY_VERSION)"
 

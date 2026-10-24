@@ -1,7 +1,11 @@
 version: 2
 updates:
   - { package-ecosystem: gomod, directory: /control-plane, schedule: { interval: weekly }, groups: { go: { patterns: ["*"] } } }
+  # requirements-lock.txt is hash-locked: Dependabot updates a pin with its hashes; regenerate the whole lock with
+  # the command in its header when mitmproxy's own requirements change (CI installs it with pip check).
   - { package-ecosystem: pip, directory: /data-plane, schedule: { interval: weekly } }
+  # Hash-locked pip-audit environment of the CI audit job.
+  - { package-ecosystem: pip, directory: /.github, schedule: { interval: weekly } }
   - { package-ecosystem: npm, directory: /frontend, schedule: { interval: weekly }, groups: { npm: { patterns: ["*"] } } }
   # Node.js build images stay on an LTS line (even major versions); odd majors are short-lived, so the
   # move to the next LTS is done deliberately instead of by Dependabot.
@@ -12,3 +16,7 @@ updates:
   # Digest-pinned third-party images of the compose files (ClamAV, PostgreSQL, HAProxy).
   - { package-ecosystem: docker-compose, directories: ["/", "/deploy/compose/ha"], schedule: { interval: weekly } }
   - { package-ecosystem: github-actions, directory: /, schedule: { interval: weekly } }
+# Not covered by Dependabot, update by hand (digest/hash next to the version): the BuildKit image in
+# release.yml (setup-buildx driver-opts), the kubeconform, Trivy and PostgreSQL service images, the kind, bicep,
+# Cilium chart and CloudNativePG manifest hashes in ci.yml, and the ClamAV digest in deploy/helm/aegisproxy/values.yaml
+# (keep it equal to the compose files).

@@ -1,6 +1,8 @@
 # AegisProxy build & test entry points. No target changes the working directory of the caller.
 VERSION ?= 2.1.0
-REGISTRY ?= aegisproxy
+# Image names of the release workflow (ghcr.io/<owner>/aegisproxy-<component>:v<version>), the Helm chart's defaults.
+REGISTRY ?= ghcr.io/atomfritte
+IMAGE_TAG ?= v$(VERSION)
 GO ?= go
 PY ?= python3
 HELM ?= helm
@@ -54,14 +56,14 @@ test-conformance:
 	scripts/conformance/run.sh $(CONFORMANCE_WORK)
 
 lint-helm:
-	$(HELM) lint deploy/helm/aegisproxy --set storage.postgres.url=postgres://u:p@db/aegis
-	$(HELM) lint deploy/helm/aegisproxy --set storage.type=file --set console.enabled=true
+	$(HELM) lint deploy/helm/aegisproxy --set storage.postgres.url=postgres://u:p@db/aegis --set 'networkPolicy.proxyClientCIDRs={10.0.0.0/8}'
+	$(HELM) lint deploy/helm/aegisproxy --set storage.type=file --set console.enabled=true --set 'dataPlane.service.loadBalancerSourceRanges={10.0.0.0/8}'
 
 images:
-	docker build -t $(REGISTRY)/control-plane:$(VERSION) --build-arg VERSION=$(VERSION) .
-	docker build -t $(REGISTRY)/control-plane-api:$(VERSION) --build-arg VERSION=$(VERSION) control-plane
-	docker build -t $(REGISTRY)/data-plane:$(VERSION) data-plane
-	docker build -t $(REGISTRY)/console:$(VERSION) frontend
+	docker build -t $(REGISTRY)/aegisproxy-control-plane:$(IMAGE_TAG) --build-arg VERSION=$(VERSION) .
+	docker build -t $(REGISTRY)/aegisproxy-control-plane-api:$(IMAGE_TAG) --build-arg VERSION=$(VERSION) control-plane
+	docker build -t $(REGISTRY)/aegisproxy-data-plane:$(IMAGE_TAG) data-plane
+	docker build -t $(REGISTRY)/aegisproxy-console:$(IMAGE_TAG) frontend
 
 clean:
 	rm -rf dist frontend/dist

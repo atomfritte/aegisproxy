@@ -3,6 +3,8 @@
 # ca.existingSecret (created with `aegis-control-plane gen-ca`), ingress with TLS, and review networkPolicy.
 
 global:
+  # Registry mirror for every image: replaces the registry host of each image repository (ghcr.io,
+  # docker.io), e.g. harbor.corp.example/ghcr-proxy -> harbor.corp.example/ghcr-proxy/atomfritte/aegisproxy-...
   imageRegistry: ""
   imagePullSecrets: []
 
@@ -67,18 +69,23 @@ storage:
 
 controlPlane:
   image:
-    repository: aegisproxy/control-plane   # all-in-one image (API + bundled console)
-    tag: ""                                 # defaults to Chart.appVersion
+    # Release images of .github/workflows/release.yml: signed with cosign (keyless), SBOM and build
+    # provenance attached. In production pin the digest you verified (docs/deployment/kubernetes.md#images).
+    repository: ghcr.io/atomfritte/aegisproxy-control-plane   # all-in-one image (API + bundled console)
+    tag: ""                                 # defaults to v<Chart.appVersion> (the release tag)
     digest: ""                              # optional sha256:... pin (appended to the tag)
     pullPolicy: IfNotPresent
   replicas: 2
   # Reverse proxies whose X-Forwarded-For header is trusted (client IPs for rate limits, CIDR-bound
-  # service accounts and the audit trail). Empty = the TCP peer is the client. Set it to the pod CIDR of
-  # your ingress controller (or the addresses of an external load balancer); never to whole private
-  # ranges, because every client inside them could then choose its own address.
+  # service accounts and the audit trail). Empty = the TCP peer is the client. Only addresses that belong
+  # to proxies alone, e.g. an external load balancer; never a pod CIDR or a whole private range, because
+  # every pod or client inside it could then choose its own address. For an in-cluster ingress controller
+  # use ingress.trustedController instead.
   trustedProxies: ""
-  # DNS names whose current addresses are trusted as proxies (comma-separated). The chart's own console
-  # (console.enabled, same-origin /api proxy) is added automatically via its headless Service.
+  # DNS names whose current addresses are trusted as proxies (comma-separated). Use absolute names with a
+  # trailing dot (name.namespace.svc.cluster.local.) so the pod's DNS search list is never consulted. The
+  # chart's own console (console.enabled, same-origin /api proxy) and ingress.trustedController are added
+  # automatically through headless Services.
   trustedProxyHosts: ""
   internalDomains: ""          # AEGIS_INTERNAL_DOMAINS (empty = built-in defaults)
   corsOrigins: ""              # origins of a console hosted on another origin
@@ -119,8 +126,8 @@ controlPlane:
 console:
   enabled: false
   image:
-    repository: aegisproxy/console
-    tag: ""
+    repository: ghcr.io/atomfritte/aegisproxy-console
+    tag: ""                                 # defaults to v<Chart.appVersion>
     digest: ""
     pullPolicy: IfNotPresent
   replicas: 2
@@ -146,11 +153,26 @@ ingress:
   # Host for the separate console (console.enabled=true); empty = not exposed via ingress.
   consoleHost: ""
   consoleTlsSecretName: ""
+  # Trust exactly the ingress controller's pods as proxies (X-Forwarded-For). Without it the control-plane
+  # sees the controller as the client of every request: per-IP login and SCIM lockouts then hit everyone
+  # and the audit trail records the controller's address. The chart creates a headless Service selecting
+  # the controller pods in their namespace (the release needs rights there) and trusts its absolute DNS
+  # name; or name an existing headless Service with existingServiceFQDN. Never trust a pod CIDR instead.
+  trustedController:
+    enabled: false
+    namespace: ingress-nginx
+    # Labels of the controller pods (defaults of the ingress-nginx chart).
+    podLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/component: controller
+    # Absolute name of an existing headless Service of the controller pods, e.g.
+    # ingress-peers.ingress-nginx.svc.cluster.local. (no Service is created then).
+    existingServiceFQDN: ""
 
 dataPlane:
   image:
-    repository: aegisproxy/data-plane
-    tag: ""
+    repository: ghcr.io/atomfritte/aegisproxy-data-plane
+    tag: ""                                 # defaults to v<Chart.appVersion>
     digest: ""
     pullPolicy: IfNotPresent
   replicas: 3
@@ -168,7 +190,11 @@ dataPlane:
   # e.g. [{ name: AEGIS_BUFFER_BUDGET, value: "768m" }] together with a higher memory limit
   extraEnv: []
   service:
+    # A LoadBalancer exposes the proxy to every network that reaches it: rendering fails unless
+    # loadBalancerSourceRanges or networkPolicy.proxyClientCIDRs restrict the clients to the server
+    # networks, or allowPublicProxy is set deliberately.
     type: LoadBalancer
+    allowPublicProxy: false
     port: 8080
     nodePort: null
     # Local preserves the client source IP — required for server identification by IP/CIDR.
@@ -234,8 +260,16 @@ networkPolicy:
   # Namespace labels of the ingress controller allowed to reach the control-plane/console.
   ingressNamespaceSelector:
     kubernetes.io/metadata.name: ingress-nginx
-  # Client networks allowed to use the proxy (empty = any source).
+  # Client networks allowed to use the proxy (empty = any source). Needs externalTrafficPolicy Local
+  # (default) so the pods see the client addresses.
   proxyClientCIDRs: []
+  # DNS servers the components may query (port 53): the cluster DNS pods in their namespace only, so a pod
+  # elsewhere that merely carries the label is not reachable. NodeLocal DNSCache (link-local address) or an
+  # external resolver: add it with extraDnsEgress, e.g. [{ ipBlock: { cidr: 169.254.20.10/32 } }].
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+  extraDnsEgress: []
   # Additional NetworkPolicyPeers allowed to reach every component's ports, e.g. a monitoring
   # namespace (Prometheus scraping) or node CIDRs for kubelet probes on CNIs that enforce policy on
   # host traffic:
@@ -250,9 +284,14 @@ networkPolicy:
     - 192.168.0.0/16
     - 100.64.0.0/10
     - 169.254.0.0/16
-  # IPv6 egress (dual-stack clusters): ::/0 minus dataPlaneEgressDenyIPv6. false = no IPv6 egress at all.
-  dataPlaneEgressIPv6: true
-  # Add the cluster's pod/service/VPC IPv6 ranges when they are global unicast (e.g. EKS IPv6).
+    - 168.63.129.16/32   # Azure WireServer / host agent (goal state, extension configuration)
+  # IPv6 egress (dual-stack and IPv6 clusters): ::/0 minus dataPlaneEgressDenyIPv6 and clusterIPv6CIDRs.
+  # Off by default: pod, service and node addresses of IPv6 clusters are often global unicast (EKS, GKE)
+  # and would count as "internet". Enabling it requires clusterIPv6CIDRs.
+  dataPlaneEgressIPv6: false
+  # The cluster's pod, service, node and VPC IPv6 ranges (e.g. 2600:1f14:abc:de00::/56), excluded from IPv6
+  # egress. Use ["fc00::/7"] when they are unique-local addresses (already in the list below).
+  clusterIPv6CIDRs: []
   dataPlaneEgressDenyIPv6:
     - ::1/128          # loopback
     - 64:ff9b::/96     # NAT64 well-known prefix (reaches IPv4 destinations, incl. private ranges)

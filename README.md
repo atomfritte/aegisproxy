@@ -208,7 +208,8 @@ Try AegisProxy on one host with Docker Compose (Docker with the Compose plugin a
 install -m 600 .env.example .env          # holds every secret: owner read/write only
 ./scripts/gen-secrets.sh >> .env          # JWT, data-plane and encryption keys
 docker compose up -d --build
-docker run --rm -v aegisproxy_aegis-data:/data alpine cat /data/secrets/initial-admin-password
+docker run --rm -v aegisproxy_aegis-data:/data alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
+  cat /data/secrets/initial-admin-password
 ```
 
 Open **http://127.0.0.1:8081** and sign in as `admin` with that password. Change it right away (user menu or
@@ -216,7 +217,8 @@ Open **http://127.0.0.1:8081** and sign in as `admin` with that password. Change
 proxy on port **8080** — it is blocked, because nothing is allowed yet:
 
 ```bash
-docker run --rm -v aegisproxy_aegis-data:/data alpine rm /data/secrets/initial-admin-password
+docker run --rm -v aegisproxy_aegis-data:/data alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
+  rm /data/secrets/initial-admin-password
 curl -x http://127.0.0.1:8080 http://example.com/      # → 403 with the message shown above
 ```
 
@@ -250,7 +252,8 @@ accounts such as `admin` / `admin123` — evaluation only, never in production).
 | Separate console | console on its own host or CDN | [separate-console.md](docs/deployment/separate-console.md) |
 
 Ports: **8080** proxy (servers), **8081** API and console (administrators, workers), **9091** worker health and
-metrics. Release images are signed with cosign and carry an SBOM; see the
+metrics. Release images (`ghcr.io/atomfritte/aegisproxy-*`) are signed with cosign and carry an SBOM
+(verification: [SECURITY.md](SECURITY.md)); Docker Compose always builds the images locally. See the
 [deployment overview](docs/deployment/README.md) for sizing and topologies.
 
 ## Documentation
