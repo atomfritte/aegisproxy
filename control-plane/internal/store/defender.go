@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"aegisproxy/control-plane/internal/auth"
 	"aegisproxy/control-plane/internal/defender"
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 	"aegisproxy/control-plane/internal/oidc"
 	"aegisproxy/control-plane/internal/threatintel"
 )
@@ -374,20 +374,7 @@ func (s *Store) defenderLoop() {
 // microsoftCloudHost allows the Entra ID authorities and Defender/Graph API hosts of the Microsoft
 // clouds (and loopback for local test doubles).
 func microsoftCloudHost(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	h := strings.ToLower(u.Hostname())
-	if oidc.IsLoopback(raw) {
-		return true
-	}
-	for _, suffix := range []string{".microsoftonline.com", ".microsoftonline.us", ".chinacloudapi.cn", ".microsoft.com", ".microsoft.us", ".windows.com", ".windows.net"} {
-		if strings.HasSuffix("."+h, suffix) {
-			return true
-		}
-	}
-	return false
+	return netguard.HostInDomains(raw, append([]string{"microsoft.com", "microsoft.us", "windows.com", "windows.net"}, netguard.EntraAuthorityDomains...)...)
 }
 
 // DefenderConfigNormalized returns the configuration with defaults applied (as the API shows it).

@@ -21,3 +21,37 @@ func TestForbidden(t *testing.T) {
 		t.Fatalf("metadata address dialed: %v", err)
 	}
 }
+
+func TestHostInDomains(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://dce-1.westeurope-1.ingest.monitor.azure.com":               true,
+		"https://dce-1.westeurope-1.ingest.privatelink.monitor.azure.com/x": true,
+		"https://dce.usgovvirginia-1.ingest.monitor.azure.us":               true,
+		"https://dce.chinaeast2-1.ingest.monitor.azure.cn.":                 true,
+		"https://LOCALHOST:8443/":                                           true,
+		"https://127.0.0.1:9/":                                              true,
+		"https://[::1]:9/":                                                  true,
+		"https://attacker.example/monitor.azure.com":                        false,
+		"https://monitor.azure.com.attacker.example":                        false,
+		"https://evilmonitor.azure.com":                                     false,
+		"https://monitor.azure.com@attacker.example":                        false,
+		"https://10.0.0.5":                                                  false,
+		"https://localhost.attacker.example":                                false,
+	} {
+		if got := HostInDomains(raw, AzureMonitorDomains...); got != want {
+			t.Errorf("HostInDomains(%q) = %v", raw, got)
+		}
+	}
+	for raw, want := range map[string]bool{
+		"https://login.microsoftonline.com":         true,
+		"https://login.microsoftonline.us/":         true,
+		"https://login.chinacloudapi.cn":            true,
+		"https://login.partner.microsoftonline.cn":  true,
+		"https://login.microsoftonline.com.evil.io": false,
+		"https://attacker.example":                  false,
+	} {
+		if got := HostInDomains(raw, EntraAuthorityDomains...); got != want {
+			t.Errorf("HostInDomains(%q, entra) = %v", raw, got)
+		}
+	}
+}

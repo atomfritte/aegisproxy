@@ -631,7 +631,7 @@ func (s *Store) SubmitChangeRequest(id, title, description string, actor *auth.T
 	})
 	if err == nil {
 		// Impact is computed outside the write lock (evaluates recorded traffic) and attached.
-		if impact, ierr := s.SimulateSpec(id, &cr.Spec); ierr == nil {
+		if impact, ierr := s.SimulateSpec(id, &cr.Spec, systemActor); ierr == nil {
 			cr.Impact = &impact
 			_ = s.withWrite(func() error {
 				if j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == cr.ID }); j >= 0 {

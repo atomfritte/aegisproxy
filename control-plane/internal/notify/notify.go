@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -420,8 +421,15 @@ func (d *Dispatcher) deliver(j job) {
 		req.Header.Set("User-Agent", "AegisProxy-Notifier/2.0")
 		resp, err := d.client.Do(req)
 		if err != nil {
-			statusNote = fmt.Sprintf("Webhook HTTP error: %v", err)
-			d.log.Warn("webhook delivery failed", "channel", j.channel, "error", err)
+			// The webhook URL is the credential (Teams/Slack embed the token in the path): name the
+			// host only and drop the URL net/http quotes in its error.
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Err
+			}
+			dest := models.MaskURL(j.webhookURL)
+			statusNote = fmt.Sprintf("Webhook HTTP error (%s): %v", dest, err)
+			d.log.Warn("webhook delivery failed", "channel", j.channel, "destination", dest, "error", err)
 			break
 		}
 		_ = resp.Body.Close()

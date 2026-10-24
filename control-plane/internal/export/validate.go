@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 // TypeInfo describes a sink type for the console.
@@ -204,6 +205,16 @@ func Validate(s *models.ExportSink) error {
 		if s.AuthorityURL != "" {
 			if err := httpURL("authority_url", s.AuthorityURL, true); err != nil {
 				return err
+			}
+		}
+		// Ambient identities present platform credentials the sink's author does not hold: their
+		// tokens may only go to Microsoft endpoints (loopback stays open for local test doubles).
+		if s.AzureAuth != "client_secret" {
+			if !netguard.HostInDomains(s.Endpoint, netguard.AzureMonitorDomains...) {
+				return errors.New("with managed or workload identity the endpoint must be an Azure Monitor data collection endpoint (*.monitor.azure.com, .us or .cn)")
+			}
+			if s.AuthorityURL != "" && !netguard.HostInDomains(s.AuthorityURL, netguard.EntraAuthorityDomains...) {
+				return errors.New("with managed or workload identity authority_url must be an Entra ID authority (login.microsoftonline.com, .us or login.chinacloudapi.cn)")
 			}
 		}
 	default:

@@ -55,22 +55,35 @@ high → 3, critical → 2; OTLP severity numbers 9 / 10 / 13 / 17 / 21.
 
 - Every destination has its own in-memory queue (20,000 records), batches records (`batch_size`, default 500;
   `flush_seconds`, default 2) and never blocks the proxy or the API.
+- When the queue is full (the destination is slower than the record rate), **audit and security** records are
+  written to the spool instead (behind the records already spooled, so they may arrive slightly out of order);
+  **traffic** records are dropped. Drops are counted as `dropped` and reported as the destination's last error
+  (at most once a minute).
 - When a destination is unavailable (network error, HTTP 408/429/5xx), batches are written to a durable
   **spool** on disk (`AEGIS_EXPORT_SPOOL_DIR/<sink id>`, size limit `spool_mb`, default 256 MB) and replayed **in
   order** with exponential backoff (1 s … 5 min). The spool survives restarts — delivery is **at least once**.
   Elasticsearch/OpenSearch use deterministic document IDs, so replays do not create duplicates.
 - When the spool limit is reached the oldest segment is discarded and counted as `dropped`.
-- Permanent rejections (HTTP 4xx such as invalid credentials or a mapping error) are counted as `failed` and
-  not retried; the error is shown in the console.
+- Permanent rejections (HTTP 4xx such as invalid credentials or a mapping error) are counted as `failed` (records)
+  and `discarded_batches` and not retried; the error is shown in the console. Destinations that carry audit or
+  security records keep each rejected batch in `AEGIS_EXPORT_SPOOL_DIR/<sink id>/dead-letter.jsonl` (one JSON
+  object per batch: time, sink, error and the encoded records; 32 MB, one older generation `.1`) so it can be
+  inspected and replayed after fixing the cause. Deleting the destination deletes its spool directory and with
+  it the dead-letter file.
+- Splunk HEC with indexer acknowledgement: a batch counts as delivered once Splunk confirms it was indexed. A
+  delivery attempt waits at most 30 s; when the acknowledgement takes longer, later attempts keep polling the
+  same `ackId` instead of resending the batch. Only if no acknowledgement arrives within 2 minutes of sending is
+  the batch resent (at least once, as Splunk recommends).
 - In a cluster, every control-plane replica exports the records it produced itself (audit events of the writes it
   performed, flows and security events reported by the workers connected to it) — no duplicates across replicas.
   Status and counters in the console are those of the replica that answers the request; Prometheus metrics are
   per replica.
 
 Prometheus metrics: `aegis_export_records_sent_total`, `aegis_export_records_failed_total`,
-`aegis_export_records_dropped_total`, `aegis_export_queue_records`, `aegis_export_spool_bytes`,
-`aegis_export_sink_healthy` (label `sink`). Suggested alert: `aegis_export_spool_bytes > 0 for 15m` or
-`increase(aegis_export_records_dropped_total[1h]) > 0`.
+`aegis_export_records_dropped_total`, `aegis_export_batches_discarded_total`, `aegis_export_queue_records`,
+`aegis_export_spool_bytes`, `aegis_export_sink_healthy` (label `sink`). Suggested alert:
+`aegis_export_spool_bytes > 0 for 15m`, `increase(aegis_export_records_dropped_total[1h]) > 0` or
+`increase(aegis_export_batches_discarded_total[1h]) > 0`.
 
 ## Security
 
@@ -82,6 +95,15 @@ Prometheus metrics: `aegis_export_records_sent_total`, `aegis_export_records_fai
   supported for syslog/TLS and HTTPS destinations. `tls_skip_verify` exists for lab setups only.
 - Destinations in link-local ranges (cloud metadata endpoints) are refused. Private and loopback addresses are
   allowed on purpose (internal SIEM collectors, local sidecars).
+- Microsoft Sentinel with **managed identity** or **workload identity** sends tokens of the platform's identity,
+  which the destination's author does not hold: the endpoint must be an Azure Monitor data collection endpoint
+  (`*.monitor.azure.com`, `.us`, `.cn`, also via Private Link) and `authority_url` an Entra ID authority
+  (`login.microsoftonline.com`, `.us`, `login.chinacloudapi.cn`). Loopback addresses stay allowed for local test
+  doubles. Client-secret authentication is not restricted (the author supplies the secret).
+- Endpoint URLs can carry credentials: query values are always masked in API responses and delivery errors,
+  and webhook destinations show only scheme and host (`https://hooks.example/••••••`); sending the masked value
+  back keeps the stored URL. Delivery errors never quote the full request URL. InfoSec Approvers see delivery
+  errors without the destination's response body.
 - `file` sinks can only write plain file names inside `AEGIS_EXPORT_DIR`.
 
 ## Setup examples

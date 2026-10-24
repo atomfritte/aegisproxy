@@ -16,7 +16,9 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +26,8 @@ import (
 	"aegisproxy/control-plane/internal/models"
 )
 
-const queueSize = 20_000
+// queueSize bounds the in-memory queue per sink (a variable for tests).
+var queueSize = 20_000
 
 type Options struct {
 	SpoolDir  string // per-sink spools: <SpoolDir>/<sink id>
@@ -152,8 +155,8 @@ func (m *Manager) Configure(sinks []models.ExportSink) {
 		}
 		rt, err := m.start(s)
 		if err != nil {
-			m.log.Error("export sink not started", "sink", s.Name, "type", s.Type, "error", err)
-			m.sinks[id] = &runtime{cfg: s, sig: signature(s), failedStart: err.Error(), done: closedChan()}
+			m.log.Error("export sink not started", "sink", s.Name, "type", s.Type, "error", scrubError(s, err.Error()))
+			m.sinks[id] = &runtime{cfg: s, sig: signature(s), failedStart: scrubError(s, err.Error()), done: closedChan()}
 			continue
 		}
 		m.sinks[id] = rt
@@ -174,6 +177,9 @@ func (m *Manager) start(s models.ExportSink) (*runtime, error) {
 	}
 	rt := &runtime{cfg: s, sig: signature(s), drv: drv, meta: m.meta, log: m.log.With("sink", s.Name),
 		q: make(chan Event, queueSize), stop: make(chan struct{}), done: make(chan struct{})}
+	if m.opts.SpoolDir != "" {
+		rt.deadLetterPath = filepath.Join(m.opts.SpoolDir, s.ID, "dead-letter.jsonl")
+	}
 	if s.SpoolMB > 0 && m.opts.SpoolDir != "" {
 		sp, discarded, err := openSpool(filepath.Join(m.opts.SpoolDir, s.ID), int64(s.SpoolMB)<<20, encodingSignature(s))
 		if err != nil {
@@ -202,7 +208,7 @@ func (m *Manager) Publish(ev Event) {
 		select {
 		case rt.q <- ev:
 		default:
-			rt.dropped.Add(1)
+			rt.overflow(ev)
 		}
 	}
 }
@@ -281,8 +287,11 @@ type runtime struct {
 	done        chan struct{}
 	stopOnce    sync.Once
 	failedStart string
+	// deadLetterPath keeps permanently rejected batches of audit/security sinks ("" = none).
+	deadLetterPath string
 
-	sent, failed, dropped atomic.Uint64
+	sent, failed, dropped, discarded atomic.Uint64
+	lastDropAlert                    atomic.Int64 // unix nanos
 
 	mu        sync.Mutex
 	lastOK    *time.Time
@@ -290,6 +299,71 @@ type runtime struct {
 	lastErrAt *time.Time
 	nextRetry time.Time
 	backoff   time.Duration
+}
+
+// critical streams must not be lost silently: when the in-memory queue is full their records go to
+// the spool, and batches the destination rejects are kept in a dead-letter file.
+func critical(stream string) bool {
+	return stream == models.StreamAudit || stream == models.StreamSecurity
+}
+
+// overflow takes an event the full queue cannot hold: audit and security records are spooled to disk
+// (behind the records already spooled), traffic records are dropped. Drops are counted and reported
+// in the status (at most once a minute).
+func (rt *runtime) overflow(ev Event) {
+	if critical(ev.Stream) && rt.spool != nil {
+		if rec, err := rt.drv.encode(redacted(ev, &rt.cfg)); err == nil && rt.spool.Append([][]byte{rec}) == nil {
+			rt.dropped.Add(rt.spool.takeDropped())
+			return
+		}
+	}
+	rt.dropped.Add(1)
+	now := time.Now().UnixNano()
+	if last := rt.lastDropAlert.Load(); now-last >= int64(time.Minute) && rt.lastDropAlert.CompareAndSwap(last, now) {
+		msg := fmt.Sprintf("export queue full (%d events): records are being dropped (%d so far); the destination is too slow or unreachable",
+			queueSize, rt.dropped.Load())
+		rt.recordErr(msg)
+		rt.log.Warn(msg, "stream", ev.Stream)
+	}
+}
+
+// deadLetterMax bounds the dead-letter file; one older generation (.1) is kept.
+const deadLetterMax = 32 << 20
+
+// deadLetter appends a batch the destination rejected permanently to <spool dir>/dead-letter.jsonl
+// when the sink carries audit or security records (one JSON object per batch, records as text), so
+// they can be inspected and replayed. It reports whether the batch was kept.
+func (rt *runtime) deadLetter(batch [][]byte, reason string) bool {
+	if rt.deadLetterPath == "" || !slices.ContainsFunc(rt.cfg.Streams, critical) {
+		return false
+	}
+	recs := make([]string, len(batch))
+	for i, r := range batch {
+		recs[i] = strings.TrimRight(string(r), "\n")
+	}
+	line, err := json.Marshal(map[string]any{"discarded_at": time.Now().UTC(), "sink_id": rt.cfg.ID, "sink": rt.cfg.Name,
+		"error": scrubError(rt.cfg, reason), "records": recs})
+	if err != nil {
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(rt.deadLetterPath), 0o700); err != nil {
+		rt.log.Error("dead-letter file not writable", "error", err)
+		return false
+	}
+	if fi, err := os.Stat(rt.deadLetterPath); err == nil && fi.Size()+int64(len(line)) > deadLetterMax {
+		_ = os.Rename(rt.deadLetterPath, rt.deadLetterPath+".1")
+	}
+	f, err := os.OpenFile(rt.deadLetterPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		rt.log.Error("dead-letter file not writable", "error", err)
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		rt.log.Error("dead-letter write failed", "error", err)
+		return false
+	}
+	return true
 }
 
 func (rt *runtime) accepts(ev Event) bool {
@@ -393,14 +467,17 @@ func (rt *runtime) toSpool(batch [][]byte) {
 	rt.dropped.Add(rt.spool.takeDropped())
 }
 
+// deliveryTimeout bounds one delivery attempt (a variable for tests).
+var deliveryTimeout = 30 * time.Second
+
 func (rt *runtime) deliver(batch [][]byte) {
 	if rt.spooling() {
 		rt.toSpool(batch)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
 	defer cancel()
-	if rt.handle(len(batch), rt.drv.send(ctx, batch)) {
+	if rt.handle(batch, rt.drv.send(ctx, batch)) {
 		rt.toSpool(batch)
 	}
 }
@@ -413,13 +490,14 @@ func (rt *runtime) deliverFinal(batch [][]byte) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if rt.handle(len(batch), rt.drv.send(ctx, batch)) {
+	if rt.handle(batch, rt.drv.send(ctx, batch)) {
 		rt.toSpool(batch)
 	}
 }
 
 // handle accounts a send result and reports whether the batch must be retried later.
-func (rt *runtime) handle(n int, err error) (retry bool) {
+func (rt *runtime) handle(batch [][]byte, err error) (retry bool) {
+	n := len(batch)
 	now := time.Now().UTC()
 	var pe *permanentError
 	var part *partialError
@@ -440,8 +518,10 @@ func (rt *runtime) handle(n int, err error) (retry bool) {
 		return false
 	case errors.As(err, &pe):
 		rt.failed.Add(uint64(n))
+		rt.discarded.Add(1)
 		rt.recordErr(pe.msg)
-		rt.log.Warn("export batch rejected", "records", n, "error", pe.msg)
+		kept := rt.deadLetter(batch, pe.msg)
+		rt.log.Warn("export batch rejected", "records", n, "dead_letter", kept, "error", scrubError(rt.cfg, pe.msg))
 		return false
 	default:
 		rt.recordErr(err.Error())
@@ -450,16 +530,31 @@ func (rt *runtime) handle(n int, err error) (retry bool) {
 		jitter := time.Duration(rand.Int64N(int64(rt.backoff / 4)))
 		rt.nextRetry = time.Now().Add(rt.backoff + jitter)
 		rt.mu.Unlock()
-		rt.log.Warn("export destination unavailable; spooling", "records", n, "retry_in", rt.backoff.String(), "error", err)
+		rt.log.Warn("export destination unavailable; spooling", "records", n, "retry_in", rt.backoff.String(), "error", scrubError(rt.cfg, err.Error()))
 		return true
 	}
 }
 
 func (rt *runtime) recordErr(msg string) {
 	now := time.Now().UTC()
+	msg = scrubError(rt.cfg, msg)
 	rt.mu.Lock()
 	rt.lastErr, rt.lastErrAt = msg, &now
 	rt.mu.Unlock()
+}
+
+var urlWithQuery = regexp.MustCompile(`(https?://[^\s?#"'<>]+)\?[^\s"'<>]*`)
+
+// scrubError removes credentials from a delivery error before it is stored, shown or logged
+// (defense in depth; drivers already name destinations without them): the configured endpoint is
+// replaced by its masked form and query strings of any URL are hidden.
+func scrubError(s models.ExportSink, msg string) string {
+	if s.Endpoint != "" && s.Type != "syslog" && s.Type != "file" {
+		if masked := models.MaskSinkEndpoint(s.Type, s.Endpoint); masked != s.Endpoint {
+			msg = strings.ReplaceAll(msg, s.Endpoint, masked)
+		}
+	}
+	return urlWithQuery.ReplaceAllString(msg, "$1?"+models.MaskedSecretMarker)
 }
 
 // drainSpool replays spooled batches in order while the destination accepts them.
@@ -482,8 +577,8 @@ func (rt *runtime) drainSpool() {
 		if len(recs) == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		retry := rt.handle(len(recs), rt.drv.send(ctx, recs))
+		ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+		retry := rt.handle(recs, rt.drv.send(ctx, recs))
 		cancel()
 		if retry {
 			return
@@ -507,9 +602,10 @@ func (rt *runtime) shutdown() {
 }
 
 func (rt *runtime) status(node string) models.ExportSinkStatus {
-	st := models.ExportSinkStatus{ID: rt.cfg.ID, Node: node, Sent: rt.sent.Load(), Failed: rt.failed.Load(), Dropped: rt.dropped.Load()}
+	st := models.ExportSinkStatus{ID: rt.cfg.ID, Node: node, Sent: rt.sent.Load(), Failed: rt.failed.Load(), Dropped: rt.dropped.Load(),
+		DiscardedBatches: rt.discarded.Load()}
 	if rt.failedStart != "" {
-		st.State, st.LastError = "error", rt.failedStart
+		st.State, st.LastError = "error", rt.failedStart // scrubbed when recorded
 		return st
 	}
 	st.Queued = len(rt.q)

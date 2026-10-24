@@ -689,7 +689,8 @@ func (s *Store) DiscoveredSources() []models.DiscoveredSource {
 	return out
 }
 
-// EffectivePolicy explains which policy sets, rules and exceptions apply to one server.
+// EffectivePolicy explains which policy sets, rules and exceptions apply to one server (API-safe:
+// the server is returned without its proxy credential digest).
 func (s *Store) EffectivePolicy(serverID string) (models.EffectivePolicy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -699,7 +700,7 @@ func (s *Store) EffectivePolicy(serverID string) (models.EffectivePolicy, error)
 	}
 	groups := srv.EffectiveGroupIDs
 	ep := models.EffectivePolicy{
-		Server: cloneServer(srv), EffectiveGroupIDs: append([]string{}, groups...), DynamicGroupIDs: []string{},
+		Server: cloneServer(srv).Public(), EffectiveGroupIDs: append([]string{}, groups...), DynamicGroupIDs: []string{},
 		Quarantined: srv.Quarantined, PolicySets: []models.EffectivePolicySet{}, TLSBypass: []models.TLSBypassRule{},
 		BlockPageTemplateID: s.templateForGroupsLocked(groups),
 	}
