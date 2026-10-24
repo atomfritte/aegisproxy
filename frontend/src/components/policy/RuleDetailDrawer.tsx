@@ -30,7 +30,14 @@ export const RuleDetailDrawer: React.FC<{ rule: PolicyRule | RuleInput | null; o
             items={[
               { label: 'Methods', value: <MethodList methods={r.methods} /> },
               { label: 'State', value: r.enabled ? <Badge tone="success">Enabled</Badge> : <Badge tone="neutral">Disabled</Badge> },
-              { label: 'Follows redirects', value: r.follow_redirects ? 'Yes, for two minutes per redirect' : 'No' },
+              {
+                label: 'Follows redirects',
+                value: !r.follow_redirects
+                  ? 'No'
+                  : r.redirect_hosts?.length
+                    ? `Yes, to ${r.redirect_hosts.join(', ')} (two minutes per redirect)`
+                    : 'Yes, to any public host (two minutes per redirect)',
+              },
               { label: 'Expires', value: r.expires_at ? <CountdownChip due={r.expires_at} kind="expiry" /> : 'Never' },
               {
                 label: 'Companion rules',

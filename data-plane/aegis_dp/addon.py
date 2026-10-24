@@ -7,6 +7,7 @@ Hook pipeline (regular proxy mode, rawtcp disabled):
   requestheaders     Host/SNI consistency (destination binding in transparent/SOCKS/reverse modes), policy
                      evaluation, block page with signed block token; Accept-Encoding/Range rewriting for inspection
   request            DLP (secrets in URL/body), upload size limit, ICAP REQMOD
+                     (request bodies are only buffered when one of these needs them: buffering.py)
   server_connect     resolve + vet destination IPs (threat IPs, DNS rebinding to internal ranges), pin the IP
   responseheaders    streaming / oversize / undecodable / partial-content decisions
   response           SHA-256 IOC check, file-type policy, YARA, ClamAV, ICAP RESPMOD, redirect lineage, telemetry
@@ -35,9 +36,10 @@ from typing import Any, Callable, Dict, List, Optional
 from mitmproxy import connection, ctx, http, tcp, tls, udp
 from mitmproxy.proxy import server_hooks
 
-from . import __version__
+from . import __version__, buffering
 from .accesslog import AccessLog
 from .blockpage import is_cli_client, render_branded, render_cli, render_html
+from .buffering import BLOCK, STREAM, BodyGuard, BufferBudget
 from .clamav import ClamdClient
 from .config import Config
 from .content import detect_file_type, scan_dlp
@@ -56,7 +58,8 @@ from .policy import (
 log = logging.getLogger("aegis.dataplane")
 
 INTERNAL_HEADERS = ("X-Aegis-DataPlane-Key", "X-Simulated-Server-IP", "Proxy-Authorization", "Proxy-Connection")
-STREAM_WITHOUT_INSPECTION = 8 * 1024 * 1024
+STREAM_WITHOUT_INSPECTION = 8 * 1024 * 1024  # bodies nothing inspects are buffered only up to this size
+DEFAULT_BUFFER_BUDGET = 512 * 1024 * 1024  # AEGIS_BUFFER_BUDGET unset: min(this, body_size_limit)
 MAX_TRACKED_CONNECTIONS = 65536
 REGULAR_MODES = ("regular", "upstream")  # the client names the destination; everything else connects to an address
 INFRA_ERRORS = (OSError, asyncio.TimeoutError, TimeoutError)  # -> 503 instead of 403
@@ -149,6 +152,8 @@ class AegisAddon:
         self._last_unavailable_log = 0.0
         self.metrics = Metrics()
         self._ops = None
+        buffering.install()
+        self.budget = BufferBudget(self.cfg.buffer_budget or DEFAULT_BUFFER_BUDGET)
         self.access_log = AccessLog(self.cfg.access_log, self.cfg.access_log_format,
                                     self.cfg.access_log_rotate_mb << 20, self.cfg.access_log_keep)
 
@@ -167,6 +172,13 @@ class AegisAddon:
         # Non-HTTP payloads inside CONNECT tunnels must never be relayed: with rawtcp disabled mitmproxy
         # parses them as HTTP, answers 400 and never opens an upstream connection.
         ctx.options.update(rawtcp=False)
+        if not self.cfg.buffer_budget:
+            try:
+                limit = buffering.parse_size(str(ctx.options.body_size_limit or ""))
+            except ValueError:
+                limit = None
+            self.budget.total = min(DEFAULT_BUFFER_BUDGET, limit or DEFAULT_BUFFER_BUDGET)
+        log.info("inspection buffer budget %d MiB (body_size_limit=%s)", self.budget.total >> 20, ctx.options.body_size_limit or "unlimited")
         self.cp.start()
         if self.cfg.ops_addr and self._ops is None:
             try:
@@ -200,12 +212,20 @@ class AegisAddon:
             "aegis_dp_clamd_available": {True: 1.0, False: 0.0}.get(self.clamd.available if self.clamd else None, -1.0),
             "aegis_dp_telemetry_queue": float(self.cp.queue_len()),
             "aegis_dp_identified_connections": float(len(self.conn_auth)),
+            "aegis_dp_buffer_budget_bytes": float(self.budget.total),
+            "aegis_dp_buffered_bytes": float(self.budget.used),
+            "aegis_dp_buffered_bytes_peak": float(self.budget.peak),
+            "aegis_dp_access_log_dropped_total": float(self.access_log.dropped),
+            "aegis_dp_access_log_rotation_failures_total": float(self.access_log.rotation_failures),
         }
 
     def client_disconnected(self, client: connection.Client) -> None:
         self.conn_auth.pop(client.id, None)
         self._bound.pop(client.id, None)
         self._tainted.pop(client.id, None)
+
+    def error(self, flow: http.HTTPFlow) -> None:
+        buffering.release(flow)  # aborted, killed or disconnected flows return their buffer share
 
     async def _apply_runtime_options(self) -> None:
         """Mirror policy switches that map to mitmproxy options (runs on the event loop thread)."""
@@ -557,11 +577,17 @@ class AegisAddon:
             return
         header_host = normalize_host(flow.request.host_header or "")
         sni = normalize_host(client.sni or "") if client else ""
-        for value in (host, header_host, sni):
+        # HTTP/2 and 3 name the destination in :authority (host_header); a Host header next to it is forwarded too
+        # (and becomes the Host of an HTTP/1.1 upstream request), so both must name the same destination.
+        h2_host = flow.request.headers.get("Host") if (flow.request.is_http2 or flow.request.is_http3) and flow.request.authority else None
+        h2_host = normalize_host(h2_host) if h2_host is not None else None
+        for value in (host, header_host, sni, h2_host or ""):
             if not valid_host(value):
                 res.block(VERDICT_POLICY, "malformed_host", f"Security Guard: malformed destination host '{printable(value, 255)}'")
                 return
-        if regular and header_host and header_host != host:
+        if h2_host is not None and h2_host != header_host:
+            res.block(VERDICT_POLICY, "host_mismatch", f"Security Guard: Host header '{h2_host}' does not match :authority '{header_host}' (domain fronting)")
+        elif regular and header_host and header_host != host:
             # The upstream connection goes to request.host; Host header and SNI must agree with it,
             # otherwise policy would be evaluated for a different destination than the one contacted.
             res.block(VERDICT_POLICY, "host_mismatch", f"Security Guard: Host header '{header_host}' does not match destination '{host}' (domain fronting)")
@@ -628,7 +654,83 @@ class AegisAddon:
         inspect_on = self._inspection_enabled(policy, res.group_ids)
         if inspect_on:
             self._prepare_inspection(flow, res)
-        flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on}
+        meta = flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on}
+        self._plan_upload(flow, policy, res, meta)
+
+    def _plan_upload(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> None:
+        """Request bodies are buffered only when DLP, ICAP REQMOD or the max_upload_bytes check of a body of unknown
+        length needs them, within a per-flow cap and the worker budget; everything else is streamed."""
+        req = flow.request
+        clen_raw = req.headers.get("Content-Length", "")
+        clen = int(clen_raw) if clen_raw.isdigit() else None
+        if clen == 0:
+            return
+        dlp_on = policy.policy_value("dlp_mode", "monitor") != "off"
+        reqmod = bool(policy.policy_value("icap_reqmod_url", ""))
+        max_upload = int(policy.policy_value("max_upload_bytes", 0) or 0)
+        enforce_size = bool(max_upload) and clen is None  # a known Content-Length was checked above
+        if not (dlp_on or reqmod or enforce_size):
+            req.stream = True
+            return
+        cap = STREAM_WITHOUT_INSPECTION
+        if dlp_on:
+            cap = max(cap, int(policy.policy_value("dlp_max_scan_bytes", 1 << 20)))
+        if reqmod:
+            cap = max(cap, int(policy.policy_value("icap_max_bytes", 25 << 20) or (25 << 20)))
+        if enforce_size:
+            cap = max(cap, max_upload)
+        strict = (dlp_on or reqmod) and policy.policy_value("dlp_oversize_action", "allow") == "block"
+
+        def exceeded(reason: str, size: int) -> str:
+            self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "request"), ("reason", reason)))
+            peer, auth = meta["peer"], meta["auth"]
+            if max_upload and size > max_upload:
+                res.block(VERDICT_POLICY, "upload_too_large", f"Security Guard: upload exceeds the {max_upload}-byte limit")
+                self._block(flow, res, peer, auth, status=413)
+                return BLOCK
+            if reason == "busy" and (strict or enforce_size):
+                res.block(VERDICT_POLICY, "inspection_busy", "Security Guard: the upload inspection capacity of this worker is exhausted; retry shortly")
+                self._block(flow, res, peer, auth, status=503)
+                return BLOCK
+            if strict:
+                res.block(VERDICT_POLICY, "dlp_oversize", f"Data Loss Prevention: upload exceeds the {cap}-byte inspection limit")
+                self._block(flow, res, peer, auth, status=413)
+                return BLOCK
+            if dlp_on and self._query_dlp_blocked(flow, policy, res, meta):  # the URL leaves with the streamed request
+                return BLOCK
+            if dlp_on:
+                res.security_flags.append(f"DLP_UNSCANNED:{reason}")
+            if reqmod:
+                res.security_flags.append(f"ICAP_UNSCANNED:{reason}")
+            req.stream = True
+            return STREAM
+
+        guard = buffering.attach(flow, "request", BodyGuard(self.budget, cap, exceeded))
+        if clen is not None:
+            reason = guard.admit(clen)
+            if reason:
+                guard.exceed(reason, clen)
+
+    def _query_dlp_blocked(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> bool:
+        """DLP of the query string alone, for requests whose body is streamed (never reaches the request hook's scan)."""
+        query = urllib.parse.unquote_to_bytes(flow.request.path.split("?", 1)[1]) if "?" in flow.request.path else b""
+        findings = scan_dlp([query], policy.policy_value("dlp_detectors", [])) if query else []
+        if not findings:
+            return False
+        meta["dlp"] = findings
+        if policy.policy_value("dlp_mode", "monitor") == "block":
+            res.block(VERDICT_DLP, "dlp", "Data Loss Prevention: credentials/secrets detected in outbound request (" + ", ".join(findings) + ")")
+            self._block(flow, res, meta["peer"], meta["auth"], dlp_findings=findings)
+            return True
+        res.security_flags.extend(f"DLP:{f}" for f in findings)
+        return False
+
+    def _upload_oversize_blocked(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any], what: str) -> bool:
+        if policy.policy_value("dlp_oversize_action", "allow") != "block":
+            return False
+        res.block(VERDICT_POLICY, "dlp_oversize", f"Data Loss Prevention: upload exceeds the {what} scan limit")
+        self._block(flow, res, meta["peer"], meta["auth"], status=413)
+        return True
 
     @guarded
     async def request(self, flow: http.HTTPFlow) -> None:
@@ -640,6 +742,8 @@ class AegisAddon:
             self._deny(flow, "request", 403, "unevaluated", "Security Guard: the request was not evaluated (fail-closed)")
             return
         res: EvalResult = meta["res"]
+        if flow.request.stream:
+            return  # streamed upload: decided (URL scanned, flags set) in requestheaders or at the buffer limit
         body = flow.request.raw_content or b""
         max_upload = int(policy.policy_value("max_upload_bytes", 0) or 0)
         if max_upload and len(body) > max_upload:
@@ -667,7 +771,7 @@ class AegisAddon:
         if mode != "off":  # built-in detectors; ICAP REQMOD (external DLP) runs independently
             detectors = policy.policy_value("dlp_detectors", [])
             query = urllib.parse.unquote_to_bytes(flow.request.path.split("?", 1)[1]) if "?" in flow.request.path else b""
-            findings = scan_dlp([query, content[:limit]], detectors)
+            findings = scan_dlp([query, content[:limit]], detectors)  # the whole decoded body up to the scan limit
         if findings:
             meta["dlp"] = findings
             if mode == "block":
@@ -675,6 +779,19 @@ class AegisAddon:
                 self._block(flow, res, meta["peer"], meta["auth"], dlp_findings=findings)
                 return
             res.security_flags.extend(f"DLP:{f}" for f in findings)
+        if mode != "off" and (truncated or len(content) > limit):
+            # Bytes beyond the scan limit were not inspected: never silently.
+            res.security_flags.append("DLP_UNSCANNED:oversize")
+            if self._upload_oversize_blocked(flow, policy, res, meta, f"{limit}-byte DLP"):
+                return
+        if reqmod_url and codings and not buffering.hold(flow, "request", len(content)):
+            # The decoded copy would be kept during the ICAP call: it must fit the worker budget.
+            self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "request"), ("reason", "busy")))
+            res.security_flags.append("ICAP_UNSCANNED:busy")
+            if policy.policy_value("dlp_oversize_action", "allow") == "block":
+                res.block(VERDICT_POLICY, "inspection_busy", "Security Guard: the upload inspection capacity of this worker is exhausted; retry shortly")
+                self._block(flow, res, meta["peer"], meta["auth"], status=503)
+            return
         await self._icap_reqmod(flow, policy, res, meta, content, truncated)
 
     async def _icap_reqmod(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any], content: bytes,
@@ -683,8 +800,10 @@ class AegisAddon:
         url = policy.policy_value("icap_reqmod_url", "")
         if not url or not content or flow.request.method in ("GET", "HEAD", "OPTIONS", "CONNECT"):
             return
-        if truncated or len(content) > int(policy.policy_value("icap_max_bytes", 25 << 20) or (25 << 20)):
+        icap_max = int(policy.policy_value("icap_max_bytes", 25 << 20) or (25 << 20))
+        if truncated or len(content) > icap_max:
             res.security_flags.append("ICAP_UNSCANNED:oversize")
+            self._upload_oversize_blocked(flow, policy, res, meta, f"{icap_max}-byte ICAP")
             return
         started = time.time()
         result = await self._icap_call(url, policy, "reqmod", flow.request.method, printable(flow.request.pretty_url, 8192),
@@ -843,9 +962,48 @@ class AegisAddon:
                 resp.stream = True
                 meta["unscanned"] = "oversize"
                 res.security_flags.append("AV_UNSCANNED:oversize")
-        elif not inspect_on and clen is not None and clen > STREAM_WITHOUT_INSPECTION:
-            resp.stream = True
-            meta["unscanned"] = "not_required"
+        elif not self._has_body(flow):
+            return
+        elif not inspect_on:
+            # Nothing inspects the body: only small bodies of known size are buffered (within the budget); bodies of
+            # unknown length are relayed as they arrive, never accumulated.
+            if clen is None or clen > STREAM_WITHOUT_INSPECTION:
+                self._relay_unbuffered(flow, meta)
+            else:
+                guard = buffering.attach(flow, "response", BodyGuard(self.budget, STREAM_WITHOUT_INSPECTION,
+                                                                     lambda _reason, _size: self._relay_unbuffered(flow, meta)))
+                if guard.admit(clen):
+                    guard.exceed("busy", clen)
+        else:
+            # Inspected: buffered up to the scan limit within the worker budget, a body of unknown length chunk by chunk.
+            guard = buffering.attach(flow, "response", BodyGuard(self.budget, max_scan,
+                                                                 lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason)))
+            if clen is not None:
+                reason = guard.admit(clen)
+                if reason:
+                    guard.exceed(reason, clen)
+
+    def _relay_unbuffered(self, flow: http.HTTPFlow, meta: Dict[str, Any]) -> str:
+        flow.response.stream = True
+        meta["unscanned"] = "not_required"
+        return STREAM
+
+    def _download_exceeded(self, flow: http.HTTPFlow, policy: Policy, meta: Dict[str, Any], cap: int, reason: str) -> str:
+        """A download outgrew the scan limit (no Content-Length) or the worker budget: av_oversize_action decides."""
+        self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", reason)))
+        if policy.policy_value("av_oversize_action", "allow") == "block":
+            if reason == "oversize":
+                self._block_streamed(flow, meta, "av_oversize", f"Antivirus: download exceeds the {cap}-byte scan limit",
+                                     f"AegisProxy blocked this download: it exceeds the antivirus scan limit ({cap} bytes).\n"
+                                     "Contact InfoSec if this file is required.\n")
+            else:
+                self._block_streamed(flow, meta, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted",
+                                     "AegisProxy could not inspect this download: scan capacity exhausted. Retry shortly.\n", status=503)
+            return BLOCK
+        meta["res"].security_flags.append(f"AV_UNSCANNED:{reason}")
+        meta["unscanned"] = reason
+        flow.response.stream = True
+        return STREAM
 
     def _replace_streamed(self, flow: http.HTTPFlow, status: int, msg: bytes, verdict: str) -> None:
         """Turns a response whose headers already arrived into a block: the upstream body is discarded and
@@ -872,15 +1030,21 @@ class AegisAddon:
         flow.metadata["aegis_pending"] = (sent, msg)  # bodyless upstream responses: sent by the response hook
         flow.metadata["aegis_local"] = True
 
-    def _block_streamed(self, flow: http.HTTPFlow, meta: Dict[str, Any], reason: str, name: str, msg: str) -> None:
+    def _block_streamed(self, flow: http.HTTPFlow, meta: Dict[str, Any], reason: str, name: str, msg: str, status: int = 403) -> None:
         res: EvalResult = meta["res"]
         res.block(VERDICT_POLICY, reason, name)
-        self._replace_streamed(flow, 403, msg.encode(), VERDICT_POLICY)
+        self._replace_streamed(flow, status, msg.encode(), VERDICT_POLICY)
         flow.metadata["aegis_recorded"] = True
-        self.cp.record_flow(self._flow_record(flow, res, meta["peer"], meta["auth"], 403, VERDICT_POLICY))
+        self.cp.record_flow(self._flow_record(flow, res, meta["peer"], meta["auth"], status, VERDICT_POLICY))
 
     @guarded
     async def response(self, flow: http.HTTPFlow) -> None:
+        try:
+            await self._respond(flow)
+        finally:
+            buffering.release(flow)
+
+    async def _respond(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("aegis_local") or flow.metadata.get("aegis_recorded"):
             pending = flow.metadata.pop("aegis_pending", None)
             if pending and not pending[0]["done"] and flow.response is not None:
@@ -922,7 +1086,8 @@ class AegisAddon:
                 except ValueError:  # malformed Location: recorded as sent, no grant
                     extra["redirect_location"] = printable(loc, 4096)
                 if res.follow_redirects or res.verdict == VERDICT_LEARNING:
-                    self.grants.register(peer, loc, flow.request.pretty_url, res.matched_rule_id, res.matched_rule_name, policy.internal_suffixes)
+                    self.grants.register(peer, loc, flow.request.pretty_url, res.matched_rule_id, res.matched_rule_name,
+                                         policy.internal_suffixes, res.redirect_hosts)
         self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, res.verdict, **extra))
 
     async def _inspect_response(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any], extra: Dict[str, Any]):
@@ -951,13 +1116,24 @@ class AegisAddon:
             if policy.policy_value("av_oversize_action", "allow") == "block":
                 res.block(VERDICT_POLICY, "av_oversize", f"Antivirus: decoded download exceeds the {max_scan}-byte scan limit")
                 return VERDICT_POLICY, 403
+        scanners = True
+        if codings and inspect_on and not buffering.hold(flow, "response", len(body)):
+            # The decoded copy is kept while the scan engines run, so it must fit the worker budget too. Without room
+            # only the synchronous checks (hash IOCs, file type) run.
+            self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", "busy")))
+            res.security_flags.append("AV_UNSCANNED:busy")
+            if policy.policy_value("av_oversize_action", "allow") == "block":
+                res.block(VERDICT_POLICY, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted")
+                return VERDICT_POLICY, 503
+            scanners = False
         raw_digest = hashlib.sha256(raw).hexdigest() if codings else ""
-        return await self._inspect_body(flow, policy, res, body, extra, partial=truncated, raw_digest=raw_digest)
+        return await self._inspect_body(flow, policy, res, body, extra, partial=truncated, raw_digest=raw_digest, scanners=scanners)
 
     async def _inspect_body(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, body: bytes, extra: Dict[str, Any],
-                            partial: bool = False, raw_digest: str = ""):
+                            partial: bool = False, raw_digest: str = "", scanners: bool = True):
         """Returns (verdict, status) when the download must be blocked. ``partial``: body is only the first
-        av_max_scan_bytes of a larger decoded entity (hash/ClamAV/ICAP are skipped, file type and YARA run)."""
+        av_max_scan_bytes of a larger decoded entity (hash/ClamAV/ICAP are skipped, file type and YARA run).
+        ``scanners=False``: only the synchronous checks run (hash IOCs, file type)."""
         if not body:
             return None
         digest = "" if partial else hashlib.sha256(body).hexdigest()
@@ -981,6 +1157,9 @@ class AegisAddon:
             if ftype in self._blocked_types(policy, res.group_ids):
                 res.block(VERDICT_FILETYPE, "file_type", f"Download control: file type '{ftype}' is not permitted for this server group")
                 return VERDICT_FILETYPE, 403
+        if not scanners:
+            extra["av_result"] = "skipped"
+            return None
 
         blocked = await self._yara_check(policy, res, body, digest, extra)
         if blocked:

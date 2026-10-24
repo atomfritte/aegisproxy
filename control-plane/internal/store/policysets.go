@@ -288,6 +288,7 @@ func ruleFieldsChanged(a, b models.PolicyRule) []string {
 	cmp("path_pattern", a.PathPattern, b.PathPattern)
 	cmp("methods", nonNil(a.Methods), nonNil(b.Methods))
 	cmp("follow_redirects", a.FollowRedirects, b.FollowRedirects)
+	cmp("redirect_hosts", nonNil(a.RedirectHosts), nonNil(b.RedirectHosts))
 	cmp("companion_rules", nonNil(a.CompanionRules), nonNil(b.CompanionRules))
 	cmp("enabled", a.Enabled, b.Enabled)
 	ea, eb := "", ""

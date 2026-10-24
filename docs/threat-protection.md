@@ -106,7 +106,10 @@ blocked at the proxy too. Refresh interval: the sync interval, at least 15 minut
 
 When at least one inspection is active, the worker buffers the response body (up to `av_max_scan_bytes`, which
 is therefore the size limit for every engine — compressed and decoded; larger downloads are streamed unscanned
-with the flag `AV_UNSCANNED`, or blocked with `av_oversize_action: block`), decodes it as described under
+with the flag `AV_UNSCANNED:oversize`, or blocked with `av_oversize_action: block`). A download without
+`Content-Length` is buffered chunk by chunk and handled the same way once it outgrows the limit; buffering is
+also bounded per worker ([memory sizing](configuration.md#data-plane-memory-sizing), flag `AV_UNSCANNED:busy`
+or 503 `inspection_busy` with `block`). The worker decodes the body as described under
 [content decoding](#content-decoding) and runs, in this order, stopping at the first block:
 
 1. **Hash** — SHA-256 against threat intelligence (feeds, TAXII/MISP, Defender, custom IOCs).
@@ -188,7 +191,7 @@ c-icap with ClamAV.
 | `icap_mode` | `block` | `block` or `monitor` (flag + security event only) |
 | `icap_fail_mode` | `open` | `open`: allow and flag `AV_ERROR:icap…`; `closed`: answer 503 when the engine is unreachable, times out, answers with an error or a malformed response, or the URL is invalid |
 | `icap_timeout_seconds` | 30 | 1 – 600; one deadline for the whole exchange (connect, sending the body, response) |
-| `icap_max_bytes` | 25 MiB | larger bodies are not sent (`ICAP_UNSCANNED:oversize`; downloads are blocked when `av_oversize_action` is `block`) |
+| `icap_max_bytes` | 25 MiB | larger bodies are not sent (`ICAP_UNSCANNED:oversize`; downloads are blocked when `av_oversize_action` is `block`, uploads when `dlp_oversize_action` is `block`) |
 | `icap_allow_modified` | `true` | deliver content the engine sanitized (content disarm and reconstruction) — for downloads and for uploads (REQMOD: the sanitized body is sent upstream with a recomputed `Content-Length`, never the original); otherwise such content is blocked in `block` mode |
 | `icap_tls_skip_verify` / `icap_ca_cert_pem` | `false` / – | TLS verification for `icaps://` |
 
@@ -233,10 +236,15 @@ URL extensions: `pe`, `elf`, `macho`, `java_class`, `msi_ole`, `script`, `jar`, 
 
 ## Data loss prevention
 
-Scans URL query strings and request bodies (up to `dlp_max_scan_bytes`). Compressed uploads
-(`Content-Encoding`) are decoded first, bounded like downloads; an upload with an undecodable coding is
-blocked (`undecodable_content`) when `dlp_mode` or the ICAP REQMOD `icap_mode` is `block`, otherwise flagged
-`DLP_UNSCANNED:undecodable`. Authorization headers are deliberately not scanned — servers legitimately
+Scans URL query strings and the complete decoded request body up to `dlp_max_scan_bytes` (default 1 MiB).
+Bytes beyond the limit are never skipped silently: the upload is flagged `DLP_UNSCANNED:oversize` and, with
+`dlp_oversize_action: block`, rejected with 413 (`dlp_oversize`). The same applies to uploads above
+`icap_max_bytes` when ICAP REQMOD is configured (`ICAP_UNSCANNED:oversize`). Uploads larger than the worker's
+upload buffer (see [memory sizing](configuration.md#data-plane-memory-sizing)) are either rejected
+(`dlp_oversize_action: block`) or streamed unscanned with the same flags; their query string is still scanned
+before anything is sent. Compressed uploads (`Content-Encoding`) are decoded first, bounded like downloads; an
+upload with an undecodable coding is blocked (`undecodable_content`) when `dlp_mode` or the ICAP REQMOD
+`icap_mode` is `block`, otherwise flagged `DLP_UNSCANNED:undecodable`. Authorization headers are deliberately not scanned — servers legitimately
 authenticate to APIs. Start in `monitor` mode, review events,
 then switch to `block`. An enterprise DLP engine can additionally inspect uploads through
 [ICAP REQMOD](#icap-external-antivirus-sandbox-and-dlp-engines).

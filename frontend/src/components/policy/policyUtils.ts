@@ -41,6 +41,7 @@ export function cloneRulesForNewSet(rules: PolicyRule[] | null | undefined): Rul
     path_pattern: r.path_pattern,
     methods: [...(r.methods ?? ['GET', 'HEAD'])],
     follow_redirects: r.follow_redirects,
+    ...(r.redirect_hosts?.length ? { redirect_hosts: [...r.redirect_hosts] } : {}),
     companion_rules: [...(r.companion_rules ?? [])],
     enabled: r.enabled,
     ...(r.expires_at && new Date(r.expires_at).getTime() > now ? { expires_at: r.expires_at } : {}),
@@ -123,11 +124,18 @@ export function validateCompanion(raw: string): string | null {
   return validateHostPattern(host) || validatePathPattern(path);
 }
 
+/** A redirect target pattern (rule.redirect_hosts): a host or *.domain, never the catch-all. */
+export function validateRedirectHost(raw: string): string | null {
+  if (raw.trim() === '*') return 'Leave the list empty to allow any public host.';
+  return validateHostPattern(raw);
+}
+
 export interface RuleErrors {
   name?: string;
   host_pattern?: string;
   path_pattern?: string;
   companion_rules?: string;
+  redirect_hosts?: string;
   action?: string;
   expires_at?: string;
   methods?: string;
@@ -155,6 +163,15 @@ export function validateRule(r: RuleInput, opts: { teamLead: boolean; superAdmin
     }
     if (opts.teamLead && isBroadHostPattern(c.split('/')[0])) {
       e.companion_rules = `${c}: Team Leads cannot use catch-all companion hosts.`;
+      break;
+    }
+  }
+  const targets = r.redirect_hosts ?? [];
+  if (targets.length > 20) e.redirect_hosts = 'At most 20 redirect hosts.';
+  for (const h of targets) {
+    const he = validateRedirectHost(h);
+    if (he) {
+      e.redirect_hosts = `${h}: ${he}`;
       break;
     }
   }

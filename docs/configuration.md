@@ -116,6 +116,7 @@ aegis-control-plane version
 | `AEGIS_SYNC_INTERVAL_SECONDS` | `2` | Policy bundle sync (ETag, 304 when unchanged). |
 | `AEGIS_THREAT_SYNC_INTERVAL_SECONDS` | `30` | Threat-intel sync (gzip, ETag). |
 | `AEGIS_LOG_LEVEL` | `INFO` | Log level of the addon. |
+| `AEGIS_BUFFER_BUDGET` | `min(512m, AEGIS_BODY_SIZE_LIMIT)` | Bytes of message bodies one worker holds for inspection at the same time (`k`/`m`/`g` suffixes, at least `1m`); see [memory sizing](#data-plane-memory-sizing). |
 
 Container-specific (`data-plane/entrypoint.sh`):
 
@@ -124,11 +125,34 @@ Container-specific (`data-plane/entrypoint.sh`):
 | `AEGIS_CA_DIR` | `/certs` | Read-only directory containing `mitmproxy-ca.pem` (private key + certificate). |
 | `AEGIS_CONFDIR` | `/tmp/mitmproxy` | Private, writable mitmproxy configuration directory. |
 | `AEGIS_LISTEN_HOST` / `AEGIS_LISTEN_PORT` | `0.0.0.0` / `8080` | Proxy listener. |
-| `AEGIS_BODY_SIZE_LIMIT` | `1g` | Hard limit for buffered bodies (protection against memory exhaustion). |
+| `AEGIS_BODY_SIZE_LIMIT` | `1g` | mitmproxy `body_size_limit`: the largest request or response body relayed at all (larger messages are refused with 413/502). Not a memory figure — see below. |
 
 Regardless of the command line, the addon enforces `connection_strategy=lazy` (no upstream connection
 before a request is authorized), `ssl_insecure=false` (upstream certificates are always verified) and
 `rawtcp=false` (no raw TCP through CONNECT tunnels while `block_raw_tcp` is active).
+
+### Data-plane memory sizing
+
+A worker keeps a message body in memory only while an inspection needs it; everything else is streamed:
+
+| Body | Handling |
+|---|---|
+| Download, no inspection active | streamed; only bodies with a `Content-Length` of at most 8 MiB are buffered (within the budget) |
+| Download, inspection active | buffered up to `av_max_scan_bytes`; a larger `Content-Length` is decided up front, a body without `Content-Length` when it outgrows the limit (`av_oversize_action`: `allow` streams the rest unscanned, flag `AV_UNSCANNED:oversize`; `block` sends a 403 and discards the rest) |
+| Upload | buffered only for DLP, ICAP REQMOD or the `max_upload_bytes` check of a body without `Content-Length`, up to `max(dlp_max_scan_bytes, icap_max_bytes when REQMOD is set, 8 MiB)` (or `max_upload_bytes` when that is larger); beyond that `dlp_oversize_action` decides (`allow`: streamed, `DLP_UNSCANNED:oversize`; `block`: 413). Uploads of blocked requests are discarded as they arrive |
+
+All buffered bodies of a worker — plus decoded copies kept while scan engines run — share the
+`AEGIS_BUFFER_BUDGET`. When it is exhausted, new bodies are handled like oversized ones, flagged `…:busy`
+(`AV_UNSCANNED:busy`, `DLP_UNSCANNED:busy`, `ICAP_UNSCANNED:busy`); with `av_oversize_action` /
+`dlp_oversize_action` = `block` they are answered with 503 (`inspection_busy`) instead, and a body without
+`Content-Length` that must stay buffered for `max_upload_bytes` is answered with 503 as well. The
+metrics `aegis_dp_buffered_bytes`, `aegis_dp_buffered_bytes_peak`, `aegis_dp_buffer_budget_bytes` and
+`aegis_dp_buffer_limited_total{direction,reason}` show the usage.
+
+Plan the worker's memory limit as roughly **2 × budget + 256 MiB** (mitmproxy copies a body once when it is
+complete; Python, YARA rules and TLS state need the rest). The defaults (budget 512 MiB) fit the Helm chart's
+2 GiB limit; lower `AEGIS_BUFFER_BUDGET` for smaller hosts, and raise it together with the memory limit when
+many concurrent downloads should be scanned instead of flagged `AV_UNSCANNED:busy`.
 
 ## Console (separate hosting, `frontend/Dockerfile`)
 
@@ -157,6 +181,8 @@ control-plane (and `AEGIS_COOKIE_SAMESITE=none` if console and API are on differ
 | `av_max_scan_bytes` | 25 MiB | Larger downloads are not scanned (align with clamd `StreamMaxLength`). |
 | `av_oversize_action` | `allow` | `allow` (stream, flag `AV_UNSCANNED`) or `block`. |
 | `dlp_mode` | `monitor` | `off` \| `monitor` \| `block` — secrets in outbound URLs and bodies. |
+| `dlp_max_scan_bytes` | 1 MiB | The decoded upload is scanned completely up to this size (4 KiB – 64 MiB). |
+| `dlp_oversize_action` | `allow` | Uploads larger than the DLP or ICAP REQMOD scan limit: `allow` (forward, flag `DLP_UNSCANNED:oversize` / `ICAP_UNSCANNED:oversize`) or `block` (413). |
 | `dlp_detectors` | all | `private_key`, `aws_access_key`, `aws_secret_key`, `github_token`, `gitlab_token`, `slack_token`, `slack_webhook`, `google_api_key`, `stripe_key`, `azure_storage_key`, `npm_token`, `pypi_token`, `credit_card` (Luhn), `unix_shadow`. |
 | `blocked_file_types` | – | File types blocked globally (magic bytes): `pe`, `elf`, `macho`, `java_class`, `msi_ole`, `script`, `jar`, `apk`, `zip`, `archive`, `office_macro`, `iso`. |
 | `group_blocked_file_types` | – | Additional per-group blocks, e.g. `{"grp-db-vault": ["pe","elf","script"]}`. |

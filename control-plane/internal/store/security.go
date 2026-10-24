@@ -51,10 +51,10 @@ func (s *Store) UpdateSecurityPolicy(p models.SecurityPolicy, actor *auth.TokenC
 }
 
 func policySummary(p models.SecurityPolicy) string {
-	return fmt.Sprintf("threat_intel=%s av=%v/%s fail=%s max_scan=%d oversize=%s dlp=%s file_types=%v ip_literals=%v private=%v raw_tcp=%v ports=%v punycode=%s max_upload=%d burst=%d"+
+	return fmt.Sprintf("threat_intel=%s av=%v/%s fail=%s max_scan=%d oversize=%s dlp=%s dlp_max=%d dlp_oversize=%s file_types=%v ip_literals=%v private=%v raw_tcp=%v ports=%v punycode=%s max_upload=%d burst=%d"+
 		" icap_respmod=%q icap_reqmod=%q icap=%s/%s timeout=%d icap_max=%d cdr=%v icap_tls_skip_verify=%v icap_ca=%v yara=%s yara_max=%d",
-		p.ThreatIntelMode, p.AVEnabled, p.AVMode, p.AVFailMode, p.AVMaxScanBytes, p.AVOversizeAction, p.DLPMode, p.BlockedFileTypes,
-		p.BlockIPLiterals, p.BlockPrivateDestinations, p.BlockRawTCP, p.AllowedPorts, p.PunycodeMode, p.MaxUploadBytes, p.BlockedBurstThreshold,
+		p.ThreatIntelMode, p.AVEnabled, p.AVMode, p.AVFailMode, p.AVMaxScanBytes, p.AVOversizeAction, p.DLPMode, p.DLPMaxScanBytes,
+		p.DLPOversizeAction, p.BlockedFileTypes, p.BlockIPLiterals, p.BlockPrivateDestinations, p.BlockRawTCP, p.AllowedPorts, p.PunycodeMode, p.MaxUploadBytes, p.BlockedBurstThreshold,
 		p.ICAPRespmodURL, p.ICAPReqmodURL, p.ICAPMode, p.ICAPFailMode, p.ICAPTimeoutSeconds, p.ICAPMaxBytes, p.ICAPAllowModified, p.ICAPTLSSkipVerify,
 		p.ICAPCACertPEM != "", p.YARAMode, p.YARAMaxBytes)
 }

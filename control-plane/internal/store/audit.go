@@ -46,6 +46,9 @@ func formatRuleAuditJSON(r models.PolicyRule) string {
 		"expires_at":       expStr,
 		"enabled":          r.Enabled,
 	}
+	if len(r.RedirectHosts) > 0 {
+		view["redirect_hosts"] = r.RedirectHosts
+	}
 	b, _ := json.MarshalIndent(view, "", "  ")
 	return string(b)
 }

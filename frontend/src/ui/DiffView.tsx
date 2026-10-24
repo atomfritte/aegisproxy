@@ -22,6 +22,7 @@ export const DIFF_FIELD_LABELS: Record<string, string> = {
   path_pattern: 'Path pattern',
   methods: 'Methods',
   follow_redirects: 'Follow redirects',
+  redirect_hosts: 'Redirect targets',
   companion_rules: 'Companion rules',
   expires_at: 'Expires',
 };

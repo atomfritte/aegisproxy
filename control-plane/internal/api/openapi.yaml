@@ -6843,6 +6843,12 @@ components:
         follow_redirects:
           type: boolean
           description: Allow redirect targets (e.g. CDN objects) of matching requests.
+        redirect_hosts:
+          type: [array, 'null']
+          maxItems: 20
+          description: Optional allowlist of host patterns (`objects.example`, `*.cdn.example`) that redirects of this rule may grant access to. Empty or omitted means any public host (internal destinations never receive a grant).
+          items:
+            type: string
         companion_rules:
           type: [array, 'null']
           maxItems: 20
@@ -8501,6 +8507,11 @@ components:
           format: int64
           minimum: 4096
           maximum: 67108864
+          description: The decoded upload is scanned completely up to this size.
+        dlp_oversize_action:
+          type: string
+          description: 'Uploads above the DLP or ICAP REQMOD scan limit: `allow` (forward, flagged `DLP_UNSCANNED:oversize`) or `block` (413). Default `allow`.'
+          enum: [allow, block]
         dlp_detectors:
           type: [array, 'null']
           items:

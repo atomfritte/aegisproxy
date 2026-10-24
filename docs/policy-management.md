@@ -47,6 +47,7 @@ A new set has version 0 until it is published for the first time.
 | Path pattern | `/microsoft/**` (prefix with sub-paths), `/simple/*` (one level), exact paths. |
 | Methods | Default `GET, HEAD` (least privilege). |
 | Follow redirects | Authorizes the exact object a matching response redirects to (e.g. GitHub release assets on a CDN) for two minutes. |
+| Redirect targets | Optional with *Follow redirects* (`redirect_hosts`): host patterns (`objects.githubusercontent.com`, `*.cdn.example`) the redirect may lead to. Empty = any public host; internal destinations never receive a grant. Set it for rules on sites whose redirects the destination operator (or its users) can steer. |
 | Companion rules | Additional `host/path` patterns that belong to the same purpose (`codeload.github.com/acme/**`). |
 | Expiry | Optional; expired rules are ignored by the engine. |
 

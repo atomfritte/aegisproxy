@@ -9,6 +9,9 @@ itself into AEGIS_ACCESS_LOG_KEEP numbered generations.
 Format (AEGIS_ACCESS_LOG_FORMAT): squid (default) · combined · json
 The central log export of the control-plane covers SIEM forwarding; this log serves local tooling
 (Squid log analyzers, rsyslog on the proxy host, container log collectors).
+Lines that cannot be written (queue full, destination unreachable, write errors) and failed rotations are counted
+(aegis_dp_access_log_dropped_total, aegis_dp_access_log_rotation_failures_total) and reported in a warning at most
+once a minute; a failed rotation is retried after a minute while lines keep going to the current file.
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from typing import Any, Dict, Optional
 from .policy import ALLOWED_VERDICTS, VERDICT_TLS_BYPASS
 
 FORMATS = ("squid", "combined", "json")
+WARN_INTERVAL = 60.0
+log = logging.getLogger("aegis.dataplane")
 
 
 def _squid_action(rec: Dict[str, Any]) -> str:
@@ -91,6 +96,30 @@ class _TCPSyslog:
             raise
 
 
+class _RotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotation that fails (Windows: another process holds the file open; full disk) is counted and retried after
+    a minute; meanwhile lines keep going to the current file instead of being lost."""
+
+    def __init__(self, *args: Any, on_failure: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_failure = on_failure
+        self._retry_at = 0.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:  # noqa: N802 - logging API
+        if time.monotonic() < self._retry_at:
+            return False
+        return bool(super().shouldRollover(record))
+
+    def doRollover(self) -> None:  # noqa: N802 - logging API
+        try:
+            super().doRollover()
+        except OSError as exc:
+            self._retry_at = time.monotonic() + WARN_INTERVAL
+            self._on_failure(exc)
+            if self.stream is None:
+                self.stream = self._open()
+
+
 class AccessLog:
     """Asynchronous access log: formatting happens on the caller, I/O on a background thread so a slow
     or unreachable destination never blocks the proxy event loop (lines are dropped when the queue is full)."""
@@ -99,6 +128,9 @@ class AccessLog:
         self.fmt = fmt if fmt in FORMATS else "squid"
         self.logger: Optional[logging.Logger] = None
         self.dropped = 0
+        self.rotation_failures = 0
+        self._count_lock = threading.Lock()
+        self._last_warning = 0.0
         self._emit = None
         dest = (destination or "").strip()
         if not dest or dest.lower() == "off":
@@ -119,10 +151,13 @@ class AccessLog:
                 handler = logging.handlers.SysLogHandler(address=address, facility=logging.handlers.SysLogHandler.LOG_LOCAL5)
                 handler.ident = ident
             elif rotate_bytes > 0:
-                handler = logging.handlers.RotatingFileHandler(dest, maxBytes=rotate_bytes, backupCount=max(keep, 1), encoding="utf-8")
+                handler = _RotatingFileHandler(dest, maxBytes=rotate_bytes, backupCount=max(keep, 1), encoding="utf-8",
+                                               on_failure=self._rotation_failed)
             else:
                 handler = logging.handlers.WatchedFileHandler(dest, encoding="utf-8")
             handler.setFormatter(logging.Formatter("%(message)s"))
+            # logging reports write errors to stderr and carries on: count them as dropped lines instead
+            handler.handleError = self._handler_error  # type: ignore[method-assign]
             lg = logging.getLogger("aegis.access")
             for old in lg.handlers:
                 old.close()
@@ -146,9 +181,30 @@ class AccessLog:
             line = format_record(rec, self.fmt).encode("utf-8", "backslashreplace").decode("utf-8")
             self._q.put_nowait(line)
         except queue.Full:
-            self.dropped += 1
+            self._dropped("queue full")
         except Exception:  # noqa: BLE001 - logging must never break proxying
             pass
+
+    def _dropped(self, why: Any) -> None:
+        with self._count_lock:
+            self.dropped += 1
+        self._warn(why)
+
+    def _handler_error(self, record: logging.LogRecord) -> None:
+        self._dropped(sys.exc_info()[1] or "write error")
+
+    def _rotation_failed(self, exc: BaseException) -> None:
+        with self._count_lock:
+            self.rotation_failures += 1
+        self._warn(f"rotation failed: {exc}")
+
+    def _warn(self, why: Any) -> None:
+        now = time.monotonic()
+        if now - self._last_warning < WARN_INTERVAL:
+            return
+        self._last_warning = now
+        log.warning("access log: %d lines dropped, %d failed rotations so far (latest: %s)", self.dropped,
+                    self.rotation_failures, str(why)[:200])
 
     def flush(self, timeout: float = 5.0) -> None:
         deadline = time.time() + timeout
@@ -172,10 +228,10 @@ class AccessLog:
         while True:
             line = self._q.get()
             if time.time() < backoff_until:
-                self.dropped += 1
+                self._dropped("destination unavailable")
                 continue
             try:
                 self._emit(line)
-            except Exception:  # noqa: BLE001
-                self.dropped += 1
+            except Exception as exc:  # noqa: BLE001
+                self._dropped(exc)
                 backoff_until = time.time() + 5

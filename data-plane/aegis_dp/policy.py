@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import posixpath
+import re
+import string
 import threading
 import time
 import urllib.parse
@@ -43,8 +45,18 @@ DEFAULT_INTERNAL_SUFFIXES = (".internal.corp", ".local", ".localdomain", ".inter
 # Normalization & matching primitives
 # ---------------------------------------------------------------------------
 
+_ASCII_WS = " \t\r\n\f\v"
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+# normalize_host and canonicalize_path must stay identical to engine.NormalizeHost and engine.CanonicalizePath
+# (control-plane): both are tested against testdata/normalization_vectors.json.
 def normalize_host(raw_host: str) -> str:
-    h = (raw_host or "").strip().lower()
+    """Lowercase (ASCII), without surrounding ASCII whitespace, brackets of IPv6 literals, port and trailing
+    dots. A port is only stripped when the value has exactly one colon (an unbracketed IPv6 literal stays whole)."""
+    h = (raw_host or "").strip(_ASCII_WS).translate(_ASCII_LOWER)
     if h.startswith("["):
         end = h.find("]")
         if end != -1:
@@ -55,13 +67,14 @@ def normalize_host(raw_host: str) -> str:
 
 
 def canonicalize_path(raw_path: str) -> Tuple[str, bool]:
-    """Decode up to 3 levels of percent-encoding, reject NUL/backslash smuggling and deeper
-    nesting, and resolve dot-segments (/a/../b -> /b)."""
+    """Decode up to 3 levels of percent-encoding, reject NUL/backslash smuggling, malformed escapes, paths
+    that are not valid UTF-8 and deeper nesting, and resolve dot-segments (/a/../b -> /b)."""
     if not raw_path:
         return "/", True
     cur = raw_path.split("?", 1)[0].split("#", 1)[0]
     for _ in range(3):
-        if "\x00" in cur or "\\" in cur:
+        # mitmproxy decodes undecodable path bytes as lone surrogates (surrogateescape)
+        if "\x00" in cur or "\\" in cur or _BAD_ESCAPE.search(cur) or _SURROGATE.search(cur):
             return "", False
         try:
             unesc = urllib.parse.unquote(cur, errors="strict")
@@ -72,7 +85,7 @@ def canonicalize_path(raw_path: str) -> Tuple[str, bool]:
         if unesc == cur:
             break
         cur = unesc
-    if urllib.parse.unquote(cur) != cur:
+    if _BAD_ESCAPE.search(cur) or _SURROGATE.search(cur) or urllib.parse.unquote(cur) != cur:
         return "", False
     if not cur.startswith("/"):
         cur = "/" + cur
@@ -273,6 +286,7 @@ class EvalResult:
     matched_rule_id: str = ""
     matched_rule_name: str = ""
     follow_redirects: bool = False
+    redirect_hosts: List[str] = field(default_factory=list)  # allowlist for redirect grants of the matched rule
     redirect_parent_url: str = ""
     session_id: str = ""
     tls_bypass: bool = False
@@ -488,6 +502,7 @@ class Policy:
                 res.allowed, res.verdict = True, VERDICT_ALLOWED
                 res.matched_rule_id, res.matched_rule_name = rule.get("id", ""), rule.get("name", "")
                 res.follow_redirects = bool(rule.get("follow_redirects"))
+                res.redirect_hosts = [str(h) for h in (rule.get("redirect_hosts") or [])]
                 return res
 
         if ip_needs_explicit:
@@ -515,7 +530,9 @@ class RedirectGrants:
         return ip[7:] if ip.startswith("::ffff:") else ip
 
     def register(self, peer_ip: str, location: str, parent_url: str, rule_id: str, rule_name: str,
-                 internal_suffixes=DEFAULT_INTERNAL_SUFFIXES) -> bool:
+                 internal_suffixes=DEFAULT_INTERNAL_SUFFIXES, allowed_hosts=()) -> bool:
+        """Grants the redirect target for TTL seconds. Internal targets never get a grant; a non-empty
+        ``allowed_hosts`` (the rule's redirect_hosts patterns) limits the targets further."""
         try:
             target = urllib.parse.urlsplit(urllib.parse.urljoin(parent_url, location))
         except ValueError:
@@ -524,6 +541,8 @@ class RedirectGrants:
             return False
         host = normalize_host(target.hostname)
         if is_internal_host(host, internal_suffixes):
+            return False
+        if allowed_hosts and not any(match_host(p, host) for p in allowed_hosts):
             return False
         path, ok = canonicalize_path(target.path or "/")
         if not ok:

@@ -7,11 +7,13 @@ import (
 	"net/netip"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"aegisproxy/control-plane/internal/models"
 )
@@ -128,18 +130,31 @@ func sortIndexedRulesBlockFirst(list []IndexedRule) {
 	})
 }
 
-// NormalizeHost strips port numbers and trailing FQDN dots ("github.com." -> "github.com") in lowercase.
+// NormalizeHost lowercases (ASCII) and strips surrounding ASCII whitespace, IPv6 brackets, the port and trailing
+// FQDN dots ("GitHub.com.:443" -> "github.com"). A port is only stripped when the value has exactly one colon,
+// so an unbracketed IPv6 literal stays whole. NormalizeHost and CanonicalizePath must stay identical to
+// normalize_host and canonicalize_path of the data-plane (testdata/normalization_vectors.json).
 func NormalizeHost(host string) string {
-	h := strings.ToLower(strings.TrimSpace(host))
+	h := asciiLower(strings.Trim(host, " \t\r\n\f\v"))
 	if strings.HasPrefix(h, "[") {
 		if end := strings.IndexByte(h, ']'); end != -1 {
 			return h[1:end]
 		}
 	}
-	if idx := strings.IndexByte(h, ':'); idx != -1 {
-		h = h[:idx]
+	if strings.Count(h, ":") == 1 {
+		h = h[:strings.IndexByte(h, ':')]
 	}
 	return strings.TrimRight(h, ".")
+}
+
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // HashProxyToken returns the hex SHA-256 digest used to store and look up server proxy tokens.
@@ -348,7 +363,8 @@ func IsDisallowedRedirectTarget(host string) bool {
 }
 
 // CanonicalizePath decodes percent-encoded traversal sequences (%2e%2e, %2f), rejects null-bytes, backslash smuggling,
-// or >3x nested percent-encoding, and resolves dot-segments (/microsoft/../torvalds -> /torvalds).
+// malformed escapes, paths that are not valid UTF-8 or >3x nested percent-encoding, and resolves dot-segments and
+// repeated slashes (/microsoft/../torvalds -> /torvalds, //a -> /a).
 func CanonicalizePath(rawPath string) (string, bool) {
 	if rawPath == "" {
 		return "/", true
@@ -361,14 +377,14 @@ func CanonicalizePath(rawPath string) (string, bool) {
 	}
 	cur := rawPath
 	for i := 0; i < 3; i++ {
-		if strings.Contains(cur, "\x00") || strings.Contains(cur, "\\") {
+		if strings.Contains(cur, "\x00") || strings.Contains(cur, "\\") || !utf8.ValidString(cur) {
 			return "", false
 		}
 		unesc, err := url.PathUnescape(cur)
 		if err != nil {
 			return "", false
 		}
-		if strings.Contains(unesc, "\x00") || strings.Contains(unesc, "\\") {
+		if strings.Contains(unesc, "\x00") || strings.Contains(unesc, "\\") || !utf8.ValidString(unesc) {
 			return "", false
 		}
 		if unesc == cur {
@@ -391,7 +407,8 @@ func CanonicalizePath(rawPath string) (string, bool) {
 }
 
 // RegisterRedirectGrant records a temporary object access grant when an allowed URL redirects (301/302/307/308) to a CDN/Object host.
-func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, ruleID, ruleName string) {
+// A non-empty allowedHosts (the rule's redirect_hosts patterns) limits the hosts that can receive a grant.
+func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, ruleID, ruleName string, allowedHosts []string) {
 	parsed, err := url.Parse(locationURL)
 	if err != nil || parsed.Host == "" {
 		return
@@ -401,6 +418,9 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, r
 	}
 	host := NormalizeHost(parsed.Host)
 	if IsDisallowedRedirectTarget(host) {
+		return
+	}
+	if len(allowedHosts) > 0 && !slices.ContainsFunc(allowedHosts, func(p string) bool { return MatchHost(p, host) }) {
 		return
 	}
 	cleanPath, ok := CanonicalizePath(parsed.Path)

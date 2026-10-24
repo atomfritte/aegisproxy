@@ -4,7 +4,7 @@ import type { RuleInput } from '../../types';
 import { cn } from '../../lib/cn';
 import { usePermissions } from '../../data/AppData';
 import { Button, Callout, Drawer, Field, HelpTip, Input, PatternText, SegmentedControl, Switch, TagInput, Textarea } from '../../ui';
-import { describeRule, HTTP_METHODS, PATTERN_EXAMPLES, validateCompanion, validateRule } from './policyUtils';
+import { describeRule, HTTP_METHODS, PATTERN_EXAMPLES, validateCompanion, validateRedirectHost, validateRule } from './policyUtils';
 
 function toLocalInput(iso?: string): string {
   if (!iso) return '';
@@ -48,6 +48,7 @@ export const RuleFormDrawer: React.FC<RuleFormDrawerProps> = ({ open, rule, setK
     if (!valid || blockLocked) return;
     const orig = rule;
     const comps = (r.companion_rules ?? []).map((c) => c.trim()).filter(Boolean);
+    const targets = (r.redirect_hosts ?? []).map((h) => h.trim().toLowerCase()).filter(Boolean);
     onSave({
       ...r,
       name: r.name.trim(),
@@ -56,6 +57,7 @@ export const RuleFormDrawer: React.FC<RuleFormDrawerProps> = ({ open, rule, setK
       path_pattern: r.path_pattern.trim() || '/**',
       // keep null vs [] of untouched arrays so the server does not report a modification
       companion_rules: comps.length === 0 && orig && orig.companion_rules === null ? (null as unknown as string[]) : comps,
+      redirect_hosts: targets.length ? targets : undefined,
     });
   };
 
@@ -241,6 +243,25 @@ export const RuleFormDrawer: React.FC<RuleFormDrawerProps> = ({ open, rule, setK
           />
           <Switch checked={r.enabled} onChange={(v) => setR({ ...r, enabled: v })} disabled={blockLocked} label="Enabled" description="Disabled rules stay in the set but are not enforced." />
         </div>
+
+        {r.follow_redirects && (
+          <Field
+            label="Redirect targets"
+            optional
+            error={touched ? errors.redirect_hosts : undefined}
+            hint="Hosts redirects may lead to, e.g. objects.githubusercontent.com or *.cdn.example. Empty: any public host."
+          >
+            <TagInput
+              mono
+              value={r.redirect_hosts ?? []}
+              onChange={(v) => setR({ ...r, redirect_hosts: v })}
+              validate={validateRedirectHost}
+              placeholder="host, press Enter"
+              max={20}
+              disabled={blockLocked}
+            />
+          </Field>
+        )}
 
         <Field label="Expires" optional error={touched ? errors.expires_at : undefined} hint="Temporary rules are ignored by the engine after this time.">
           <Input

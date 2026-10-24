@@ -120,7 +120,8 @@ the set's assignment applies. Editing happens in a **draft**; publishing creates
 | POST | `/api/policy-sets/{id}/recertify` | scoped | `{comment}` confirm the set is still needed (resets the review due date) |
 
 `spec` = `{name, description, owner_team, tags[], priority, enabled, group_ids[], server_ids[], review_interval_days, rules[]}`;
-a rule = `{id?, name, description, action: ALLOW|BLOCK, host_pattern, path_pattern, methods[], follow_redirects, companion_rules[], enabled, expires_at?}`.
+a rule = `{id?, name, description, action: ALLOW|BLOCK, host_pattern, path_pattern, methods[], follow_redirects, redirect_hosts[]?, companion_rules[], enabled, expires_at?}`
+(`redirect_hosts`: optional host patterns redirect grants of the rule may target; omitted/empty = any public host).
 Rule ids are kept across edits (send them back unchanged); new rules get an id on save. `review_interval_days: 0` disables recertification
 for the set (the console pre-fills the governance default).
 
