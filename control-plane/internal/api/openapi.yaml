@@ -339,7 +339,8 @@ paths:
         With `simulate_redirect: true` and an allowed `github.com` URL whose rule follows redirects, a
         302 to a CDN object is simulated and evaluated as `child_flow`.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role. Team Leads simulate servers of their own groups only; any
+        other address or proxy user (unknown or foreign) answers 404.
       requestBody:
         required: true
         content:
@@ -359,6 +360,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -2797,9 +2800,13 @@ paths:
         `approve` publishes the change; `reject` unlocks the draft; `comment` only records a review entry.
         Four-eyes principle: the author and whoever last edited the draft cannot approve, the author cannot
         reject, and service accounts cannot approve. When the set was published meanwhile, approval marks
-        the request `superseded` and returns `409` with the updated `change_request`.
+        the request `superseded` and returns `409` with the updated `change_request`. Change requests
+        carrying an access-request approval (`access_request_id`) are rebased instead and grant the
+        request when approved.
 
-        **Roles:** `approve`/`reject` scoped; `comment` any authenticated role.
+        **Roles:** scoped — every decision, `comment` included, needs the rights to manage the set
+        (InfoSec and Super Admins always; Auditors are read-only). Change requests outside a Team
+        Lead's view answer 404.
       requestBody:
         required: true
         content:
@@ -3194,7 +3201,15 @@ paths:
         (`1h 8h 24h 7d 30d 90d permanent`; empty = as requested). Team Leads are limited to
         `max_temporary_access_days` and cannot grant permanent access.
 
-        **Roles:** scoped (the reviewer must be allowed to approve for every target group).
+        With `require_policy_review`, an approval by a reviewer below InfoSec that goes beyond an
+        attested request (unverified request, changed host/path pattern, added methods, longer
+        duration, redirects enabled, other target groups) creates one change request per target
+        group instead of publishing: the request stays `pending` with `change_request_ids` and is
+        granted when another reviewer approves the change request. Rejecting the request withdraws
+        open change requests.
+
+        **Roles:** scoped (the reviewer must be allowed to act for the request's own groups and for
+        every target group). Requests outside a Team Lead's groups answer 404.
       requestBody:
         required: true
         content:
@@ -3203,7 +3218,7 @@ paths:
               $ref: '#/components/schemas/ReviewOptions'
       responses:
         '200':
-          description: Reviewed request and created rules (`rule` is the first rule or null).
+          description: Reviewed request and created rules (`rule` is the first rule or null; no rules when the approval went to four-eyes review).
           content:
             application/json:
               schema:
@@ -3214,6 +3229,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -3345,7 +3362,9 @@ paths:
       summary: Change the expiry of granted access
       description: |
         Sets a new expiry (from now) for the rules of an approved, rule-based request. Team Leads are
-        limited to `max_temporary_access_days` and cannot grant permanent access.
+        limited to `max_temporary_access_days` and cannot grant permanent access; with
+        `require_policy_review` the new expiry must also lie within `max_temporary_access_days` of
+        the original approval (longer access needs InfoSec).
 
         **Roles:** scoped (Operator/Auditor denied).
       requestBody:
@@ -7153,9 +7172,19 @@ components:
           description: Verdict after the change.
         rule_name:
           type: string
+        server_id:
+          type: string
+        group_ids:
+          type: array
+          items:
+            type: string
+          description: Server groups of the sample (Team Leads see samples of their groups only).
     ImpactSummary:
       type: object
-      description: Effect of a candidate policy on the recorded traffic window.
+      description: |
+        Effect of a candidate policy on the recorded traffic window. For Team Leads, counters and
+        samples cover the servers and traffic of their own groups only (also for change requests
+        submitted by others).
       required: [flows_evaluated, newly_allowed, newly_blocked, unchanged, affected_servers, target_servers, samples, computed_at]
       properties:
         flows_evaluated:
@@ -7222,6 +7251,12 @@ components:
           format: date-time
         published_version:
           type: integer
+        access_request_id:
+          type: string
+          description: |
+            Set when the change carries the approval of an access request that needs four-eyes
+            review. Approving it grants the request; rejecting or withdrawing it returns the request
+            to the queue.
     ChangeRequestSuperseded:
       type: object
       required: [error, change_request]
@@ -7649,6 +7684,13 @@ components:
         revoked_at:
           type: string
           format: date-time
+        change_request_ids:
+          type: array
+          items:
+            type: string
+          description: |
+            Change requests carrying an approval that awaits four-eyes review; the request stays
+            `pending` until they are decided.
     AccessRequestList:
       type: object
       required: [requests, total]

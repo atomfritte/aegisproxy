@@ -42,7 +42,7 @@ A new set has version 0 until it is published for the first time.
 
 | Field | Notes |
 |---|---|
-| Action | `ALLOW` or `BLOCK`. BLOCK rules are guardrails and always take precedence. Team Leads cannot create, change or remove BLOCK rules — they can still edit ALLOW rules in a set that contains InfoSec guardrails. |
+| Action | `ALLOW` or `BLOCK`. BLOCK rules are guardrails and always take precedence. Team Leads cannot create, change (action, patterns, methods, enabled, expiry, scope of the set) or remove BLOCK rules — neither published ones nor guardrails InfoSec added to a draft — and cannot submit or approve change requests that do. They can still edit ALLOW rules in a set that contains InfoSec guardrails. |
 | Host pattern | `github.com`, `*.ubuntu.com`, an IP address. Catch-all `*` ALLOW rules require a Super Admin; Team Leads cannot use top-level wildcards (`*.com`). |
 | Path pattern | `/microsoft/**` (prefix with sub-paths), `/simple/*` (one level), exact paths. |
 | Methods | Default `GET, HEAD` (least privilege). |
@@ -74,8 +74,14 @@ Reviewers see:
 - **Diff** — added, removed and modified rules (field by field) and changed set settings.
 - **Impact** — the recorded traffic window replayed against the current and the proposed policy:
   how many requests would be newly allowed or newly blocked, on how many servers, with samples. Only
-  requests decided by rules are replayed (threat-protection verdicts do not change with rules).
-- **Discussion** — comments from any role, including auditors.
+  requests decided by rules are replayed (threat-protection verdicts do not change with rules). Team
+  Leads see the counters and samples of their own groups' servers only, also for change requests
+  of baseline or multi-group sets submitted by others.
+- **Discussion** — comments from reviewers who may manage the set (InfoSec and Super Admins always,
+  Team Leads for sets of their groups). Auditors read change requests but cannot comment.
+
+Change requests of sets outside a Team Lead's groups do not exist for them (404, also for comments
+and withdrawals).
 
 Further governance settings:
 
@@ -88,7 +94,12 @@ Further governance settings:
 | `prune_expired_after_days` | 7 | expired temporary access is removed from approvals sets after this grace period (audited as `APPROVALS_PRUNED`; 0 = keep) |
 
 A change request whose set changed in the meantime (for example because an access request added a rule to
-an approvals set) becomes **superseded** on approval; the author resubmits.
+an approvals set) becomes **superseded** on approval; the author resubmits. Change requests that carry an
+access-request approval (see [Access requests](#access-requests)) are rebased onto the current content instead.
+
+Rule attribution (`created_by`, `created_at`, `approved_by`, `access_request_id`, `source_session_id`) is always
+set by the control-plane: values sent by clients are ignored for new rules, rules that exist only in the draft
+keep their draft values and published rules keep their published values.
 
 ### History, comparison and rollback
 
@@ -110,7 +121,8 @@ jq '{dry_run: true, bundle: .}' policy-sets.json | curl -s -H "$J" -H "Authoriza
 ```
 
 Sets are matched by ID, then by name; the plan shows a rule-level diff per set (`create`, `update`,
-`unchanged`). Imports are all-or-nothing and subject to the same validation and RBAC as edits in the console;
+`unchanged`). Sets a Team Lead cannot see are never matched (a document naming one is planned as a new set;
+a name that is already taken is reported as an error without details). Imports are all-or-nothing and subject to the same validation and RBAC as edits in the console;
 with four-eyes review enabled a second person still approves every imported change.
 
 ### Recertification
@@ -137,6 +149,29 @@ token). The inbox (Console → **Access requests**) supports:
 
 Approval adds one rule per target group to the group's **approvals set** and publishes it immediately — the
 approval itself is the review. Learning-session requests start a 15-minute session for the server instead.
+
+Team Leads see and act on the requests of their own groups only; requests of other groups and of
+unregistered sources answer 404 (review, comment, assign, revoke, extend, bulk review). A reviewer must be
+allowed to act for the request's own groups *and* for every target group they choose; the audit entry is
+visible to the teams of both.
+
+**Four-eyes review of approvals.** With `require_policy_review` on, the "approval is the review" shortcut
+applies only when a Team Lead grants exactly what an attested request asked for. An approval by a reviewer
+below InfoSec goes to a **change request** instead of being published when
+
+- the request is not attested by a data-plane block token (self-reported), or
+- the reviewer changed the host or path pattern, added methods beyond `GET`/`HEAD`/the requested method,
+  granted a longer duration than requested, enabled redirect following or chose other target groups.
+
+One change request per target group is opened on the group's approvals set (marked with the access request
+ID; the set's draft is not touched). The request stays **pending** and lists the change requests; it is
+granted when another reviewer approves them (the granted duration counts from that approval), and returns to
+the queue when they are rejected or withdrawn. Rejecting the request withdraws open change requests. InfoSec
+and Super Admin approvals are published directly as before.
+
+Extensions by Team Leads under review mode share one budget: the new expiry must lie within
+`max_temporary_access_days` of the original approval, so repeated extensions cannot keep access open
+indefinitely. Longer access needs InfoSec.
 
 ## Fleet management
 
@@ -212,7 +247,8 @@ the inline form script and connections to the control-plane; links must be `http
 | Baseline sets | ✓ | ✓ | – | read |
 | Standard sets of own groups (ALLOW rules) | ✓ | ✓ | ✓ | read |
 | BLOCK rules | ✓ | ✓ | – | read |
-| Approve change requests | ✓ (not own) | ✓ (not own) | ✓ for own groups (not own) | comment |
+| Approve change requests | ✓ (not own) | ✓ (not own) | ✓ for own groups (not own) | read |
+| Comment on change requests | ✓ | ✓ | sets of own groups | – |
 | Emergency publish | ✓ | – | – | – |
 | Governance settings, block pages, groups, servers | ✓ | ✓ | – | read |
 | Quarantine / release | ✓ / ✓ | ✓ / ✓ | own groups / – | – |

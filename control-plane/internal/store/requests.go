@@ -243,14 +243,22 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 	}
 	var outReq *models.AccessRequest
 	var outRules []models.PolicyRule
+	var newCRs []models.ChangeRequest
 	err := s.withWrite(func() error {
 		idx := s.requestIndexLocked(id)
 		if idx == -1 {
 			return errors.New("request not found")
 		}
 		req := &s.state.Requests[idx]
+		if !s.requestVisibleLocked(reviewer, req) {
+			return errors.New("request not found")
+		}
 		if req.Status != "pending" {
 			return fmt.Errorf("request %s was already %s by %s", req.ID, req.Status, req.ReviewedBy)
+		}
+		// The reviewer must be responsible for the request itself, not only for the groups chosen.
+		if err := canHandleRequest(reviewer, s.requestGroupsLocked(req)); err != nil {
+			return err
 		}
 
 		groupsToCheck := o.TargetGroupIDs
@@ -263,9 +271,22 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 		if err := s.validateScopeLocked(groupsToCheck, nil); err != nil {
 			return err
 		}
+		// Audit entries are visible to the teams of the request and of the chosen target groups.
+		auditGroups := unionGroups(req.TargetGroupIDs, req.GroupIDs, groupsToCheck)
+		openChanges := s.openRequestChangesLocked(req)
+		if o.Approve && len(openChanges) > 0 {
+			return fmt.Errorf("an approval of this request is awaiting four-eyes review in change request(s) %v; decide those instead", openChanges)
+		}
 
 		now := time.Now().UTC()
 		if !o.Approve {
+			// Rejecting the request also withdraws approvals still waiting for four-eyes review.
+			for _, crID := range openChanges {
+				if j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == crID }); j >= 0 {
+					cr := &s.state.ChangeRequests[j]
+					cr.Status, cr.DecidedBy, cr.DecidedAt = "withdrawn", reviewer.Username, &now
+				}
+			}
 			req.ReviewedBy, req.ReviewerRole, req.ReviewComment, req.ReviewedAt = reviewer.Username, string(reviewer.Role), o.Comment, &now
 			req.Status = "rejected"
 			s.appendAuditLocked(models.AuditEvent{
@@ -277,7 +298,7 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 				EntityID:    req.ID,
 				EntityName:  req.SuggestedHostPattern + req.SuggestedPathPattern,
 				Summary:     fmt.Sprintf("Rejected access request %s from %s (%s)", req.ID, req.Requester, o.Comment),
-				ScopeGroups: groupsToCheck,
+				ScopeGroups: auditGroups,
 			})
 			s.markDirtyLocked()
 			reqCopy := *req
@@ -334,7 +355,7 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 				EntityID:    sess.ID,
 				EntityName:  sess.Name,
 				Summary:     fmt.Sprintf("Approved 15m Learning Session %s for %s (%s)", sess.ID, req.ServerHostname, req.ServerIP),
-				ScopeGroups: groupsToCheck,
+				ScopeGroups: unionGroups(auditGroups, groupsToCheck),
 			})
 			s.saveLocked()
 			reqCopy := *req
@@ -382,8 +403,10 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 		if len(o.Methods) > 0 {
 			methods = o.Methods
 		}
+		reviewReasons := s.approvalReviewReasonsLocked(req, reviewer, hostPat, pathPat, duration, methods, o.FollowRedirects, groupsToCheck)
 
 		var created []models.PolicyRule
+		var proposed []models.ChangeRequest
 		for _, gid := range groupsToCheck {
 			if gid == "*" {
 				return errors.New("approvals must target concrete server groups")
@@ -413,6 +436,20 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 				return err
 			}
 			rule = spec.Rules[len(spec.Rules)-1]
+			if len(reviewReasons) > 0 {
+				// Four-eyes: the approval becomes a change request of the approvals set; the set and
+				// its draft stay untouched until another reviewer approves it.
+				diff := DiffSpecs(set.PolicySetSpec, spec)
+				proposed = append(proposed, models.ChangeRequest{
+					ID: newRandomID("cr"), PolicySetID: set.ID, PolicySetName: set.Name,
+					Title: clip(fmt.Sprintf("Access request %s: %s%s (%s)", req.ID, hostPat, pathPat, duration), 200),
+					Description: clip(fmt.Sprintf("Approval of access request %s by %s needs four-eyes review: %s.\nRequester %s on %s (%s): %s\nReviewer comment: %s",
+						req.ID, reviewer.Username, strings.Join(reviewReasons, "; "), req.Requester, req.ServerHostname, req.ServerIP, req.Reason, o.Comment), 4000),
+					Status: "open", BaseVersion: set.Version, Spec: spec, Diff: &diff, SubmittedBy: reviewer.Username, SubmittedAt: now,
+					Reviews: []models.ChangeReview{}, AccessRequestID: req.ID,
+				})
+				continue
+			}
 			draft := set.Draft
 			s.publishLocked(i, spec, reviewer, publishOpts{comment: "access request " + req.ID, quiet: true})
 			if draft != nil && draft.Status == "editing" {
@@ -424,6 +461,30 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 				s.state.PolicySets[i].Draft = draft // in review: the change request becomes superseded on approval
 			}
 			created = append(created, rule)
+		}
+		if len(proposed) > 0 {
+			ids := make([]string, 0, len(proposed))
+			for _, cr := range proposed {
+				ids = append(ids, cr.ID)
+				groups, _ := setScope(&s.state.PolicySets[s.setIndexLocked(cr.PolicySetID)])
+				s.appendAuditLocked(models.AuditEvent{
+					Actor: reviewer.Username, ActorRole: string(reviewer.Role), Action: "CHANGE_REQUEST_SUBMITTED", Category: "POLICY",
+					EntityType: "change_request", EntityID: cr.ID, EntityName: cr.Title, ScopeGroups: unionGroups(auditGroups, groups),
+					Summary: fmt.Sprintf("Approval of access request %s submitted for four-eyes review (%s): %s", req.ID, strings.Join(reviewReasons, "; "), diffSummary(*cr.Diff)),
+				})
+			}
+			s.state.ChangeRequests = append(slices.Clone(proposed), s.state.ChangeRequests...)
+			if len(s.state.ChangeRequests) > 2000 {
+				s.state.ChangeRequests = s.state.ChangeRequests[:2000]
+			}
+			req.ChangeRequestIDs = ids
+			req.Comments = append(slices.Clip(req.Comments), models.RequestComment{Author: reviewer.Username, At: now,
+				Text: fmt.Sprintf("Approval submitted for four-eyes review (%s) as change request(s) %s; access is granted when another reviewer approves.",
+					strings.Join(reviewReasons, "; "), strings.Join(ids, ", "))})
+			s.markDirtyLocked()
+			reqCopy := *req
+			outReq, newCRs = &reqCopy, proposed
+			return nil
 		}
 
 		req.ReviewedBy, req.ReviewerRole, req.ReviewComment, req.ReviewedAt = reviewer.Username, string(reviewer.Role), o.Comment, &now
@@ -446,7 +507,7 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 			EntityID:    req.ID,
 			EntityName:  fmt.Sprintf("%s%s", hostPat, pathPat),
 			Summary:     fmt.Sprintf("Approved request %s: %s%s for groups %v (%s), added to approved-requests policy sets", req.ID, hostPat, pathPat, groupsToCheck, duration),
-			ScopeGroups: groupsToCheck,
+			ScopeGroups: auditGroups,
 			AfterState:  formatRuleAuditJSON(ruleSnap),
 		})
 		s.saveLocked()
@@ -454,10 +515,223 @@ func (s *Store) ReviewAccessRequest(id string, o ReviewOptions, reviewer *auth.T
 		outReq, outRules = &reqCopy, created
 		return nil
 	})
-	if err == nil && outReq != nil && s.notifier != nil {
+	for _, cr := range newCRs {
+		s.announceChangeRequest(cr)
+	}
+	if err == nil && outReq != nil && outReq.Status != "pending" && s.notifier != nil {
 		s.notifier.NotifyRequestDecision(*outReq)
 	}
 	return outReq, outRules, err
+}
+
+// approvalReviewReasonsLocked lists why an approval needs four-eyes review: with policy review
+// required, a reviewer below InfoSec may grant only what an attested request asked for. Anything the
+// reviewer chose themselves (patterns, methods, longer duration, redirects, other groups) or a
+// self-reported request goes through a change request.
+func (s *Store) approvalReviewReasonsLocked(req *models.AccessRequest, reviewer *auth.TokenClaims, hostPat, pathPat, duration string,
+	methods []string, followRedirects bool, groups []string) []string {
+	if !s.state.Governance.RequirePolicyReview || auth.CanManageSystem(reviewer) {
+		return nil
+	}
+	var why []string
+	if !req.Verified {
+		why = append(why, "the request is not attested by a data-plane block token")
+	}
+	if !strings.EqualFold(hostPat, req.SuggestedHostPattern) || pathPat != req.SuggestedPathPattern {
+		why = append(why, "the reviewer changed the host or path pattern")
+	}
+	if slices.ContainsFunc(methods, func(m string) bool { return m != "GET" && m != "HEAD" && m != req.Method }) {
+		why = append(why, "the reviewer added methods")
+	}
+	if req.Duration != "permanent" {
+		want, _ := durationOf(req.Duration)
+		if got, ok := durationOf(duration); !ok || got > want {
+			why = append(why, "the reviewer granted a longer duration than requested")
+		}
+	}
+	if followRedirects && !req.FollowRedirects {
+		why = append(why, "the reviewer enabled redirect following")
+	}
+	if own := s.requestGroupsLocked(req); slices.ContainsFunc(groups, func(g string) bool { return !slices.Contains(own, g) }) {
+		why = append(why, "the reviewer chose other target groups")
+	}
+	return why
+}
+
+// requestGroupsLocked returns the groups responsible for a request: its target groups, else the
+// current groups of the registered server it came from.
+func (s *Store) requestGroupsLocked(req *models.AccessRequest) []string {
+	if len(req.TargetGroupIDs) > 0 {
+		return req.TargetGroupIDs
+	}
+	if srv, ok := s.serverForRequestLocked(req); ok {
+		if srv.EffectiveGroupIDs != nil {
+			return srv.EffectiveGroupIDs
+		}
+		return srv.GroupIDs
+	}
+	return nil
+}
+
+// requestVisibleLocked mirrors the API's need-to-know view: Team Leads see the requests of their
+// groups only, everything else does not exist for them.
+func (s *Store) requestVisibleLocked(actor *auth.TokenClaims, req *models.AccessRequest) bool {
+	if !scopedTeamLead(actor) {
+		return actor != nil
+	}
+	mine := func(g string) bool { return slices.Contains(actor.AllowedGroups, g) }
+	return slices.ContainsFunc(req.TargetGroupIDs, mine) || slices.ContainsFunc(req.GroupIDs, mine)
+}
+
+// openRequestChangesLocked returns the IDs of the request's change requests still awaiting review.
+func (s *Store) openRequestChangesLocked(req *models.AccessRequest) []string {
+	var open []string
+	for _, id := range req.ChangeRequestIDs {
+		if cr, ok := s.changeRequestLocked(id); ok && cr.Status == "open" {
+			open = append(open, id)
+		}
+	}
+	return open
+}
+
+func (s *Store) changeRequestLocked(id string) (*models.ChangeRequest, bool) {
+	if j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == id }); j >= 0 {
+		return &s.state.ChangeRequests[j], true
+	}
+	return nil, false
+}
+
+// publishRequestChangeLocked publishes the rules of an approved access-request change request on
+// top of the set's current content (approvals sets change with every approval, so these change
+// requests are rebased instead of superseded). The granted duration counts from now.
+func (s *Store) publishRequestChangeLocked(i int, cr *models.ChangeRequest, actor *auth.TokenClaims, comment string) (models.PolicySetVersion, error) {
+	set := &s.state.PolicySets[i]
+	spec := cloneSpec(set.PolicySetSpec)
+	now := time.Now().UTC()
+	added := 0
+	for _, r := range cr.Spec.Rules {
+		if r.AccessRequestID != cr.AccessRequestID || slices.ContainsFunc(spec.Rules, func(x models.PolicyRule) bool { return x.ID == r.ID }) {
+			continue
+		}
+		r = cloneRule(r)
+		if r.ExpiresAt != nil {
+			exp := now.Add(r.ExpiresAt.Sub(cr.SubmittedAt))
+			r.ExpiresAt = &exp
+		}
+		spec.Rules = append(spec.Rules, r)
+		added++
+	}
+	if added == 0 {
+		return models.PolicySetVersion{}, errors.New("the change request carries no access rules")
+	}
+	if err := s.validateSpecLocked(set.ID, set.Kind, &spec, actor); err != nil {
+		return models.PolicySetVersion{}, err
+	}
+	draft := set.Draft
+	v := s.publishLocked(i, spec, actor, publishOpts{changeRequestID: cr.ID, comment: comment})
+	if draft != nil && draft.Status == "editing" {
+		// Keep a concurrent manual draft and carry the approval into it.
+		for _, r := range spec.Rules {
+			if r.AccessRequestID == cr.AccessRequestID && !slices.ContainsFunc(draft.Spec.Rules, func(x models.PolicyRule) bool { return x.ID == r.ID }) {
+				draft.Spec.Rules = append(draft.Spec.Rules, r)
+			}
+		}
+		draft.BaseVersion = s.state.PolicySets[i].Version
+	}
+	s.state.PolicySets[i].Draft = draft
+	return v, nil
+}
+
+// settleRequestChangesLocked resolves an access request once none of its four-eyes change requests
+// is open: granted when at least one was approved (returned for notification), pending again
+// otherwise.
+func (s *Store) settleRequestChangesLocked(reqID string) *models.AccessRequest {
+	idx := s.requestIndexLocked(reqID)
+	if idx < 0 {
+		return nil
+	}
+	req := &s.state.Requests[idx]
+	if req.Status != "pending" || len(req.ChangeRequestIDs) == 0 {
+		return nil
+	}
+	var approved []*models.ChangeRequest
+	for _, id := range req.ChangeRequestIDs {
+		cr, ok := s.changeRequestLocked(id)
+		if !ok {
+			continue
+		}
+		switch cr.Status {
+		case "open":
+			return nil
+		case "approved":
+			approved = append(approved, cr)
+		}
+	}
+	now := time.Now().UTC()
+	if len(approved) == 0 {
+		req.Comments = append(slices.Clip(req.Comments), models.RequestComment{Author: "system", At: now,
+			Text: fmt.Sprintf("Change request(s) %s were not approved; the request is pending again.", strings.Join(req.ChangeRequestIDs, ", "))})
+		req.ChangeRequestIDs = nil
+		return nil
+	}
+	var groups, ruleIDs []string
+	var expires *time.Time
+	for _, cr := range approved {
+		i := s.setIndexLocked(cr.PolicySetID)
+		if i < 0 {
+			continue
+		}
+		g, _ := setScope(&s.state.PolicySets[i])
+		groups = unionGroups(groups, g)
+		for _, r := range s.state.PolicySets[i].Rules {
+			if r.AccessRequestID == req.ID {
+				ruleIDs = append(ruleIDs, r.ID)
+				if expires == nil {
+					expires = r.ExpiresAt
+				}
+			}
+		}
+	}
+	last := approved[len(approved)-1]
+	role, comment := "", ""
+	for _, rv := range last.Reviews {
+		if rv.Decision == "approve" {
+			role, comment = rv.Role, rv.Comment
+		}
+	}
+	auditGroups := unionGroups(req.TargetGroupIDs, req.GroupIDs, groups)
+	req.Status = "approved"
+	req.ReviewedBy, req.ReviewerRole, req.ReviewComment, req.ReviewedAt = last.DecidedBy, role, comment, &now
+	req.TargetGroupIDs = groups
+	req.ExpiresAt = expires
+	req.CreatedRuleIDs = ruleIDs
+	if len(ruleIDs) > 0 {
+		req.CreatedRuleID = ruleIDs[0]
+	}
+	req.Comments = append(slices.Clip(req.Comments), models.RequestComment{Author: last.DecidedBy, At: now,
+		Text: fmt.Sprintf("Access granted after four-eyes review (change request %s, submitted by %s).", last.ID, last.SubmittedBy)})
+	s.appendAuditLocked(models.AuditEvent{
+		Actor: last.DecidedBy, ActorRole: role, Action: "REQUEST_APPROVED", Category: "APPROVAL",
+		EntityType: "access_request", EntityID: req.ID, EntityName: req.SuggestedHostPattern + req.SuggestedPathPattern,
+		Summary: fmt.Sprintf("Approved request %s for groups %v after four-eyes review of change request(s) %s submitted by %s",
+			req.ID, groups, strings.Join(req.ChangeRequestIDs, ", "), last.SubmittedBy),
+		ScopeGroups: auditGroups,
+	})
+	cp := *req
+	return &cp
+}
+
+// unionGroups merges group lists without duplicates (order of first appearance).
+func unionGroups(lists ...[]string) []string {
+	out := []string{}
+	for _, l := range lists {
+		for _, g := range l {
+			if !slices.Contains(out, g) {
+				out = append(out, g)
+			}
+		}
+	}
+	return out
 }
 
 // BulkResult is the outcome of one request in a bulk review.
@@ -502,6 +776,9 @@ func (s *Store) CommentRequest(id, text string, actor *auth.TokenClaims) (models
 			return errors.New("request not found")
 		}
 		req := &s.state.Requests[i]
+		if !s.requestVisibleLocked(actor, req) {
+			return errors.New("request not found")
+		}
 		if err := canHandleRequest(actor, req.TargetGroupIDs); err != nil {
 			return err
 		}
@@ -526,6 +803,9 @@ func (s *Store) AssignRequest(id, assignee string, actor *auth.TokenClaims) (mod
 			return errors.New("request not found")
 		}
 		req := &s.state.Requests[i]
+		if !s.requestVisibleLocked(actor, req) {
+			return errors.New("request not found")
+		}
 		if err := canHandleRequest(actor, req.TargetGroupIDs); err != nil {
 			return err
 		}
@@ -609,6 +889,9 @@ func (s *Store) RevokeAccessRequest(id, reason string, actor *auth.TokenClaims) 
 			return errors.New("request not found")
 		}
 		req := &s.state.Requests[i]
+		if !s.requestVisibleLocked(actor, req) {
+			return errors.New("request not found")
+		}
 		if req.Status != "approved" {
 			return fmt.Errorf("only approved requests can be revoked (status: %s)", req.Status)
 		}
@@ -649,6 +932,9 @@ func (s *Store) ExtendAccessRequest(id, duration string, actor *auth.TokenClaims
 			return errors.New("request not found")
 		}
 		req := &s.state.Requests[i]
+		if !s.requestVisibleLocked(actor, req) {
+			return errors.New("request not found")
+		}
 		if req.Status != "approved" || req.RequestedScope == "learning_session_15m" {
 			return errors.New("only approved rule-based requests can be extended")
 		}
@@ -659,6 +945,18 @@ func (s *Store) ExtendAccessRequest(id, duration string, actor *auth.TokenClaims
 		exp, err := s.expiryForLocked(duration, actor, now)
 		if err != nil {
 			return err
+		}
+		// With four-eyes review required, Team Lead extensions share one budget: the governance
+		// maximum counted from the original approval, so repeated extensions cannot add up.
+		if maxDays := s.state.Governance.MaxTemporaryAccessDays; s.state.Governance.RequirePolicyReview && !auth.CanManageSystem(actor) && maxDays > 0 && exp != nil {
+			start := req.CreatedAt
+			if req.ReviewedAt != nil {
+				start = *req.ReviewedAt
+			}
+			if limit := start.Add(time.Duration(maxDays) * 24 * time.Hour); exp.After(limit) {
+				return fmt.Errorf("RBAC Policy: with four-eyes review required, Team Leads can extend access to at most %d days after the original approval (until %s); longer access needs InfoSec",
+					maxDays, limit.Format(time.RFC3339))
+			}
 		}
 		if err := s.editRequestRulesLocked(req, actor, "extended access request "+req.ID, func(r *models.PolicyRule) bool {
 			r.ExpiresAt = exp

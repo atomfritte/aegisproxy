@@ -323,6 +323,21 @@ type ImpactSample struct {
 	Before         string `json:"before"`
 	After          string `json:"after"`
 	RuleName       string `json:"rule_name,omitempty"`
+	// ServerID and GroupIDs attribute the sample so it can be shown to Team Leads of those groups.
+	ServerID string   `json:"server_id,omitempty"`
+	GroupIDs []string `json:"group_ids,omitempty"`
+}
+
+// ImpactScope holds the impact counters of the servers that share one set of server groups. The
+// API sums the scopes of a Team Lead's groups instead of showing fleet-wide counters.
+type ImpactScope struct {
+	GroupIDs        []string `json:"group_ids"`
+	FlowsEvaluated  int      `json:"flows_evaluated"`
+	NewlyAllowed    int      `json:"newly_allowed"`
+	NewlyBlocked    int      `json:"newly_blocked"`
+	Unchanged       int      `json:"unchanged"`
+	AffectedServers int      `json:"affected_servers"`
+	TargetServers   int      `json:"target_servers"`
 }
 
 type ImpactSummary struct {
@@ -334,6 +349,8 @@ type ImpactSummary struct {
 	TargetServers   int            `json:"target_servers"` // registered servers the set applies to
 	Samples         []ImpactSample `json:"samples"`
 	ComputedAt      time.Time      `json:"computed_at"`
+	// Scopes breaks the counters down by server groups (stored with change requests, not served).
+	Scopes []ImpactScope `json:"scopes,omitempty"`
 }
 
 type ChangeRequest struct {
@@ -353,6 +370,9 @@ type ChangeRequest struct {
 	DecidedBy     string         `json:"decided_by,omitempty"`
 	DecidedAt     *time.Time     `json:"decided_at,omitempty"`
 	PublishedVer  int            `json:"published_version,omitempty"`
+	// AccessRequestID links a change request that carries the approval of an access request (an
+	// approval that needs four-eyes review); approving it grants the request.
+	AccessRequestID string `json:"access_request_id,omitempty"`
 }
 
 // GovernanceSettings controls change management and request handling.
@@ -610,6 +630,9 @@ type AccessRequest struct {
 	ExpiresAt      *time.Time       `json:"expires_at,omitempty"` // access expiry of an approved request
 	RevokedBy      string           `json:"revoked_by,omitempty"`
 	RevokedAt      *time.Time       `json:"revoked_at,omitempty"`
+	// ChangeRequestIDs are the change requests carrying an approval that awaits four-eyes review;
+	// the request stays pending until they are decided.
+	ChangeRequestIDs []string `json:"change_request_ids,omitempty"`
 }
 
 type RequestComment struct {

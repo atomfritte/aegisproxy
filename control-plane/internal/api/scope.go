@@ -133,6 +133,43 @@ func (t *teamScope) policies(snap store.StateSnapshot, servers []models.Server) 
 	return snap
 }
 
+// scopedImpact narrows a change request's stored impact to the caller: Team Leads get the counters
+// and samples of their groups only (impacts stored without a per-group breakdown show nothing).
+// The breakdown itself is never served. The stored value is not modified.
+func scopedImpact(imp *models.ImpactSummary, t *teamScope) *models.ImpactSummary {
+	if imp == nil {
+		return nil
+	}
+	out := *imp
+	out.Scopes = nil
+	if t == nil {
+		return &out
+	}
+	out.FlowsEvaluated, out.NewlyAllowed, out.NewlyBlocked, out.Unchanged, out.AffectedServers, out.TargetServers = 0, 0, 0, 0, 0, 0
+	for _, sc := range imp.Scopes {
+		if t.anyOf(sc.GroupIDs) {
+			out.FlowsEvaluated += sc.FlowsEvaluated
+			out.NewlyAllowed += sc.NewlyAllowed
+			out.NewlyBlocked += sc.NewlyBlocked
+			out.Unchanged += sc.Unchanged
+			out.AffectedServers += sc.AffectedServers
+			out.TargetServers += sc.TargetServers
+		}
+	}
+	out.Samples = filterSlice(imp.Samples, func(s models.ImpactSample) bool { return t.anyOf(s.GroupIDs) })
+	return &out
+}
+
+// scopedChangeRequests applies scopedImpact to a list of change requests (copies).
+func scopedChangeRequests(crs []models.ChangeRequest, t *teamScope) []models.ChangeRequest {
+	out := make([]models.ChangeRequest, len(crs))
+	for i, cr := range crs {
+		cr.Impact = scopedImpact(cr.Impact, t)
+		out[i] = cr
+	}
+	return out
+}
+
 func (t *teamScope) bandwidth(b models.BandwidthSummary) models.BandwidthSummary {
 	b.TopServers = filterSlice(b.TopServers, func(e models.ServerVolumeEntry) bool { return t.anyOf(e.GroupIDs) })
 	b.GroupBreakdown = filterSlice(b.GroupBreakdown, func(e models.GroupVolumeEntry) bool { return t.groups[e.GroupID] })

@@ -18,8 +18,9 @@ func TestLearningSessionApprovalUsesServerGroups(t *testing.T) {
 	if err != nil {
 		t.Skipf("learning-session scope not offered by the default template: %v", err)
 	}
-	// A Team Lead of another group names their own group as target: refused (server is outside their scope).
-	if _, _, err := st.ReviewAccessRequest(req.ID, ReviewOptions{Approve: true, TargetGroupIDs: []string{"grp-ci"}}, teamLeadCI); err == nil || !strings.Contains(err.Error(), "RBAC") {
+	// A Team Lead of another group names their own group as target: refused (the request is outside
+	// their scope, so it does not exist for them).
+	if _, _, err := st.ReviewAccessRequest(req.ID, ReviewOptions{Approve: true, TargetGroupIDs: []string{"grp-ci"}}, teamLeadCI); err == nil || err.Error() != "request not found" {
 		t.Fatalf("team lead of grp-ci approved a session for the vault server: %v", err)
 	}
 	// Even InfoSec cannot open a session on a strict-isolation server by naming another target group.

@@ -321,9 +321,24 @@ func simulate(in simInput) models.ImpactSummary {
 	tmp := models.PolicySet{Kind: kind, PolicySetSpec: *spec}
 	tGroups, tServers := setScope(&tmp)
 	sum := models.ImpactSummary{Samples: []models.ImpactSample{}, ComputedAt: time.Now().UTC()}
+	// Per-group breakdown: one scope per distinct server group membership.
+	scopeIdx := map[string]int{}
+	scopeAffected := map[string]map[string]bool{}
+	scopeOf := func(groups []string) *models.ImpactScope {
+		key := strings.Join(sortedCopy(groups), ",")
+		i, ok := scopeIdx[key]
+		if !ok {
+			i = len(sum.Scopes)
+			scopeIdx[key] = i
+			sum.Scopes = append(sum.Scopes, models.ImpactScope{GroupIDs: nonNil(sortedCopy(groups))})
+			scopeAffected[key] = map[string]bool{}
+		}
+		return &sum.Scopes[i]
+	}
 	for _, srv := range servers {
 		if slices.Contains(tGroups, "*") || slices.Contains(tServers, srv.ID) || slices.ContainsFunc(srv.GroupIDs, func(g string) bool { return slices.Contains(tGroups, g) }) {
 			sum.TargetServers++
+			scopeOf(srv.GroupIDs).TargetServers++
 		}
 	}
 	affected := map[string]bool{}
@@ -352,16 +367,25 @@ func simulate(in simInput) models.ImpactSummary {
 		before := ruleDecision(curIdx, host, path, method, f.ServerID, groupsOf, explicitOnly)
 		after := ruleDecision(candIdx, host, path, method, f.ServerID, groupsOf, explicitOnly)
 		sum.FlowsEvaluated++
+		sc := scopeOf(groupsOf)
+		sc.FlowsEvaluated++
 		if before.allowed == after.allowed {
 			sum.Unchanged++
+			sc.Unchanged++
 			continue
 		}
 		if after.allowed {
 			sum.NewlyAllowed++
+			sc.NewlyAllowed++
 		} else {
 			sum.NewlyBlocked++
+			sc.NewlyBlocked++
 		}
 		affected[f.ServerID] = true
+		if key := strings.Join(sc.GroupIDs, ","); !scopeAffected[key][f.ServerID] {
+			scopeAffected[key][f.ServerID] = true
+			sc.AffectedServers++
+		}
 		key := f.ServerID + "|" + method + "|" + f.FullURL
 		if len(sum.Samples) < 25 && !seen[key] {
 			seen[key] = true
@@ -372,7 +396,8 @@ func simulate(in simInput) models.ImpactSummary {
 				return models.VerdictBlocked
 			}
 			sum.Samples = append(sum.Samples, models.ImpactSample{ServerHostname: f.ServerHostname, ServerIP: f.ServerIP, Method: method,
-				URL: f.FullURL, Before: verdict(before), After: verdict(after), RuleName: cmpOr(after.rule, before.rule)})
+				URL: f.FullURL, Before: verdict(before), After: verdict(after), RuleName: cmpOr(after.rule, before.rule),
+				ServerID: f.ServerID, GroupIDs: slices.Clone(groupsOf)})
 		}
 	}
 	sum.AffectedServers = len(affected)

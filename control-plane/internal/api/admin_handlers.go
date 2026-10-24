@@ -82,7 +82,7 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, claims *
 		"servers":             publicServers(servers),
 		"rules":               snap.Rules,
 		"policy_sets":         snap.PolicySets,
-		"change_requests":     nonNil(snap.ChangeRequests),
+		"change_requests":     scopedChangeRequests(snap.ChangeRequests, scope),
 		"governance":          snap.Governance,
 		"block_pages":         snap.BlockPages,
 		"overview":            overviewStats(snap, servers, claims),
@@ -117,6 +117,9 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, claims *
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
+
+// flowStreamRecheck is how often an open flow stream re-validates its session and scope.
+var flowStreamRecheck = time.Minute
 
 func (s *Server) handleFlowStream(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	flusher, ok := w.(http.Flusher)
@@ -160,7 +163,7 @@ func (s *Server) handleFlowStream(w http.ResponseWriter, r *http.Request, claims
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
 	// Re-validate the session periodically so revoked/expired sessions stop receiving data.
-	recheck := time.NewTicker(time.Minute)
+	recheck := time.NewTicker(flowStreamRecheck)
 	defer recheck.Stop()
 	ctx := r.Context()
 	for {
@@ -173,11 +176,14 @@ func (s *Server) handleFlowStream(w http.ResponseWriter, r *http.Request, claims
 			}
 			flusher.Flush()
 		case <-recheck.C:
-			if _, _, err := s.getClaims(r); err != nil {
+			fresh, _, err := s.getClaims(r)
+			if err != nil {
 				_, _ = fmt.Fprint(w, "event: session_expired\ndata: {}\n\n")
 				flusher.Flush()
 				return
 			}
+			// Role and group changes (users and service accounts) apply to the open stream as well.
+			scope = scopeFor(fresh)
 		case flow, ok := <-ch:
 			if !ok {
 				return
@@ -222,7 +228,7 @@ func (s *Server) handleReviewRequest(w http.ResponseWriter, r *http.Request, cla
 	if len(rules) > 0 {
 		first = &rules[0]
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"request": req, "rule": first, "rules": rules})
+	writeJSON(w, http.StatusOK, map[string]any{"request": req, "rule": first, "rules": nonNil(rules)})
 }
 
 func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
@@ -423,6 +429,11 @@ func (s *Server) handleSimulateProxyRequest(w http.ResponseWriter, r *http.Reque
 		ServerIP: body.ServerIP, ProxyAuthUser: body.ProxyAuthUser, Method: body.Method, Scheme: parsed.Scheme,
 		Host: parsed.Hostname(), Port: port, Path: path, FullURL: body.FullURL, UserAgent: body.UserAgent,
 	})
+	if scope := scopeFor(claims); scope != nil && !scope.anyOf(res.GroupIDs) {
+		// Team Leads simulate their own servers only; unknown and foreign sources get the same answer.
+		writeError(w, http.StatusNotFound, "no server of your groups has this address or proxy user")
+		return
+	}
 	mutate := s.store.DemoMode() && (auth.CanManageSystem(claims) || auth.CanApproveForGroups(claims, res.GroupIDs))
 
 	statusCode := 200

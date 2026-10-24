@@ -98,7 +98,13 @@ export const ReviewPanel: React.FC<{ request: AccessRequest }> = ({ request: r }
           description: `${r.server_hostname || r.server_ip} records and allows traffic for 15 minutes.`,
           action: { label: 'Open learning sessions', onClick: () => navigate('/learning') },
         });
-      else {
+      else if ((res.request?.change_request_ids?.length ?? 0) > 0 && res.request?.status === 'pending') {
+        const ids = res.request.change_request_ids ?? [];
+        toast.success('Submitted for four-eyes review', {
+          description: 'Another reviewer must approve the change request before the access is granted.',
+          action: { label: 'Open change request', onClick: () => navigate(`/changes/${encodeURIComponent(ids[0])}`) },
+        });
+      } else {
         const n = (res.rules ?? []).length || groups.length;
         toast.success(`Approved — ${pluralize(n, 'rule')} added`, {
           description: `Enforced within seconds, ${expiryText(duration)}.`,

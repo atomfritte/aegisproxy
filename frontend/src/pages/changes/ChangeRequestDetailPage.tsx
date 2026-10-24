@@ -79,11 +79,13 @@ const ChangeRequestDetail: React.FC<{ id: string }> = ({ id }) => {
   const open = c.status === 'open';
 
   let decideBlocked: string | null = null;
-  if (perms.isReadOnly) decideBlocked = 'Your role is read-only. You can comment, but a reviewer with approval rights must decide.';
+  if (perms.isReadOnly) decideBlocked = 'Your role is read-only. A reviewer with approval rights for this policy set must decide.';
   else if (isAuthor) decideBlocked = 'You submitted this change. Four-eyes principle: another approver must decide.';
   else if (!inScope) decideBlocked = 'This change affects groups you cannot approve for.';
   const approveBlocked = decideBlocked || (isLastEditor ? 'You edited this draft last, so another reviewer must approve it.' : null);
   const canWithdraw = open && (isAuthor || perms.canManageSystem);
+  // Comments are part of the review: they need the rights to manage the set (or InfoSec).
+  const canComment = open && !perms.isReadOnly && inScope;
 
   const reloadAll = async () => {
     await refresh();
@@ -231,6 +233,15 @@ const ChangeRequestDetail: React.FC<{ id: string }> = ({ id }) => {
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
         <div className="min-w-0 space-y-6">
+          {c.access_request_id && (
+            <Callout tone="info" title="Access request approval">
+              This change carries the approval of access request{' '}
+              <Link to={`/requests/${encodeURIComponent(c.access_request_id)}`} className="font-medium text-accent hover:underline">
+                {c.access_request_id}
+              </Link>
+              . Approving it grants the access; rejecting it returns the request to the queue.
+            </Callout>
+          )}
           {c.status === 'superseded' && (
             <Callout tone="warning" title="Superseded">
               The policy set changed after this request was submitted (for example an approved access request added a rule). The author needs to resubmit the draft.
@@ -303,7 +314,7 @@ const ChangeRequestDetail: React.FC<{ id: string }> = ({ id }) => {
             <CardHeader title="Activity" description={`${(c.reviews ?? []).length} review${(c.reviews ?? []).length === 1 ? '' : 's'} and comments`} />
             <div className="p-[var(--card-p)]">
               <Timeline items={timeline} />
-              {open && (
+              {canComment && (
                 <form
                   className="mt-5 border-t border-border pt-4"
                   onSubmit={(e) => {

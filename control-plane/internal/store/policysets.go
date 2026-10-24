@@ -173,6 +173,15 @@ func (s *Store) validateSpecLocked(setID, kind string, spec *models.PolicySetSpe
 				}
 			}
 		} else {
+			if existed && strings.EqualFold(old.Action, "BLOCK") {
+				// Changing a guardrail in any way (action, matching fields, enabled) needs the rights
+				// to remove it from its current scope.
+				o := cloneRule(old)
+				o.GroupIDs, o.ServerIDs = prevGroups, prevServers
+				if err := auth.CanModifyRule(actor, o, fleet); err != nil {
+					return fmt.Errorf("changing guardrail %q: %w", old.Name, err)
+				}
+			}
 			r.GroupIDs, r.ServerIDs = groups, servers
 			if err := s.normalizeAndValidateRuleLocked(r, actor.Role); err != nil {
 				if len(groups) == 0 && len(servers) == 0 && strings.Contains(err.Error(), "must target") {
@@ -249,6 +258,104 @@ func (s *Store) canManageSetLocked(actor *auth.TokenClaims, kind string, scopes 
 		}
 		if len(sc.GroupIDs) == 0 && len(sc.ServerIDs) == 0 && len(sc.Rules) > 0 {
 			return errors.New("RBAC Policy: Team Leads must assign policy sets to their server groups")
+		}
+	}
+	return nil
+}
+
+// scopedTeamLead reports whether the actor is limited to the policy objects of their own groups.
+func scopedTeamLead(actor *auth.TokenClaims) bool {
+	return actor != nil && actor.Role == models.RoleTeamLead && !slices.Contains(actor.AllowedGroups, "*")
+}
+
+// setVisibleLocked mirrors the API's need-to-know view: Team Leads see baseline sets, sets they
+// created and sets (or drafts) that reach their groups or servers; other roles see every set.
+func (s *Store) setVisibleLocked(actor *auth.TokenClaims, set *models.PolicySet) bool {
+	if !scopedTeamLead(actor) {
+		return actor != nil
+	}
+	if set.Kind == models.PolicySetKindBaseline || set.CreatedBy == actor.Username {
+		return true
+	}
+	mine := func(groups []string) bool {
+		return slices.ContainsFunc(groups, func(g string) bool { return slices.Contains(actor.AllowedGroups, g) })
+	}
+	reaches := func(groups, servers []string) bool {
+		if slices.Contains(groups, "*") || slices.Contains(servers, "*") || mine(groups) {
+			return true
+		}
+		return slices.ContainsFunc(servers, func(id string) bool {
+			srv, ok := s.serverByIDLocked(id)
+			return ok && (mine(srv.EffectiveGroupIDs) || mine(srv.GroupIDs))
+		})
+	}
+	return reaches(set.GroupIDs, set.ServerIDs) || (set.Draft != nil && reaches(set.Draft.Spec.GroupIDs, set.Draft.Spec.ServerIDs))
+}
+
+// sanitizeClientRulesLocked drops attribution that clients must not choose (created_by/at,
+// approved_by, access_request_id, source_session_id). Published rules get their values back in
+// validateSpecLocked; rules that exist only in the draft keep the draft's values; new rules are
+// attributed to the actor. set is nil for a new set.
+func sanitizeClientRulesLocked(set *models.PolicySet, spec *models.PolicySetSpec) {
+	published, drafted := map[string]bool{}, map[string]models.PolicyRule{}
+	if set != nil {
+		for _, r := range set.Rules {
+			published[r.ID] = true
+		}
+		if set.Draft != nil {
+			for _, r := range set.Draft.Spec.Rules {
+				drafted[r.ID] = r
+			}
+		}
+	}
+	for i := range spec.Rules {
+		r := &spec.Rules[i]
+		if r.ID != "" && published[r.ID] {
+			continue
+		}
+		if d, ok := drafted[r.ID]; ok && r.ID != "" {
+			approvedBy := ""
+			if len(ruleFieldsChanged(d, *r)) == 0 {
+				approvedBy = d.ApprovedBy
+			}
+			r.CreatedAt, r.CreatedBy, r.ApprovedBy = d.CreatedAt, d.CreatedBy, approvedBy
+			r.AccessRequestID, r.SourceSessionID = d.AccessRequestID, d.SourceSessionID
+			continue
+		}
+		r.CreatedAt, r.CreatedBy, r.ApprovedBy = time.Time{}, "", ""
+		r.AccessRequestID, r.SourceSessionID = "", ""
+	}
+}
+
+// checkDraftGuardrailsLocked protects BLOCK rules that exist only in the current draft (published
+// ones are checked by validateSpecLocked): replacing the draft must not change or drop them unless
+// the actor may manage guardrails.
+func (s *Store) checkDraftGuardrailsLocked(set *models.PolicySet, spec models.PolicySetSpec, actor *auth.TokenClaims) error {
+	if set.Draft == nil {
+		return nil
+	}
+	published := map[string]bool{}
+	for _, r := range set.Rules {
+		published[r.ID] = true
+	}
+	next := map[string]models.PolicyRule{}
+	for _, r := range spec.Rules {
+		next[r.ID] = r
+	}
+	tmp := models.PolicySet{Kind: set.Kind, PolicySetSpec: set.Draft.Spec}
+	groups, servers := setScope(&tmp)
+	fleet := s.effectiveServersLocked()
+	for _, old := range set.Draft.Spec.Rules {
+		if published[old.ID] || !strings.EqualFold(old.Action, "BLOCK") {
+			continue
+		}
+		if cur, ok := next[old.ID]; ok && len(ruleFieldsChanged(old, cur)) == 0 {
+			continue
+		}
+		o := cloneRule(old)
+		o.GroupIDs, o.ServerIDs = groups, servers
+		if err := auth.CanModifyRule(actor, o, fleet); err != nil {
+			return fmt.Errorf("changing or removing guardrail %q of the draft: %w", old.Name, err)
 		}
 	}
 	return nil
@@ -390,6 +497,8 @@ func (s *Store) CreatePolicySet(kind string, spec models.PolicySetSpec, actor *a
 	}
 	var out models.PolicySet
 	err := s.withWrite(func() error {
+		spec := cloneSpec(spec)
+		sanitizeClientRulesLocked(nil, &spec)
 		i, err := s.createSetLocked(kind, spec, actor)
 		if err != nil {
 			return err
@@ -448,7 +557,12 @@ func (s *Store) SaveDraft(id string, spec models.PolicySetSpec, actor *auth.Toke
 		if set.Draft != nil && set.Draft.Status == "in_review" {
 			return ErrDraftLocked
 		}
+		spec = cloneSpec(spec)
+		sanitizeClientRulesLocked(set, &spec)
 		if err := s.canManageSetLocked(actor, set.Kind, set.PolicySetSpec, spec); err != nil {
+			return err
+		}
+		if err := s.checkDraftGuardrailsLocked(set, spec, actor); err != nil {
 			return err
 		}
 		if err := s.validateSpecLocked(id, set.Kind, &spec, actor); err != nil {
@@ -631,22 +745,28 @@ func (s *Store) SubmitChangeRequest(id, title, description string, actor *auth.T
 		return nil
 	})
 	if err == nil {
-		// Impact is computed outside the write lock (evaluates recorded traffic) and attached.
-		if impact, ierr := s.SimulateSpec(id, &cr.Spec, systemActor); ierr == nil {
-			cr.Impact = &impact
-			_ = s.withWrite(func() error {
-				if j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == cr.ID }); j >= 0 {
-					s.state.ChangeRequests[j].Impact = &impact
-					s.markDirtyLocked()
-				}
-				return nil
-			})
-		}
-		if s.notifier != nil {
-			s.notifier.NotifyChangeRequest(cr)
-		}
+		cr = s.announceChangeRequest(cr)
 	}
 	return cr, err
+}
+
+// announceChangeRequest computes the impact of a newly submitted change request outside the write
+// lock (it evaluates recorded traffic), attaches it and notifies reviewers.
+func (s *Store) announceChangeRequest(cr models.ChangeRequest) models.ChangeRequest {
+	if impact, err := s.SimulateSpec(cr.PolicySetID, &cr.Spec, systemActor); err == nil {
+		cr.Impact = &impact
+		_ = s.withWrite(func() error {
+			if j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == cr.ID }); j >= 0 {
+				s.state.ChangeRequests[j].Impact = &impact
+				s.markDirtyLocked()
+			}
+			return nil
+		})
+	}
+	if s.notifier != nil {
+		s.notifier.NotifyChangeRequest(cr)
+	}
+	return cr
 }
 
 // ReviewChangeRequest records a decision. Approval publishes the change (four-eyes: the reviewer
@@ -659,38 +779,59 @@ func (s *Store) ReviewChangeRequest(crID, decision, comment string, actor *auth.
 		return models.ChangeRequest{}, errors.New("decision must be approve, reject or comment")
 	}
 	var out models.ChangeRequest
+	var granted *models.AccessRequest
 	err := s.withWrite(func() error {
 		j := slices.IndexFunc(s.state.ChangeRequests, func(c models.ChangeRequest) bool { return c.ID == crID })
 		if j < 0 {
 			return errors.New("change request not found")
 		}
 		cr := &s.state.ChangeRequests[j]
+		i := s.setIndexLocked(cr.PolicySetID)
+		// Need-to-know first: a change request outside the caller's view does not exist for them.
+		if !strings.EqualFold(cr.SubmittedBy, actor.Username) && (i < 0 || !s.setVisibleLocked(actor, &s.state.PolicySets[i])) && scopedTeamLead(actor) {
+			return errors.New("change request not found")
+		}
 		if cr.Status != "open" {
 			return fmt.Errorf("change request is already %s", cr.Status)
 		}
-		i := s.setIndexLocked(cr.PolicySetID)
 		if i < 0 {
 			return errors.New("policy set not found")
 		}
 		set := &s.state.PolicySets[i]
 		now := time.Now().UTC()
+		// Every decision, comments included, needs the rights to manage the set (or InfoSec).
+		if err := s.canManageSetLocked(actor, set.Kind, set.PolicySetSpec, cr.Spec); err != nil {
+			return err
+		}
 		if decision != "comment" {
 			if actor.ServiceAccount && decision == "approve" {
 				return errors.New("four-eyes principle: change requests must be approved by a person, not a service account")
 			}
-			if err := s.canManageSetLocked(actor, set.Kind, set.PolicySetSpec, cr.Spec); err != nil {
-				return err
-			}
 			if strings.EqualFold(actor.Username, cr.SubmittedBy) {
 				return errors.New("four-eyes principle: you cannot review your own change request")
 			}
-			if decision == "approve" && set.Draft != nil && strings.EqualFold(actor.Username, set.Draft.UpdatedBy) {
+			// An access-request change leaves the set's draft alone, so its editor may approve it.
+			if decision == "approve" && cr.AccessRequestID == "" && set.Draft != nil && strings.EqualFold(actor.Username, set.Draft.UpdatedBy) {
 				return errors.New("four-eyes principle: you edited this draft, so another reviewer must approve it")
+			}
+			if decision == "approve" && cr.AccessRequestID != "" {
+				if k := s.requestIndexLocked(cr.AccessRequestID); k < 0 || s.state.Requests[k].Status != "pending" {
+					return errors.New("the access request of this change request is no longer pending; withdraw the change request")
+				}
 			}
 		}
 		cr.Reviews = append(cr.Reviews, models.ChangeReview{Reviewer: actor.Username, Role: string(actor.Role), Decision: decision, Comment: comment, At: now})
 		switch decision {
 		case "approve":
+			if cr.AccessRequestID != "" {
+				v, err := s.publishRequestChangeLocked(i, cr, actor, comment)
+				if err != nil {
+					return err
+				}
+				cr.Status, cr.DecidedBy, cr.DecidedAt, cr.PublishedVer = "approved", actor.Username, &now, v.Version
+				granted = s.settleRequestChangesLocked(cr.AccessRequestID)
+				break
+			}
 			if set.Version != cr.BaseVersion {
 				cr.Status = "superseded"
 				if set.Draft != nil && set.Draft.ChangeRequestID == cr.ID {
@@ -717,6 +858,9 @@ func (s *Store) ReviewChangeRequest(crID, decision, comment string, actor *auth.
 				EntityType: "change_request", EntityID: cr.ID, EntityName: cr.Title,
 				Summary: fmt.Sprintf("Rejected change request for %q: %s", cr.PolicySetName, clip(comment, 300)),
 			})
+			if cr.AccessRequestID != "" {
+				s.settleRequestChangesLocked(cr.AccessRequestID)
+			}
 		}
 		s.markDirtyLocked()
 		out = *cr
@@ -724,6 +868,9 @@ func (s *Store) ReviewChangeRequest(crID, decision, comment string, actor *auth.
 	})
 	if err == nil && out.Status == "superseded" {
 		err = ErrSuperseded
+	}
+	if err == nil && granted != nil && s.notifier != nil {
+		s.notifier.NotifyRequestDecision(*granted)
 	}
 	return out, err
 }
@@ -735,10 +882,14 @@ func (s *Store) WithdrawChangeRequest(crID string, actor *auth.TokenClaims) erro
 			return errors.New("change request not found")
 		}
 		cr := &s.state.ChangeRequests[j]
+		own := strings.EqualFold(cr.SubmittedBy, actor.Username)
+		if i := s.setIndexLocked(cr.PolicySetID); !own && (i < 0 || !s.setVisibleLocked(actor, &s.state.PolicySets[i])) && scopedTeamLead(actor) {
+			return errors.New("change request not found")
+		}
 		if cr.Status != "open" {
 			return fmt.Errorf("change request is already %s", cr.Status)
 		}
-		if !strings.EqualFold(cr.SubmittedBy, actor.Username) && !auth.CanManageSystem(actor) {
+		if !own && !auth.CanManageSystem(actor) {
 			return errors.New("RBAC Policy: only the author or InfoSec can withdraw a change request")
 		}
 		now := time.Now().UTC()
@@ -752,6 +903,9 @@ func (s *Store) WithdrawChangeRequest(crID string, actor *auth.TokenClaims) erro
 			Actor: actor.Username, ActorRole: string(actor.Role), Action: "CHANGE_REQUEST_WITHDRAWN", Category: "POLICY",
 			EntityType: "change_request", EntityID: cr.ID, EntityName: cr.Title, Summary: "Withdrew change request " + cr.ID,
 		})
+		if cr.AccessRequestID != "" {
+			s.settleRequestChangesLocked(cr.AccessRequestID)
+		}
 		s.markDirtyLocked()
 		return nil
 	})
@@ -836,8 +990,11 @@ func (s *Store) DeletePolicySet(id, reason string, actor *auth.TokenClaims) erro
 		}
 		s.state.PolicySets = slices.Delete(s.state.PolicySets, i, i+1)
 		for j := range s.state.ChangeRequests {
-			if s.state.ChangeRequests[j].PolicySetID == id && s.state.ChangeRequests[j].Status == "open" {
-				s.state.ChangeRequests[j].Status = "withdrawn"
+			if cr := &s.state.ChangeRequests[j]; cr.PolicySetID == id && cr.Status == "open" {
+				cr.Status = "withdrawn"
+				if cr.AccessRequestID != "" {
+					s.settleRequestChangesLocked(cr.AccessRequestID)
+				}
 			}
 		}
 		groups, _ := setScope(&set)

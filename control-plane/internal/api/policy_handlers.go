@@ -118,21 +118,13 @@ func (s *Server) handleCreatePolicySet(w http.ResponseWriter, r *http.Request, c
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	stripServerFields(&body.Spec)
+	// Rule attribution (created/approved by, request and session links) is set by the store.
 	set, err := s.store.CreatePolicySet(body.Kind, body.Spec, claims)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, set)
-}
-
-// stripServerFields drops bookkeeping that clients must not set on new rules (the store keeps
-// the values of existing rules).
-func stripServerFields(spec *models.PolicySetSpec) {
-	for i := range spec.Rules {
-		spec.Rules[i].SourceSessionID, spec.Rules[i].AccessRequestID = "", ""
-	}
 }
 
 // handleExportPolicySets downloads policy sets as a JSON bundle (?id=…&id=… selects sets).
@@ -153,9 +145,6 @@ func (s *Server) handleImportPolicySets(w http.ResponseWriter, r *http.Request, 
 	}
 	if !decodeJSON(w, r, &body) {
 		return
-	}
-	for i := range body.Bundle.PolicySets {
-		stripServerFields(&body.Bundle.PolicySets[i].PolicySetSpec)
 	}
 	results, err := s.store.ImportPolicySets(body.Bundle, body.DryRun, claims)
 	if err != nil && results == nil {
@@ -186,6 +175,7 @@ func (s *Server) handleGetPolicySet(w http.ResponseWriter, r *http.Request, clai
 			crs = append(crs, cr)
 		}
 	}
+	crs = scopedChangeRequests(crs, scopeFor(claims))
 	var draftDiff *models.PolicyDiff
 	if set.Draft != nil {
 		d := store.DiffSpecs(set.PolicySetSpec, set.Draft.Spec)
@@ -222,6 +212,9 @@ func versionSummaries(vs []models.PolicySetVersion) []versionSummary {
 }
 
 func (s *Server) handleDeletePolicySet(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	if err := s.store.DeletePolicySet(r.PathValue("id"), r.URL.Query().Get("reason"), claims); err != nil {
 		writeStoreError(w, err)
 		return
@@ -237,21 +230,8 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request, claims 
 		return
 	}
 	id := r.PathValue("id")
-	if cur, ok := s.store.PolicySet(id); ok {
-		known := map[string]bool{}
-		for _, rr := range cur.Rules {
-			known[rr.ID] = true
-		}
-		if cur.Draft != nil {
-			for _, rr := range cur.Draft.Spec.Rules {
-				known[rr.ID] = true
-			}
-		}
-		for i := range body.Spec.Rules {
-			if !known[body.Spec.Rules[i].ID] {
-				body.Spec.Rules[i].SourceSessionID, body.Spec.Rules[i].AccessRequestID = "", ""
-			}
-		}
+	if !s.policySetVisible(w, claims, id) {
+		return
 	}
 	set, err := s.store.SaveDraft(id, body.Spec, claims)
 	if err != nil {
@@ -262,6 +242,9 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request, claims 
 }
 
 func (s *Server) handleDiscardDraft(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	if err := s.store.DiscardDraft(r.PathValue("id"), claims); err != nil {
 		writeStoreError(w, err)
 		return
@@ -275,6 +258,9 @@ func (s *Server) handlePublishDraft(w http.ResponseWriter, r *http.Request, clai
 		Emergency bool   `json:"emergency"`
 	}
 	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
 		return
 	}
 	set, err := s.store.PublishDraft(r.PathValue("id"), body.Comment, body.Emergency, claims)
@@ -297,6 +283,9 @@ func (s *Server) handleSubmitChange(w http.ResponseWriter, r *http.Request, clai
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	cr, err := s.store.SubmitChangeRequest(r.PathValue("id"), body.Title, body.Description, claims)
 	if err != nil {
 		writeStoreError(w, err)
@@ -305,6 +294,7 @@ func (s *Server) handleSubmitChange(w http.ResponseWriter, r *http.Request, clai
 	if latest, ok := s.store.ChangeRequest(cr.ID); ok {
 		cr = latest
 	}
+	cr.Impact = scopedImpact(cr.Impact, scopeFor(claims))
 	writeJSON(w, http.StatusCreated, cr)
 }
 
@@ -317,6 +307,9 @@ func (s *Server) handleSimulateSet(w http.ResponseWriter, r *http.Request, claim
 		return
 	}
 	id := r.PathValue("id")
+	if !s.policySetVisible(w, claims, id) {
+		return
+	}
 	spec := body.Spec
 	if spec == nil {
 		set, ok := s.store.PolicySet(id)
@@ -335,6 +328,7 @@ func (s *Server) handleSimulateSet(w http.ResponseWriter, r *http.Request, claim
 		writeStoreError(w, err)
 		return
 	}
+	impact.Scopes = nil // the per-group breakdown is not served (Team Leads simulate on their own traffic)
 	writeJSON(w, http.StatusOK, impact)
 }
 
@@ -422,6 +416,9 @@ func (s *Server) handleRollbackSet(w http.ResponseWriter, r *http.Request, claim
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	set, published, err := s.store.RollbackPolicySet(r.PathValue("id"), body.Version, body.Comment, claims)
 	if err != nil {
 		writeStoreError(w, err)
@@ -436,6 +433,9 @@ func (s *Server) handleRecertifySet(w http.ResponseWriter, r *http.Request, clai
 	}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
 		return
 	}
 	set, err := s.store.RecertifyPolicySet(r.PathValue("id"), body.Comment, claims)
@@ -455,7 +455,7 @@ func (s *Server) handleListChangeRequests(w http.ResponseWriter, r *http.Request
 			out = append(out, cr)
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, scopedChangeRequests(out, scopeFor(claims)))
 }
 
 func (s *Server) handleGetChangeRequest(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
@@ -464,7 +464,19 @@ func (s *Server) handleGetChangeRequest(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusNotFound, "change request not found")
 		return
 	}
+	cr.Impact = scopedImpact(cr.Impact, scopeFor(claims))
 	writeJSON(w, http.StatusOK, cr)
+}
+
+// changeRequestVisible answers 404 for change requests outside a Team Lead's view.
+func (s *Server) changeRequestVisible(w http.ResponseWriter, claims *auth.TokenClaims, id string) bool {
+	if v := s.policyViewFor(claims); v != nil {
+		if cr, ok := s.store.ChangeRequest(id); !ok || !v.changeRequest(cr) {
+			writeError(w, http.StatusNotFound, "change request not found")
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleReviewChange(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
@@ -475,7 +487,11 @@ func (s *Server) handleReviewChange(w http.ResponseWriter, r *http.Request, clai
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	if !s.changeRequestVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	cr, err := s.store.ReviewChangeRequest(r.PathValue("id"), body.Decision, body.Comment, claims)
+	cr.Impact = scopedImpact(cr.Impact, scopeFor(claims))
 	if err != nil {
 		if errors.Is(err, store.ErrSuperseded) {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "change_request": cr})
@@ -488,6 +504,9 @@ func (s *Server) handleReviewChange(w http.ResponseWriter, r *http.Request, clai
 }
 
 func (s *Server) handleWithdrawChange(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	if !s.changeRequestVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	if err := s.store.WithdrawChangeRequest(r.PathValue("id"), claims); err != nil {
 		writeStoreError(w, err)
 		return
@@ -553,6 +572,13 @@ func (s *Server) handleQuarantine(w http.ResponseWriter, r *http.Request, claims
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	if scope := scopeFor(claims); scope != nil {
+		i := slices.IndexFunc(s.store.Servers(), func(srv models.Server) bool { return srv.ID == r.PathValue("id") && scope.serverVisible(srv) })
+		if i < 0 {
+			writeError(w, http.StatusNotFound, "server not found") // same answer for foreign servers
+			return
+		}
+	}
 	srv, err := s.store.SetQuarantine(r.PathValue("id"), body.Quarantined, body.Reason, claims)
 	if err != nil {
 		writeStoreError(w, err)
@@ -573,6 +599,9 @@ func (s *Server) handleQuarantineByIdentity(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	srv, err := s.store.FindServer(body.Hostname, body.IP)
+	if scope := scopeFor(claims); err == nil && scope != nil && !scope.serverVisible(srv) {
+		err = errors.New("server not found") // same answer for foreign servers
+	}
 	if err != nil {
 		writeStoreError(w, err)
 		return
