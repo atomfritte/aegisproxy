@@ -2,9 +2,9 @@
 {{- $cv := .Values.clamav }}
 {{- $sel := dict "root" . "component" "clamav" }}
 # ClamAV (clamd) — each replica keeps its own signature database (freshclam runs inside the pod).
-# The official image starts as root and drops to the clamav user; it is therefore not compatible
-# with the "restricted" Pod Security Standard (use the "baseline" level for this namespace or a
-# pre-hardened clamd image).
+# The official image's /init needs root (chown, symlinks in /var); the pod instead runs an equivalent
+# start script as the image's clamav user with a read-only root filesystem, no capabilities and the
+# RuntimeDefault seccomp profile ("restricted" Pod Security Standard).
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -23,14 +23,27 @@ spec:
     spec:
       {{- include "aegis.imagePullSecrets" . | nindent 6 }}
       automountServiceAccountToken: false
-      securityContext:
-        seccompProfile: { type: RuntimeDefault }
+      securityContext: {{- toYaml $cv.podSecurityContext | nindent 8 }}
       containers:
         - name: clamav
           image: {{ include "aegis.image" (dict "root" . "image" $cv.image) }}
           imagePullPolicy: {{ $cv.image.pullPolicy }}
-          securityContext:
-            allowPrivilegeEscalation: false
+          securityContext: {{- toYaml $cv.containerSecurityContext | nindent 12 }}
+          # Same steps as the image's /init without the root-only parts: initial signature download,
+          # freshclam daemon (FRESHCLAM_CHECKS per day), clamd in the foreground.
+          command: ["/sbin/tini", "--", "/bin/sh", "-ec"]
+          args:
+            - |
+              if [ ! -f /var/lib/clamav/main.cvd ] && [ ! -f /var/lib/clamav/main.cld ]; then
+                echo "Updating initial database"
+                sed -e 's|^\(TestDatabases \)|#\1|' -e '$a TestDatabases no' -e 's|^\(NotifyClamd \)|#\1|' \
+                  /etc/clamav/freshclam.conf > /tmp/freshclam_initial.conf
+                freshclam --foreground --stdout --config-file=/tmp/freshclam_initial.conf
+                rm -f /tmp/freshclam_initial.conf
+              fi
+              freshclam --checks="${FRESHCLAM_CHECKS:-1}" --daemon --foreground --stdout &
+              rm -f /tmp/clamd.sock
+              exec clamd --foreground
           ports:
             - { name: clamd, containerPort: 3310, protocol: TCP }
           startupProbe:
@@ -57,8 +70,14 @@ spec:
           resources: {{- toYaml $cv.resources | nindent 12 }}
           volumeMounts:
             - { name: signatures, mountPath: /var/lib/clamav }
-      {{- if not $cv.persistence.enabled }}
+            - { name: tmp, mountPath: /tmp }
+            - { name: logs, mountPath: /var/log/clamav }
       volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: logs
+          emptyDir: { sizeLimit: 128Mi }
+      {{- if not $cv.persistence.enabled }}
         - name: signatures
           emptyDir: {}
       {{- end }}

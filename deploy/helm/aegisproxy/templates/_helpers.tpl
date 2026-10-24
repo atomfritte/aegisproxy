@@ -23,7 +23,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- define "aegis.image" -}}
 {{- $reg := .root.Values.global.imageRegistry -}}
 {{- $tag := .image.tag | default .root.Chart.AppVersion -}}
-{{- if $reg -}}{{ printf "%s/%s:%s" $reg .image.repository $tag }}{{- else -}}{{ printf "%s:%s" .image.repository $tag }}{{- end -}}
+{{- $ref := printf "%s:%s" .image.repository $tag -}}
+{{- if $reg }}{{ $ref = printf "%s/%s" $reg $ref }}{{ end -}}
+{{- if .image.digest }}{{ $ref = printf "%s@%s" $ref .image.digest }}{{ end -}}
+{{- $ref -}}
 {{- end -}}
 
 {{- define "aegis.secretName" -}}{{ .Values.secrets.existingSecret | default (printf "%s-secrets" (include "aegis.fullname" .)) }}{{- end -}}
@@ -64,4 +67,21 @@ imagePullSecrets:
 {{- if and (not .Values.ca.existingSecret) (not .Values.ca.generate) -}}{{ fail "set ca.existingSecret or ca.generate=true" }}{{- end -}}
 {{- if not (hasPrefix "http" .Values.publicUrl) -}}{{ fail "publicUrl must be an absolute http(s) URL" }}{{- end -}}
 {{- if not (has .Values.probes.mode (list "http" "exec")) -}}{{ fail "probes.mode must be http or exec" }}{{- end -}}
+{{- end -}}
+
+{{/* Internet egress peers: IPv4 and (optionally) IPv6 without the internal ranges of networkPolicy. */}}
+{{- define "aegis.publicEgress" -}}
+{{- $np := .Values.networkPolicy -}}
+- ipBlock:
+    cidr: 0.0.0.0/0
+    {{- with $np.dataPlaneEgressDeny }}
+    except: {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- if $np.dataPlaneEgressIPv6 }}
+- ipBlock:
+    cidr: "::/0"
+    {{- with $np.dataPlaneEgressDenyIPv6 }}
+    except: {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}
 {{- end -}}

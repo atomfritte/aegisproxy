@@ -203,7 +203,7 @@ func (s *Server) isTrustedProxy(a netip.Addr) bool {
 			return true
 		}
 	}
-	return false
+	return s.proxyHosts.contains(a)
 }
 
 // rateLimiter is a fixed-window per-key limiter with bounded memory.

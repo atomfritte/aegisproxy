@@ -71,6 +71,14 @@ spec:
             - { name: AEGIS_FLOW_RETENTION, value: {{ .Values.storage.flowRetention | quote }} }
             - { name: AEGIS_EVENT_RETENTION, value: {{ .Values.storage.eventRetention | quote }} }
             - { name: AEGIS_TRUSTED_PROXIES, value: {{ $cp.trustedProxies | quote }} }
+            {{- $proxyHosts := list }}
+            {{- if and .Values.console.enabled (not .Values.console.apiBaseUrl) }}
+            {{- $proxyHosts = append $proxyHosts (printf "%s-console-headless.%s.svc.%s" (include "aegis.fullname" .) .Release.Namespace .Values.clusterDomain) }}
+            {{- end }}
+            {{- range splitList "," $cp.trustedProxyHosts }}{{ if trim . }}{{ $proxyHosts = append $proxyHosts (trim .) }}{{ end }}{{ end }}
+            {{- with $proxyHosts }}
+            - { name: AEGIS_TRUSTED_PROXY_HOSTS, value: {{ join "," . | quote }} }
+            {{- end }}
             - { name: AEGIS_COOKIE_SAMESITE, value: {{ $cp.cookieSameSite | quote }} }
             - { name: AEGIS_SESSION_TTL, value: {{ $cp.sessionTTL | quote }} }
             - { name: AEGIS_DEMO_MODE, value: {{ $cp.demoMode | quote }} }

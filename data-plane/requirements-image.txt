@@ -1,0 +1,16 @@
+# Hash-pinned package overrides of the container image (data-plane/Dockerfile), installed with
+# pip --require-hashes --no-deps on top of the mitmproxy base image (CPython 3.14, Linux x86_64/aarch64):
+#  - the security overrides of requirements-security.txt (the build fails if the versions differ)
+#  - patched releases of packages the base image ships with known vulnerabilities
+# Update the hashes together with the versions (PyPI "Download files" or uv pip compile --generate-hashes).
+brotli==1.2.1 \
+    --hash=sha256:a998857af4fcd19920bdf5f30f0f1a23f38472a703d33e49168cd4fd32438377 \
+    --hash=sha256:a3942e2d365f009e5e7839114fa315e1a2bcfea12b52064a28f1a7281862a2a7
+    # CVE-2026-111497 (PYSEC-2026-4322), see requirements-security.txt
+msgpack==1.2.1 \
+    --hash=sha256:0e2bf9280bceb5efca998435904b5d3e9fdbcc11d90dc9df30aec7973252b720 \
+    --hash=sha256:ca0dacff965c47afdc3749a8469d7302a8f801d6a28758d55120d75e66ce6889
+    # GHSA-6v7p-g79w-8964
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+    # CVE-2026-97687, CVE-2026-97689

@@ -6,6 +6,7 @@ import { ROLE_LABELS } from '../../../data/permissions';
 import { useSession } from '../../../data/session';
 import { useTheme } from '../../../lib/theme';
 import { Badge, ButtonLink, Card, CardHeader, CodeBlock, CopyButton, DescriptionList, SegmentedControl } from '../../../ui';
+import { installCommands } from '../../security/tls/ca';
 import { MonoValue, SectionTitle } from './shared';
 
 const Copyable: React.FC<{ value?: string; empty?: string }> = ({ value, empty = 'Not configured' }) =>
@@ -37,8 +38,8 @@ export const GeneralSection: React.FC = () => {
     `export HTTPS_PROXY=http://${proxy || '<proxy-host>:8080'}`,
     'export NO_PROXY=localhost,127.0.0.1,.corp.example',
     '',
-    '# Trust the enterprise root CA (fingerprint-pinned installer)',
-    `curl -fsSL ${caBase}/api/public/ca/install-linux.sh | sudo bash`,
+    '# Trust the enterprise root CA (fingerprint-pinned installer; the verified one-liner is on TLS & CA)',
+    installCommands(caBase).linux,
   ].join('\n');
 
   return (

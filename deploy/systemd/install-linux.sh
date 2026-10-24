@@ -62,6 +62,7 @@ REQUIREMENTS=""
 INSTALL_DEPS=0
 NO_START=0
 FORCE=0
+FORCE_ACCOUNTS=0
 
 usage() {
     cat <<'EOF'
@@ -99,6 +100,8 @@ Data-plane
 General
   --no-start                   install and enable, but do not (re)start the services
   --force                      allow replacing an existing, different secret or CA
+  --force-accounts             use existing aegis/aegis-dp accounts even if they are not system accounts
+                               with a nologin shell (not recommended)
   -h, --help
 EOF
 }
@@ -128,6 +131,7 @@ while [ $# -gt 0 ]; do
         --install-deps) INSTALL_DEPS=1; shift ;;
         --no-start) NO_START=1; shift ;;
         --force) FORCE=1; shift ;;
+        --force-accounts) FORCE_ACCOUNTS=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -174,18 +178,20 @@ ensure_secret() {
 }
 
 # env_set FILE KEY VALUE - sets KEY in a systemd EnvironmentFile (replaces active lines, else the first
-# commented template line, else appends). Preserves ownership and permissions of FILE.
+# commented template line, else appends). Preserves ownership and permissions of FILE; the temporary copy
+# is owner-only (mktemp, umask 077), so its content is never readable by other users.
 env_set() {
-    local file=$1 key=$2 value=$3 mode
+    local file=$1 key=$2 value=$3 mode tmp
     case "$value" in *$'\n'*) die "Invalid value for $key" ;; esac
     if grep -q "^${key}=" "$file"; then mode=active
     elif grep -q "^#${key}=" "$file"; then mode=commented
     else printf '%s=%s\n' "$key" "$value" >> "$file"; return; fi
+    tmp=$(umask 077; mktemp "$file.XXXXXX")
     awk -v k="$key" -v v="$value" -v mode="$mode" '
         mode == "active"    && index($0, k "=") == 1      { print k "=" v; next }
         mode == "commented" && !done && index($0, "#" k "=") == 1 { print k "=" v; done = 1; next }
-        { print }' "$file" > "$file.tmp"
-    cat "$file.tmp" > "$file"; rm -f "$file.tmp"
+        { print }' "$file" > "$tmp" || { rm -f "$tmp"; die "Cannot update $file"; }
+    cat "$tmp" > "$file"; rm -f "$tmp"
 }
 
 env_get() { # FILE KEY -> last active value (quotes stripped)
@@ -193,13 +199,26 @@ env_get() { # FILE KEY -> last active value (quotes stripped)
     sed -n "s/^$2=//p" "$1" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
 }
 
-ensure_user() { # NAME COMMENT
-    local name=$1 nologin
+# ensure_user NAME COMMENT - creates the service account, or verifies that an existing account of that name
+# is a system account (UID 1..SYS_UID_MAX) without a login shell: the services run as it and it owns
+# their state, so an existing interactive user must not be adopted silently (--force-accounts overrides).
+ensure_user() {
+    local name=$1 nologin entry uid shell sys_max login=""
     nologin=$(command -v nologin || echo /usr/sbin/nologin)
     getent group "$name" >/dev/null || groupadd --system "$name"
-    if ! getent passwd "$name" >/dev/null; then
+    if ! entry=$(getent passwd "$name"); then
         useradd --system --gid "$name" --home-dir /nonexistent --no-create-home --shell "$nologin" --comment "$2" "$name"
         ok "Created system user $name"
+        return
+    fi
+    uid=$(printf '%s' "$entry" | cut -d: -f3)
+    shell=$(printf '%s' "$entry" | cut -d: -f7)
+    sys_max=$(awk '$1 == "SYS_UID_MAX" { print $2 }' /etc/login.defs 2>/dev/null | tail -n 1)
+    case "$sys_max" in ''|*[!0-9]*) sys_max=999 ;; esac
+    case "$shell" in */nologin|*/false) ;; *) login=1 ;; esac
+    if [ "$uid" -eq 0 ] || [ "$uid" -gt "$sys_max" ] || [ -n "$login" ]; then
+        [ "$FORCE_ACCOUNTS" = 1 ] || die "The existing account $name (uid $uid, shell $shell) is not a system account with a nologin shell. Remove it, fix it (usermod --shell $nologin) or pass --force-accounts to use it anyway."
+        warn "Using the existing account $name (uid $uid, shell $shell) because of --force-accounts"
     fi
 }
 

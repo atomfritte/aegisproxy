@@ -1,6 +1,10 @@
 # Live integration tests. "public-endpoints" needs no credentials: it checks the clients against the public
 # Entra ID, Defender for Endpoint and Datadog endpoints so API changes surface within a week. "microsoft" runs
 # against real tenants through a staging installation (credentials from the "staging" environment).
+# The staging secrets are only for the default branch: the job runs only there (a manual run on another
+# branch is skipped), and the "staging" environment must additionally be restricted to the default branch
+# (Settings -> Environments -> staging -> Deployment branches and tags: "Selected branches", default branch
+# only; ideally with required reviewers), so a modified workflow on another branch cannot read the secrets.
 name: live-integration
 on:
   workflow_dispatch:
@@ -16,17 +20,21 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - name: Entra ID discovery/JWKS/token errors, Defender API, Datadog intake (no credentials)
         run: go -C control-plane test -tags live -count=1 -run Live -v ./internal/oidc ./internal/defender ./internal/export
 
   microsoft:
+    # Scheduled runs always use the default branch; manual runs only from it.
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     environment: staging
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with: { python-version: "3.12" }
       - name: Defender for Endpoint and Sentinel (live)

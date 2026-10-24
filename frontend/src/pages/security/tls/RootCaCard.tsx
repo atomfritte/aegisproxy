@@ -45,7 +45,7 @@ export const RootCaCard: React.FC = () => {
   const { data: ca, error, loading } = useAsync(() => api.public.caInfo(), []);
   const [showPem, setShowPem] = useState(false);
   const base = publicBaseUrl(ca?.public_url);
-  const cmds = installCommands(base);
+  const cmds = installCommands(base, ca);
   const subject = ca ? parseDN(ca.subject) : {};
   const selfSigned = ca && ca.subject === ca.issuer;
 
@@ -122,7 +122,7 @@ export const RootCaCard: React.FC = () => {
               <div>
                 <div className="text-[13px] font-semibold text-fg">Install on servers</div>
                 <p className="mt-0.5 text-[12.5px] leading-5 text-fg-muted">
-                  The installers verify the fingerprint above before adding the CA to the system trust store.
+                  Each command checks the installer against its SHA-256 before running it; the installer then verifies the fingerprint above before adding the CA to the system trust store.
                 </p>
               </div>
               <CodeBlock title="Linux (run as root)" code={cmds.linux} wrap />

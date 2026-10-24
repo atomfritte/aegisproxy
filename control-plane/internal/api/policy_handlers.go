@@ -685,9 +685,9 @@ func (s *Server) onboarding(srv models.Server, token string) map[string]string {
 	noProxy := []string{"localhost", "127.0.0.1", "::1"}
 	noProxy = append(noProxy, s.cfg.InternalSuffix...)
 	np := strings.Join(noProxy, ",")
-	pub := s.cfg.PublicURL
-	linux := fmt.Sprintf(`# 1. Trust the AegisProxy root CA (verifies the pinned fingerprint)
-curl -fsSL %[1]s/api/public/ca/install-linux.sh | sudo bash
+	ca := s.caInstallCommands()
+	linux := fmt.Sprintf(`# 1. Trust the AegisProxy root CA (the installer runs only if its SHA-256 matches; it verifies the pinned CA fingerprint)
+%[1]s
 
 # 2. Route outbound HTTP(S) through the proxy (root-only file, loaded by login shells and systemd units via EnvironmentFile)
 sudo install -m 0600 /dev/null /etc/aegis-proxy.env
@@ -706,10 +706,10 @@ printf 'proxy=http://%[4]s\nproxy_username=%[5]s\nproxy_password=%[6]s\n' | sudo
 
 # 4. Verify (expect 403 + block page text for a non-whitelisted host)
 set -a; . /etc/aegis-proxy.env; set +a; curl -sS -o /dev/null -w '%%{http_code}\n' https://example.org/
-`, pub, proxy, np, s.cfg.ProxyAddress, srv.ProxyAuthUser, token)
+`, ca.Linux, proxy, np, s.cfg.ProxyAddress, srv.ProxyAuthUser, token)
 	windows := fmt.Sprintf(`# Run in an elevated PowerShell
-# 1. Trust the AegisProxy root CA
-iwr -UseBasicParsing %[1]s/api/public/ca/install-windows.ps1 | iex
+# 1. Trust the AegisProxy root CA (the installer runs only if its SHA-256 matches)
+%[1]s
 
 # 2. Machine-wide proxy for tools that honour environment variables (curl, git, pip, PowerShell 7)
 [Environment]::SetEnvironmentVariable('HTTPS_PROXY', '%[2]s', 'Machine')
@@ -722,7 +722,7 @@ netsh winhttp set proxy proxy-server="%[4]s" bypass-list="<local>"
 
 # 4. Verify
 curl.exe -sS -o NUL -w "%%{http_code}" https://example.org/
-`, pub, proxy, np, s.cfg.ProxyAddress, firstNonEmptyStr(srv.IP, "<server IP>"))
+`, ca.Windows, proxy, np, s.cfg.ProxyAddress, firstNonEmptyStr(srv.IP, "<server IP>"))
 	return map[string]string{"linux": linux, "windows": windows, "proxy_url": proxy, "no_proxy": np, "proxy_address": s.cfg.ProxyAddress}
 }
 

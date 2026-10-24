@@ -4,10 +4,10 @@ The repository root contains a hardened `docker-compose.yml`:
 
 | Service | Image | Notes |
 |---|---|---|
-| `ca-init` | `aegisproxy/control-plane` | One-shot: creates the root CA in the `aegis-ca` volume (`gen-ca`). |
-| `control-plane` | `aegisproxy/control-plane` | API + bundled console, file storage in `aegis-data`, CA mounted read-only. |
+| `ca-init` | `aegisproxy/control-plane` | One-shot: creates the root CA in the `aegis-ca` volume (key + certificate) and copies the certificate alone to `aegis-ca-public` (`gen-ca /certs /public`). |
+| `control-plane` | `aegisproxy/control-plane` | API + bundled console, file storage in `aegis-data`, only the public CA certificate (`aegis-ca-public`, read-only); the CA key is mounted into the data-plane only. |
 | `data-plane` | `aegisproxy/data-plane` | mitmproxy worker, port 8080, waits for a healthy control-plane. |
-| `clamav` | `clamav/clamav:1.5` | Antivirus, signatures in `clamav-db`. |
+| `clamav` | `clamav/clamav:1.5` (pinned by digest) | Antivirus, signatures in `clamav-db`. |
 
 All AegisProxy containers run as non-root (UID 65532), with a read-only root filesystem, all Linux
 capabilities dropped and `no-new-privileges`.
@@ -15,7 +15,7 @@ capabilities dropped and `no-new-privileges`.
 ## Installation
 
 ```bash
-cp .env.example .env
+install -m 600 .env.example .env          # holds every secret: owner read/write only
 ./scripts/gen-secrets.sh >> .env          # AEGIS_JWT_SECRET, AEGIS_DATAPLANE_KEY, AEGIS_DB_PASSWORD
 $EDITOR .env                              # AEGIS_PUBLIC_URL, bind addresses, optional admin password
 docker compose up -d --build
@@ -43,8 +43,14 @@ proxy (see `deploy/nginx/aegis-console.conf`), then set:
 
 ```
 AEGIS_PUBLIC_URL=https://aegis.corp.example
-AEGIS_TRUSTED_PROXIES=172.16.0.0/12      # address of the reverse proxy as seen by the container
+AEGIS_TRUSTED_PROXIES=172.18.0.1/32      # exact address of the reverse proxy as seen by the container
 ```
+
+A reverse proxy on the Docker host reaches the published port from the gateway of the compose network
+(`docker network inspect aegisproxy_default --format '{{(index .IPAM.Config 0).Gateway}}'`). Trust exactly
+that address, never a whole private range such as `172.16.0.0/12`: every container and host inside a trusted
+range could otherwise set `X-Forwarded-For` and choose the client address used for login rate limits,
+CIDR-bound service accounts and the audit trail. Without a reverse proxy leave it empty.
 
 Alternatively mount a certificate and set `AEGIS_TLS_CERT_FILE`/`AEGIS_TLS_KEY_FILE`.
 

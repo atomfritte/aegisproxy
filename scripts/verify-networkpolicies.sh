@@ -52,5 +52,15 @@ if has_svc pg-rw; then check "data-plane -> PostgreSQL 5432" blocked py "$(svc p
 check "data-plane -> cloud metadata 169.254.169.254:80" blocked py 169.254.169.254 80
 check "data-plane -> internet example.com:443" open py example.com 443
 
+# ClamAV: DNS and public HTTPS (signature updates) only.
+CV=$($K -n "$NS" get pods -l app.kubernetes.io/component=clamav -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$CV" ]; then
+    cv_nc() { $K -n "$NS" exec "$CV" -- nc -z -w 4 "$1" "$2"; }
+    check "ClamAV -> control-plane 8081" blocked cv_nc "$(svc control-plane)" 8081
+    check "ClamAV -> cloud metadata 169.254.169.254:80" blocked cv_nc 169.254.169.254 80
+    check "ClamAV -> internet example.com:80" blocked cv_nc example.com 80
+    check "ClamAV -> signature mirror database.clamav.net:443" open cv_nc database.clamav.net 443
+fi
+
 echo; echo "$pass/$((pass + fail)) checks as intended"
 [ "$fail" -eq 0 ]

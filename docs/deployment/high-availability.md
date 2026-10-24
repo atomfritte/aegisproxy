@@ -28,8 +28,8 @@ console (nginx) :8082 ────────┘                               
 
 ```bash
 cd deploy/compose/ha
-cp ../../../.env.example .env && ../../../scripts/gen-secrets.sh >> .env
-docker compose up -d --build
+install -m 600 ../../../.env.example .env && ../../../scripts/gen-secrets.sh >> .env
+docker compose up -d --build   # trusts X-Forwarded-For only from the lb and console containers (AEGIS_TRUSTED_PROXY_HOSTS)
 open http://127.0.0.1:8081          # console via load balancer
 open http://127.0.0.1:8082          # separately hosted console
 open http://127.0.0.1:8404/stats    # HAProxy statistics

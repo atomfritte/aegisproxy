@@ -70,7 +70,10 @@ type Config struct {
 
 	CORSOrigins    []string
 	TrustedProxies []netip.Prefix
-	InternalSuffix []string
+	// TrustedProxyHosts are DNS names (e.g. a headless Service of the console pods) whose current
+	// addresses are trusted like TrustedProxies.
+	TrustedProxyHosts []string
+	InternalSuffix    []string
 
 	MetricsToken string
 
@@ -258,6 +261,13 @@ func Load() (*Config, error) {
 		}
 		c.TrustedProxies = append(c.TrustedProxies, p.Masked())
 	}
+	for _, h := range splitList(env("AEGIS_TRUSTED_PROXY_HOSTS", "")) {
+		h = strings.ToLower(strings.TrimSuffix(h, "."))
+		if !validProxyHost(h) {
+			return nil, fmt.Errorf("AEGIS_TRUSTED_PROXY_HOSTS: invalid host name %q", h)
+		}
+		c.TrustedProxyHosts = append(c.TrustedProxyHosts, h)
+	}
 	for i, s := range c.InternalSuffix {
 		s = strings.ToLower(s)
 		if !strings.HasPrefix(s, ".") {
@@ -365,6 +375,22 @@ func Load() (*Config, error) {
 	c.ExportDir = env("AEGIS_EXPORT_DIR", filepath.Join(c.DataDir, "export"))
 	c.ExportSpoolDir = env("AEGIS_EXPORT_SPOOL_DIR", filepath.Join(c.DataDir, "export-spool"))
 	return c, nil
+}
+
+// validProxyHost accepts DNS host names (letters, digits, hyphens, dots), no addresses or ports.
+func validProxyHost(h string) bool {
+	if h == "" || len(h) > 253 || strings.HasPrefix(h, ".") || strings.Contains(h, "..") {
+		return false
+	}
+	if _, err := netip.ParseAddr(h); err == nil {
+		return false
+	}
+	for _, r := range h {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // isKnownLeakedSecret rejects the hard-coded defaults shipped by earlier releases.

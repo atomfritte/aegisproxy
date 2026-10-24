@@ -547,8 +547,10 @@ func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult,
  Policy Verdict  : %s — %s
 --------------------------------------------------------------------------------
 %s
- 🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER:
-    curl -fsSL %s/api/public/ca/install-linux.sh | sudo bash
+ 🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER (compare the installer's SHA-256 with
+    the AegisProxy console, TLS & CA, before running it):
+    curl -fsSLo aegis-ca-install.sh %s/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
+    sudo bash aegis-ca-install.sh
 ================================================================================`,
 		res.ServerHostname, serverIP, strings.Join(res.GroupIDs, ", "), method, fullURL, traceID,
 		res.Verdict, reason, selfService, publicURL)
