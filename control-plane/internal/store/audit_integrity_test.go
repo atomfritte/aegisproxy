@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -308,6 +309,9 @@ func TestAuditVerificationAnchorsStartAndHead(t *testing.T) {
 // Finding 4: a renamed-away live file (logrotate dateext + nocreate) must not shrink the export to
 // the in-memory window.
 func TestAuditExportWithoutLiveFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot remove the open audit log (sharing violation), so the live file cannot vanish while the sink runs")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
 	st, _ := openAuditStore(t, dir, path)
