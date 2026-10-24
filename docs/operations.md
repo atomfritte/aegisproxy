@@ -60,6 +60,30 @@ cloud-init).
 Docker/containerd and Kubernetes nodes need the proxy in their service environment (`systemctl edit docker`
 → `Environment=HTTPS_PROXY=…`) and the CA in the host trust store.
 
+## Proxy credentials on the wire
+
+Proxy tokens travel in the `Proxy-Authorization` header (Basic, `<hostname>:<token>`). On a plain
+`http://proxy:8080` listener that header is **clear text on the client → proxy hop**: anyone who can capture
+traffic on that segment can copy a server's token and use it from any address. HTTPS destinations are still
+tunnelled with TLS end to end, but the `CONNECT` request and its credentials are not. Protect the hop with one of:
+
+| Option | Protects | Notes |
+|---|---|---|
+| IPsec or WireGuard between servers and the data-plane | everything on the hop | Recommended for servers outside a trusted segment. The proxy sees the tunnel address, so register servers by token or by their tunnel address. |
+| TLS to the proxy ("secure web proxy", `https://` proxy URL) | the proxy request, `CONNECT` and credentials | Supported by the data-plane image (mitmproxy 12.3): the regular listener detects a TLS handshake and serves the proxy over TLS with a certificate issued by the AegisProxy CA for the name the client connects to. Clients must trust the AegisProxy CA for the proxy itself, e.g. `curl --proxy https://proxy.corp.example:8080 --proxy-cacert aegis-ca.pem`, `HTTPS_PROXY=https://…` for tools that support TLS proxies. The same port keeps accepting plain-text clients, so this protects only clients configured for it. |
+| Dedicated network segment / VLAN for proxy traffic | traffic outside the segment | Limits who can capture the hop; does not protect against hosts on the same segment. |
+
+A token alone does not identify a server forever: rotate it (console → server → *Rotate token*) if it may have
+been exposed. Groups with **Require proxy token** never fall back to address-based identification, which matters
+behind NAT or shared addresses ([policy-management.md](policy-management.md#proxy-tokens-and-shared-addresses)).
+
+Behaviour of the data-plane for credentials:
+
+- An invalid token, a malformed `Proxy-Authorization` header or a hostname used from an address it is not bound
+  to is refused with **HTTP 407** and the verdict `AUTH_FAILED` (security event "Proxy authentication"). The
+  request is never evaluated as the anonymous source address.
+- A member of a *Require proxy token* group that sends no token, or only its hostname, gets 407 as well.
+
 ## Access requests
 
 Blocked requests show a block page (browsers) or a CLI message with a one-liner — branded per group, see
@@ -272,6 +296,18 @@ on the local network, threat intelligence on, YARA/ICAP/ClamAV off:
   session first (`POST /api/sessions/{id}/stop`). Stopping a session that already ended is refused as well.
 - Linux package: the logrotate rule for `audit.jsonl` changed from `copytruncate` to rename-based rotation
   (re-run `install-linux.sh` or copy `deploy/systemd/aegis.logrotate`).
+- **Path patterns** (schema version 4): `*` now matches one path segment and `**` any depth. The first start
+  rewrites stored patterns that ended in `*` to `**` so they keep their meaning, and writes the audit event
+  `POLICY_PATH_PATTERNS_MIGRATED` (patterns with a `*` in the middle are listed for review). Imported bundles
+  without `path_syntax: 2` are rewritten the same way. See
+  [policy-management.md](policy-management.md#path-patterns).
+- **Proxy credentials**: wrong or malformed proxy credentials now get HTTP 407 (`AUTH_FAILED`) instead of being
+  treated as the anonymous source address — fix stale tokens in client configurations before upgrading
+  (the traffic log shows them as `AUTH_FAILED` afterwards). New group setting `require_proxy_token`.
+- **Shared addresses**: redirect grants and learning sessions are bound to the server identity, not to its IP
+  address; servers behind the same NAT address no longer share them. Strict-isolation groups get neither.
+- Upgrade the control-plane and the data-plane workers **together** for these changes: an older worker does not
+  know `AUTH_FAILED`, `require_proxy_token` or the new path semantics.
 
 ### Upgrading from 1.x
 

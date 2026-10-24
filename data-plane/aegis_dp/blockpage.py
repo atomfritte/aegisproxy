@@ -10,7 +10,7 @@ import shlex
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .policy import VERDICT_POLICY, SECURITY_VERDICTS
+from .policy import VERDICT_AUTH_FAILED, VERDICT_POLICY, SECURITY_VERDICTS
 
 CLI_USER_AGENTS = ("curl/", "wget/", "git/", "apt-http/", "pip/", "python-requests/", "python-urllib/", "go-http-client/",
                    "containerd/", "docker/", "helm/", "npm/", "yarn/", "maven/", "gradle/", "powershell", "winhttp", "libwww-perl")
@@ -36,15 +36,28 @@ def _csp(nonce: str, public_url: str) -> str:
 
 
 def self_service_allowed(verdict: str) -> bool:
-    """Threat-protection blocks (malware, C2, DLP...) are not eligible for self-service whitelisting."""
+    """Threat-protection blocks (malware, C2, DLP...) and failed proxy authentication are not eligible for
+    self-service whitelisting."""
     return verdict not in SECURITY_VERDICTS or verdict == VERDICT_POLICY
+
+
+AUTH_FAILED_HELP = (
+    "The proxy credentials sent by this client (Proxy-Authorization) are not valid: the token is unknown, was\n"
+    "    rotated or is mistyped, the username does not belong to it, or this server's group requires the proxy\n"
+    "    token. The request was not attributed to the source address. Set the proxy URL of this server to\n"
+    "    http://<proxy-user>:<proxy-token>@<proxy-host>:<port> with the token shown when the server was onboarded\n"
+    "    (console: Servers -> server -> Rotate token issues a new one), or remove the credentials if this server\n"
+    "    is identified by its address."
+)
 
 
 def render_cli(ctx: Dict[str, str], groups: List[str]) -> str:
     public = ctx["public_url"]
     payload = json.dumps({"block_token": ctx["block_token"], "requester": f"root@{_clean(ctx['server_hostname'])}",
                           "reason": "ENTER_REASON_HERE", "requested_scope": "prefix_with_objects", "duration": "24h"})
-    if self_service_allowed(ctx["verdict"]):
+    if ctx["verdict"] == VERDICT_AUTH_FAILED:
+        action = f" 🔑 {AUTH_FAILED_HELP}\n"
+    elif self_service_allowed(ctx["verdict"]):
         action = (
             " 🚀 1. REQUEST ACCESS IN BROWSER (Self-Service Block Portal):\n"
             f"    {ctx['dashboard_url']}/?portal=block&bt={urllib.parse.quote(ctx['block_token'])}\n\n"
@@ -104,7 +117,10 @@ def render_html(ctx: Dict[str, str], groups: List[str]) -> Tuple[str, str]:
     e = {k: html.escape(_clean(str(v))) for k, v in ctx.items()}
     data = json.dumps({"endpoint": ctx["public_url"] + "/api/public/requests", "block_token": ctx["block_token"]}).replace("<", "\\u003c")
     portal = html.escape(f"{ctx['dashboard_url']}/?portal=block&bt={urllib.parse.quote(ctx['block_token'])}")
-    if self_service_allowed(ctx["verdict"]):
+    if ctx["verdict"] == VERDICT_AUTH_FAILED:
+        form = f"<p><strong>Proxy authentication failed.</strong> {html.escape(' '.join(AUTH_FAILED_HELP.split()))}</p>"
+        script = ""
+    elif self_service_allowed(ctx["verdict"]):
         form = f"""
       <form id="rq">
         <label class="f" for="requester">Your name / email / change ticket</label>
@@ -141,7 +157,7 @@ duration:document.getElementById('duration').value,reason:document.getElementByI
 <meta name="robots" content="noindex"><title>Blocked by AegisProxy</title><style nonce="{nonce}">{_STYLE}</style></head>
 <body><div class="c"><div class="card">
 <span class="badge">🛡️ AEGISPROXY • HTTP {e['status']} {e['verdict']}</span>
-<h1>Outbound access blocked by policy</h1>
+<h1>{'Proxy authentication failed' if ctx['verdict'] == VERDICT_AUTH_FAILED else 'Outbound access blocked by policy'}</h1>
 <p>{e['reason']}</p>
 <div class="grid">
 <div><label>Server</label><span>{e['server_hostname']} ({e['server_ip']})</span></div>
@@ -226,6 +242,8 @@ def fill(shell: str, values: Dict[str, str], html_mode: bool) -> str:
 def render_branded(block_pages: Dict[str, Any], ctx: Dict[str, str], groups: List[str], accept_language: str,
                    cli: bool) -> Optional[Tuple[str, str]]:
     """Returns (body, csp) from the bundle's template shells, or None to use the built-in page."""
+    if ctx["verdict"] == VERDICT_AUTH_FAILED:
+        return None  # templates explain blocks; a 407 needs the built-in credentials help
     tpl = select_template(block_pages or {}, groups)
     if not tpl:
         return None

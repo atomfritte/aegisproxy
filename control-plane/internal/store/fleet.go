@@ -166,6 +166,9 @@ func (s *Store) UpsertGroup(g models.ServerGroup, actor *auth.TokenClaims) (mode
 		cidrs = append(cidrs, p.Masked().String())
 	}
 	g.CIDRs = cidrs
+	if g.RequireProxyToken && len(g.CIDRs) > 0 {
+		return models.ServerGroup{}, errors.New("a group that requires a proxy token cannot have CIDRs: CIDR membership identifies sources by address only")
+	}
 	if g.ServerCount < 0 {
 		g.ServerCount = 0
 	}
@@ -192,7 +195,8 @@ func (s *Store) UpsertGroup(g models.ServerGroup, actor *auth.TokenClaims) (mode
 		s.appendAuditLocked(models.AuditEvent{
 			Actor: actor.Username, ActorRole: string(actor.Role), Action: action, Category: "FLEET",
 			EntityType: "server_group", EntityID: g.ID, EntityName: g.Name,
-			Summary: fmt.Sprintf("%s server group %s (CIDRs %v, strict isolation=%v%s)", strings.ToLower(strings.TrimPrefix(action, "GROUP_")), g.ID, g.CIDRs, g.StrictIsolation, selector),
+			Summary: fmt.Sprintf("%s server group %s (CIDRs %v, strict isolation=%v, require proxy token=%v%s)", strings.ToLower(strings.TrimPrefix(action, "GROUP_")),
+				g.ID, g.CIDRs, g.StrictIsolation, g.RequireProxyToken, selector),
 		})
 		s.saveLocked()
 		return nil

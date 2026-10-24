@@ -14,6 +14,7 @@ const VERDICTS: Record<string, { label: string; tone: Tone }> = {
   DLP_BLOCKED: { label: 'DLP blocked', tone: 'danger' },
   FILETYPE_BLOCKED: { label: 'File type blocked', tone: 'danger' },
   QUARANTINED: { label: 'Quarantined', tone: 'danger' },
+  AUTH_FAILED: { label: 'Proxy auth failed', tone: 'danger' },
   SIMULATED: { label: 'Simulated', tone: 'neutral' },
 };
 

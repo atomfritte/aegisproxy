@@ -10,7 +10,11 @@ import (
 	"aegisproxy/control-plane/internal/models"
 )
 
-const PolicyBundleFormat = "aegisproxy.policy-sets/v1"
+const (
+	PolicyBundleFormat = "aegisproxy.policy-sets/v1"
+	// PolicyPathSyntax is the path pattern syntax of exported bundles (see models.PolicySetBundle.PathSyntax).
+	PolicyPathSyntax = 2
+)
 
 // ExportPolicySets returns the published content of the selected sets (all when ids is empty),
 // without hit counters. Approvals sets are included for reference but skipped on import.
@@ -21,7 +25,8 @@ func (s *Store) ExportPolicySets(ids []string, actor *auth.TokenClaims) models.P
 	for _, id := range ids {
 		want[id] = true
 	}
-	b := models.PolicySetBundle{Format: PolicyBundleFormat, ExportedAt: time.Now().UTC(), ExportedBy: actor.Username, PolicySets: []models.PolicySetDocument{}}
+	b := models.PolicySetBundle{Format: PolicyBundleFormat, PathSyntax: PolicyPathSyntax, ExportedAt: time.Now().UTC(), ExportedBy: actor.Username,
+		PolicySets: []models.PolicySetDocument{}}
 	for _, set := range s.state.PolicySets {
 		if len(want) > 0 && !want[set.ID] {
 			continue
@@ -111,6 +116,13 @@ func (s *Store) ImportPolicySets(bundle models.PolicySetBundle, dryRun bool, act
 	if len(bundle.PolicySets) == 0 || len(bundle.PolicySets) > 200 {
 		return nil, errors.New("the bundle must contain between 1 and 200 policy sets")
 	}
+	if bundle.PathSyntax > PolicyPathSyntax {
+		return nil, fmt.Errorf("unsupported path_syntax %d (expected at most %d)", bundle.PathSyntax, PolicyPathSyntax)
+	}
+	legacyPaths := 0
+	if bundle.PathSyntax < PolicyPathSyntax {
+		legacyPaths = migrateLegacyBundle(&bundle) // exported before 2.1: keep the meaning of "/*" and "x*"
+	}
 	if actor.Role == models.RoleAuditorOperator {
 		return nil, errors.New("RBAC Policy: read-only role")
 	}
@@ -156,7 +168,8 @@ func (s *Store) ImportPolicySets(bundle models.PolicySetBundle, dryRun bool, act
 		s.appendAuditLocked(models.AuditEvent{
 			Actor: actor.Username, ActorRole: string(actor.Role), Action: "POLICY_SETS_IMPORTED", Category: "POLICY",
 			EntityType: "policy_set", EntityID: "import", EntityName: fmt.Sprintf("%d sets", len(steps)),
-			Summary: fmt.Sprintf("Imported %d policy sets as drafts (%s)", len(steps), bundle.Format),
+			Summary: fmt.Sprintf("Imported %d policy sets as drafts (%s, path syntax %d; %d legacy path patterns rewritten)", len(steps), bundle.Format,
+				max(bundle.PathSyntax, 1), legacyPaths),
 		})
 		s.markDirtyLocked()
 		return nil

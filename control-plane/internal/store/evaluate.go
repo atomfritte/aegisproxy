@@ -12,58 +12,93 @@ import (
 	"aegisproxy/control-plane/internal/netguard"
 )
 
-// ResolveServer identifies the calling server by proxy token, (IP-bound) proxy username,
-// registered IP or group CIDR — in that order. Unknown sources get no group membership.
-func (s *Store) ResolveServer(ip, proxyAuthUser string) (string, string, []string) {
+// ServerIdentity is the resolved requester of a proxy request.
+type ServerIdentity struct {
+	ID       string
+	Hostname string
+	GroupIDs []string
+	// Method is how the server was identified: "token", "username" (bare proxy username bound to the server's IP
+	// or subnet), "ip", "cidr" or "" (unregistered source).
+	Method string
+	// AuthError is set when proxy credentials were presented but identify no server: "invalid_proxy_token", or
+	// "proxy_token_required" (a bare username for a member of a group with require_proxy_token). The request is
+	// refused (AUTH_FAILED, HTTP 407); it never falls back to the source address.
+	AuthError string
+}
+
+func identified(srv models.Server, method string) ServerIdentity {
+	return ServerIdentity{ID: srv.ID, Hostname: srv.Hostname, GroupIDs: append([]string(nil), srv.GroupIDs...), Method: method}
+}
+
+func unregistered(cleanIP, authErr string) ServerIdentity {
+	return ServerIdentity{ID: engine.UnregisteredPrefix + cleanIP, Hostname: "unregistered-" + cleanIP, GroupIDs: []string{}, AuthError: authErr}
+}
+
+func tokenRequired(idx *engine.CompiledPolicyIndex, srv models.Server) bool {
+	return slices.ContainsFunc(srv.GroupIDs, func(g string) bool { return idx.TokenGroups[g] })
+}
+
+// Identify resolves the calling server. Presented credentials decide alone: a proxy token ("username:token" or a
+// bare token) or a bare proxy username bound to the server's IP/subnet; anything else is an authentication
+// failure. Without credentials the source address identifies the server it is registered for (only when exactly
+// one server has it and none of its groups requires a proxy token), then group CIDRs (except groups requiring a
+// token). Unknown sources get no group membership. Same as Policy.identify in the data-plane.
+func (s *Store) Identify(ip, proxyAuth string) ServerIdentity {
 	s.mu.RLock()
 	idx := s.compiledIdx
 	s.mu.RUnlock()
 
 	cleanIP := strings.TrimPrefix(strings.TrimSpace(ip), "::ffff:")
-	authTrimmed := strings.TrimSpace(proxyAuthUser)
-
-	if idx != nil {
-		if authTrimmed != "" {
-			// 1. "username:token" (Basic auth) or bare bearer token, verified via SHA-256 digest.
-			if user, tok, ok := strings.Cut(authTrimmed, ":"); ok {
-				if srv, found := idx.ServerByToken[engine.HashProxyToken(tok)]; found &&
-					(user == "" || strings.EqualFold(user, srv.ProxyAuthUser)) {
-					return srv.ID, srv.Hostname, append([]string(nil), srv.GroupIDs...)
-				}
-			} else if srv, found := idx.ServerByToken[engine.HashProxyToken(authTrimmed)]; found {
-				return srv.ID, srv.Hostname, append([]string(nil), srv.GroupIDs...)
+	authTrimmed := strings.TrimSpace(proxyAuth)
+	if idx == nil {
+		return unregistered(cleanIP, "")
+	}
+	if authTrimmed != "" {
+		if user, tok, ok := strings.Cut(authTrimmed, ":"); ok {
+			if srv, found := idx.ServerByToken[engine.HashProxyToken(tok)]; found && (user == "" || strings.EqualFold(user, srv.ProxyAuthUser)) {
+				return identified(srv, "token")
 			}
-			// 2. Bare username is only accepted if the source IP matches the server's registered IP or
-			// SubnetCIDR (prevents cross-server Proxy-Authorization spoofing).
-			if !strings.Contains(authTrimmed, ":") {
-				if srv, ok := idx.ServerByAuth[strings.ToLower(authTrimmed)]; ok {
-					if cleanIP == srv.IP || (srv.SubnetCIDR != "" && engine.MatchCIDR(srv.SubnetCIDR, cleanIP)) {
-						return srv.ID, srv.Hostname, append([]string(nil), srv.GroupIDs...)
-					}
-				}
-			}
+			return unregistered(cleanIP, "invalid_proxy_token")
 		}
-
-		if srv, ok := idx.ServerByIP[cleanIP]; ok {
-			return srv.ID, srv.Hostname, append([]string(nil), srv.GroupIDs...)
+		if srv, found := idx.ServerByToken[engine.HashProxyToken(authTrimmed)]; found {
+			return identified(srv, "token")
 		}
-
-		if addr, err := netip.ParseAddr(cleanIP); err == nil {
-			var matchedGroups []string
-			for _, c := range idx.ParsedCIDRs {
-				if c.Prefix.Contains(addr.Unmap()) && !slices.Contains(matchedGroups, c.GroupID) {
-					matchedGroups = append(matchedGroups, c.GroupID)
-				}
+		// A bare username only counts from the server's registered IP or SubnetCIDR (prevents cross-server
+		// Proxy-Authorization spoofing).
+		if srv, found := idx.ServerByAuth[strings.ToLower(authTrimmed)]; found &&
+			(cleanIP == srv.IP || (srv.SubnetCIDR != "" && engine.MatchCIDR(srv.SubnetCIDR, cleanIP))) {
+			if tokenRequired(idx, srv) {
+				return unregistered(cleanIP, "proxy_token_required")
 			}
-			if len(matchedGroups) > 0 {
-				octets := strings.NewReplacer(".", "-", ":", "-").Replace(cleanIP)
-				return "srv-auto-" + octets, "node-" + octets, matchedGroups
-			}
+			return identified(srv, "username")
 		}
+		return unregistered(cleanIP, "invalid_proxy_token")
 	}
 
+	if srv, ok := idx.ServerByIP[cleanIP]; ok && !tokenRequired(idx, srv) {
+		return identified(srv, "ip")
+	}
+	if addr, err := netip.ParseAddr(cleanIP); err == nil {
+		var matchedGroups []string
+		for _, c := range idx.ParsedCIDRs {
+			if c.Prefix.Contains(addr.Unmap()) && !slices.Contains(matchedGroups, c.GroupID) {
+				matchedGroups = append(matchedGroups, c.GroupID)
+			}
+		}
+		if len(matchedGroups) > 0 {
+			octets := strings.NewReplacer(".", "-", ":", "-").Replace(cleanIP)
+			return ServerIdentity{ID: "srv-auto-" + octets, Hostname: "node-" + octets, GroupIDs: matchedGroups, Method: "cidr"}
+		}
+	}
 	// Strict zero-trust default: unregistered sources receive no group membership.
-	return "srv-unregistered-" + cleanIP, "unregistered-" + cleanIP, []string{}
+	return unregistered(cleanIP, "")
+}
+
+// ResolveServer returns ID, host name and groups of Identify (an authentication failure resolves to the
+// unregistered source).
+func (s *Store) ResolveServer(ip, proxyAuth string) (string, string, []string) {
+	id := s.Identify(ip, proxyAuth)
+	return id.ID, id.Hostname, id.GroupIDs
 }
 
 func matchesTLSBypassScope(b models.TLSBypassRule, srvID string, groupIDs []string, strict map[string]bool) bool {
@@ -133,11 +168,18 @@ func blockResult(res engine.EvaluationResult, verdict, reason, name string) engi
 	return res
 }
 
-// Evaluate applies, in order: server quarantine, threat intelligence, destination hygiene (internal/IP-literal/port/
-// punycode), explicit BLOCK guardrails, TLS passthrough, learning sessions, redirect-object grants
-// and ALLOW rules. Anything unmatched is denied. The Python data-plane implements the same order.
+// authFailedMessages explain AUTH_FAILED verdicts (block page / CLI text of the data-plane's 407 response).
+var authFailedMessages = map[string]string{
+	"invalid_proxy_token":  "Proxy authentication failed: the presented proxy credentials match no registered server (unknown, rotated or mistyped token)",
+	"proxy_token_required": "Proxy authentication failed: this server's group requires its proxy token (a proxy username alone is not accepted)",
+}
+
+// Evaluate applies, in order: proxy authentication, server quarantine, threat intelligence, destination hygiene
+// (internal/IP-literal/port/punycode), explicit BLOCK guardrails, TLS passthrough, learning sessions, redirect-object
+// grants and ALLOW rules. Anything unmatched is denied. The Python data-plane implements the same order.
 func (s *Store) Evaluate(req engine.EvaluationRequest) engine.EvaluationResult {
-	srvID, srvHost, groupIDs := s.ResolveServer(req.ServerIP, req.ProxyAuthUser)
+	ident := s.Identify(req.ServerIP, req.ProxyAuthUser)
+	srvID, srvHost, groupIDs := ident.ID, ident.Hostname, ident.GroupIDs
 	host := engine.NormalizeHost(req.Host)
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
@@ -151,6 +193,9 @@ func (s *Store) Evaluate(req engine.EvaluationRequest) engine.EvaluationResult {
 		GroupIDs:       groupIDs,
 		SuggestedHost:  host,
 		SuggestedPath:  "/**",
+	}
+	if ident.AuthError != "" {
+		return blockResult(res, models.VerdictAuthFailed, ident.AuthError, authFailedMessages[ident.AuthError])
 	}
 
 	s.mu.RLock()
@@ -257,15 +302,17 @@ func (s *Store) Evaluate(req engine.EvaluationRequest) engine.EvaluationResult {
 
 	ipLiteralNeedsExplicit := isIPLiteral && policy.BlockIPLiterals
 	implicitAllowOK := !internalDest && !ipLiteralNeedsExplicit
+	// Temporary grants (learning sessions, redirect objects) never open anything for strict-isolation tiers.
+	strict := slices.ContainsFunc(groupIDs, func(g string) bool { return idx.StrictGroups[g] })
 
-	// 5. Active learning session (strictly scoped to the reference server; never opens internal or
-	// IP-literal destinations).
+	// 5. Active learning session, bound to the resolved server identity (the source address only counts where
+	// Identify accepted it: no credentials and registered for exactly this server). Never opens internal or
+	// IP-literal destinations.
 	if implicitAllowOK {
 		for _, sess := range sessions {
-			if sess.Status == "active" && now.Before(sess.ExpiresAt) &&
-				(sess.ServerID == srvID || sess.ServerIP == strings.TrimPrefix(req.ServerIP, "::ffff:")) {
+			if sess.Status == "active" && now.Before(sess.ExpiresAt) && sess.ServerID == srvID {
 				res.SessionID = sess.ID
-				if sess.Mode == "record_and_allow" {
+				if sess.Mode == "record_and_allow" && !strict {
 					res.Allowed = true
 					res.Verdict = models.VerdictLearningAllowed
 					res.MatchedRuleID = sess.ID
@@ -276,8 +323,8 @@ func (s *Store) Evaluate(req engine.EvaluationRequest) engine.EvaluationResult {
 			}
 		}
 
-		// 6. Ephemeral 302 redirect object grant (GET/HEAD/CONNECT only, single hop).
-		if grant, ok := s.engine.CheckRedirectGrant(req.ServerIP, host, cleanPath, method); ok {
+		// 6. Ephemeral 302 redirect object grant of this server (GET/HEAD/CONNECT only, single hop).
+		if grant, ok := s.engine.CheckRedirectGrant(srvID, host, cleanPath, method); ok && !strict {
 			res.Allowed = true
 			res.Verdict = models.VerdictRedirectObject
 			res.MatchedRuleID = grant.RuleID

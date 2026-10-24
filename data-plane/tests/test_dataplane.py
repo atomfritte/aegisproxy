@@ -92,6 +92,58 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(canonicalize_path(v["in"]), (v["out"], v["ok"]), repr(v["in"]))
         self.assertFalse(canonicalize_path("/a\udcffb")[1], "undecodable path bytes (surrogateescape)")
 
+    def test_path_vectors_shared_with_control_plane(self):
+        # The same file drives engine.MatchPath / engine.LegacyPathPattern tests in the control-plane.
+        with open(os.path.join(os.path.dirname(VECTORS), "path_vectors.json"), encoding="utf-8") as fh:
+            vectors = json.load(fh)
+        self.assertTrue(vectors["match"])
+        for v in vectors["match"]:
+            self.assertEqual(match_path(v["pattern"], v["path"]), v["match"], f'{v["pattern"]!r} vs {v["path"]!r}')
+        for v in vectors["legacy"]:  # rewritten legacy patterns keep their meaning in this matcher too
+            for path, matched in v["old"]:
+                self.assertEqual(match_path(v["out"], path), matched, f'{v["out"]!r} vs {path!r}')
+        # linear time: a hostile path against a wildcard-heavy pattern
+        start = time.monotonic()
+        self.assertFalse(match_path("/" + "*a" * 40 + "/x", "/" + "a" * 8000))
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_identity_vectors_shared_with_control_plane(self):
+        # The same file drives store.Identify/Evaluate tests in the control-plane (NAT separation, temporary
+        # grants bound to the server identity, proxy token enforcement).
+        with open(os.path.join(os.path.dirname(VECTORS), "identity_vectors.json"), encoding="utf-8") as fh:
+            v = json.load(fh)
+        servers = [{**{k: x for k, x in s.items() if k != "token"}, "proxy_auth_token_hash": hash_token(s["token"])} for s in v["servers"]]
+        rules = [{**r, "enabled": True} for r in v["rules"]]
+        sessions = [{**s, "status": "active", "expires_at": FUTURE} for s in v["sessions"]]
+        p = Policy({**BUNDLE, "groups": v["groups"], "servers": servers, "rules": rules, "sessions": sessions, "tls_bypass": []})
+        grants = RedirectGrants()
+        for g in v["grants"]:
+            self.assertTrue(grants.register(g["server_id"], g["location"], g["parent_url"], g["rule_id"], g["rule_name"]))
+        self.assertTrue(v["cases"])
+        for c in v["cases"]:
+            res = p.evaluate(c["ip"], c["auth"], c["method"], c["host"], 443, c["path"], f'https://{c["host"]}{c["path"]}', self.t, grants)
+            self.assertEqual((res.verdict, res.server_id), (c["verdict"], c["server_id"]), c["name"])
+            if "block_reason" in c:
+                self.assertEqual(res.block_reason, c["block_reason"], c["name"])
+            self.assertEqual(res.allowed, c["verdict"] in ("ALLOWED", "LEARNING_ALLOWED", "REDIRECT_OBJECT_ALLOWED"), c["name"])
+
+    def test_auth_failed_block_page(self):
+        from aegis_dp.blockpage import render_branded, render_cli, render_html
+        res = self.ev("github.com", auth="svc-ci-1:wrong")
+        self.assertEqual((res.verdict, res.block_reason, res.group_ids), ("AUTH_FAILED", "invalid_proxy_token", []))
+        ctx = {"status": "407", "verdict": res.verdict, "reason": res.matched_rule_name, "server_hostname": res.server_hostname,
+               "server_ip": "10.1.0.5", "method": "GET", "url": "https://github.com/", "trace_id": "t", "block_token": "bt",
+               "public_url": "https://aegis.example", "dashboard_url": "https://aegis.example", "suggested": "", "suggested_host": ""}
+        cli = render_cli(ctx, [])
+        self.assertIn("HTTP 407", cli)
+        self.assertIn("Rotate token", cli)
+        self.assertNotIn("api/public/requests", cli)  # no self-service request for a failed authentication
+        page, _ = render_html(ctx, [])
+        self.assertIn("Proxy authentication failed", page)
+        self.assertNotIn('id="rq"', page)
+        tpl = {"default_template_id": "t", "templates": {"t": {"shells": {"en": {"threat_cli": "custom", "request_cli": "custom"}}}}}
+        self.assertIsNone(render_branded(tpl, ctx, [], "", True))
+
     def test_destination_vectors_shared_with_control_plane(self):
         # The same file drives engine.IsInternalAddr / store.alwaysForbiddenAddr tests in the control-plane.
         from aegis_dp.policy import is_forbidden_addr, is_internal_addr, parse_ip
@@ -147,20 +199,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.ev("github.com", method="CONNECT").verdict, VERDICT_ALLOWED)
 
     def test_redirect_grants_and_sessions(self):
-        self.g.register("10.1.0.5", "https://objects.example/asset.tgz", "https://github.com/microsoft/x", "r-gh", "gh")
+        self.g.register("srv-ci-1", "https://objects.example/asset.tgz", "https://github.com/microsoft/x", "r-gh", "gh")
         p = Policy({**BUNDLE, "rules": BUNDLE["rules"][:2]})
         r = p.evaluate("10.1.0.5", "", "GET", "objects.example", 443, "/asset.tgz", "", self.t, self.g)
         self.assertEqual(r.verdict, VERDICT_REDIRECT)
         r = p.evaluate("10.1.0.5", "", "POST", "objects.example", 443, "/asset.tgz", "", self.t, self.g)
         self.assertEqual(r.verdict, VERDICT_BLOCKED)  # grants are read-only
-        self.assertFalse(self.g.register("10.1.0.5", "http://127.0.0.1/x", "https://github.com/", "r", "n"))
+        self.assertFalse(self.g.register("srv-ci-1", "http://127.0.0.1/x", "https://github.com/", "r", "n"))
         # rule.redirect_hosts limits the targets that receive a grant
         limited = Policy({**BUNDLE, "rules": [{**BUNDLE["rules"][0], "redirect_hosts": ["*.cdn.example"]}]})
         hosts = limited.evaluate("10.1.0.5", "", "GET", "github.com", 443, "/microsoft/x", "", self.t, self.g).redirect_hosts
         self.assertEqual(hosts, ["*.cdn.example"])
-        self.assertFalse(self.g.register("10.1.0.5", "https://evil.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
-        self.assertTrue(self.g.register("10.1.0.5", "https://eu.cdn.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
-        self.assertIsNone(self.g.check("10.1.0.5", "evil.example", "/x", "GET"))
+        self.assertFalse(self.g.register("srv-ci-1", "https://evil.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
+        self.assertTrue(self.g.register("srv-ci-1", "https://eu.cdn.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
+        self.assertIsNone(self.g.check("srv-ci-1", "evil.example", "/x", "GET"))
+        self.assertIsNone(self.g.check("10.1.0.5", "eu.cdn.example", "/x", "GET"))  # keyed by server identity, not address
         sess = {**BUNDLE, "rules": [], "sessions": [{"id": "s1", "server_id": "srv-ci-1", "mode": "record_and_allow",
                                                     "status": "active", "expires_at": FUTURE, "name": "rec"}]}
         r = Policy(sess).evaluate("10.1.0.5", "", "GET", "pypi.org", 443, "/simple/", "", self.t, self.g)
@@ -1006,11 +1059,36 @@ class AddonSecurityTest(unittest.TestCase):
         a = self.addon()
         f = self.flow("10.0.1.158", "/secret", headers=[("Proxy-Authorization", "Bearer \udcff"), ("Host", "10.0.1.158")])
         self.call(a, "requestheaders", f)
-        self.assertEqual(f.response.status_code, 403)
-        self.assertEqual(self.records(a)[-1]["block_reason"], "ip_literal")
+        # an unknown token is an authentication failure, never attributed to the source address
+        self.assertEqual(f.response.status_code, 407)
+        self.assertEqual((self.records(a)[-1]["verdict"], self.records(a)[-1]["block_reason"]), ("AUTH_FAILED", "invalid_proxy_token"))
         c = self.flow("10.0.1.158", "", method="CONNECT", headers=[("Proxy-Authorization", "Bearer \udcff")], port=443)
         self.call(a, "http_connect", c)
-        self.assertEqual(c.response.status_code, 403)
+        self.assertEqual(c.response.status_code, 407)
+
+    def test_invalid_proxy_token_is_refused_with_407(self):
+        from aegis_dp.addon import parse_proxy_auth
+        from aegis_dp.policy import MALFORMED_PROXY_AUTH
+        basic = lambda s: "Basic " + base64.b64encode(s.encode()).decode()  # noqa: E731
+        self.assertEqual(parse_proxy_auth(None), "")
+        self.assertEqual(parse_proxy_auth(basic("svc:tok")), "svc:tok")
+        self.assertEqual(parse_proxy_auth(basic("svc:")), "svc")
+        self.assertEqual(parse_proxy_auth("Bearer tok"), "tok")
+        for bad in ("", "Basic", "Basic !!!", basic(":"), "Negotiate abc", "Bearer  "):
+            self.assertEqual(parse_proxy_auth(bad), MALFORMED_PROXY_AUTH, bad)
+        a = self.addon()
+        # srv-1 is registered for 10.1.0.5: a wrong token from that address must not fall back to the address
+        for header in (basic("svc:wrong"), "Basic !!!"):
+            c = self.flow("dl.example", "", method="CONNECT", headers=[("Proxy-Authorization", header)], port=443)
+            self.call(a, "http_connect", c)
+            self.assertEqual(c.response.status_code, 407, header)
+            self.assertEqual(c.response.headers.get("Proxy-Authenticate"), 'Basic realm="AegisProxy"')
+            self.assertEqual(c.response.headers.get("X-Aegis-Verdict"), "AUTH_FAILED")
+            self.assertIn(b"Proxy authentication failed", c.response.raw_content)
+            self.assertEqual(self.records(a)[-1]["server_id"], "srv-unregistered-10.1.0.5")
+        f = self.flow("dl.example", "/x", headers=[("Host", "dl.example")])  # no credentials: the address identifies srv-1
+        self.call(a, "requestheaders", f)
+        self.assertIsNone(f.response)
 
     def test_c1_undecodable_host_header(self):
         a = self.addon()
@@ -1601,7 +1679,8 @@ class AddonSecurityTest(unittest.TestCase):
             f = self.flow("dl.example", headers=[("Host", "dl.example")])
             self.exchange(a, f, [("Location", loc)], b"", status=302)
             host = loc.split("/")[2]
-            self.assertEqual(a.grants.check("10.1.0.5", host, "/a.bin", "GET") is not None, granted, loc)
+            self.assertEqual(a.grants.check("srv-1", host, "/a.bin", "GET") is not None, granted, loc)
+            self.assertIsNone(a.grants.check("10.1.0.5", host, "/a.bin", "GET"))  # keyed by server identity
 
     def test_bounded_connection_state(self):
         from aegis_dp import addon as addon_mod

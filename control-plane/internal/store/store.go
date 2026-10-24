@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	currentSchemaVersion = 3
+	currentSchemaVersion = 4
 	maxFlows             = 2000
 	maxAuditEvents       = 2000
 	maxSecurityEvents    = 1000
@@ -608,6 +608,10 @@ func (s *Store) migrateLocked() {
 	}
 	// v2 -> v3: flat rules become policy sets; hit counters move to RuleStats.
 	s.migratePolicySetsLocked()
+	if s.state.SchemaVersion < 4 {
+		// v3 -> v4: '*' in path patterns is one segment (2.1); legacy patterns keep their meaning.
+		s.migratePathPatternsLocked()
+	}
 	if s.state.Governance.RequestSLAHours == 0 {
 		s.state.Governance = DefaultGovernance()
 	}
