@@ -51,25 +51,28 @@ type RevokedToken struct {
 }
 
 type StateSnapshot struct {
-	SchemaVersion    int                       `json:"schema_version"`
-	Revision         uint64                    `json:"revision"`
-	Users            []models.User             `json:"users"`
-	EntraConfig      models.EntraIDConfig      `json:"entra_config"`
-	Groups           []models.ServerGroup      `json:"groups"`
-	Servers          []models.Server           `json:"servers"`
-	Rules            []models.PolicyRule       `json:"rules"`
-	TLSBypass        []models.TLSBypassRule    `json:"tls_bypass"`
-	Sessions         []models.LearningSession  `json:"sessions"`
-	Requests         []models.AccessRequest    `json:"requests"`
-	Flows            []models.TrafficFlow      `json:"flows"`
-	NotifyConfig     models.NotificationConfig `json:"notify_config"`
-	AuditEvents      []models.AuditEvent       `json:"audit_events"`
-	SecurityPolicy   models.SecurityPolicy     `json:"security_policy"`
-	ThreatFeeds      []models.ThreatFeed       `json:"threat_feeds"`
-	Indicators       []models.Indicator        `json:"indicators"`
-	ThreatExceptions []models.ThreatException  `json:"threat_exceptions"`
-	SecurityEvents   []models.SecurityEvent    `json:"security_events"`
-	RevokedTokens    []RevokedToken            `json:"revoked_tokens"`
+	SchemaVersion int                  `json:"schema_version"`
+	Revision      uint64               `json:"revision"`
+	Users         []models.User        `json:"users"`
+	EntraConfig   models.EntraIDConfig `json:"entra_config"`
+	// GroupMapKeysTyped records that group mapping keys use the 2.1 id:/name: semantics
+	// (migrateGroupMappingKeysLocked ran once).
+	GroupMapKeysTyped bool                      `json:"group_map_keys_typed,omitempty"`
+	Groups            []models.ServerGroup      `json:"groups"`
+	Servers           []models.Server           `json:"servers"`
+	Rules             []models.PolicyRule       `json:"rules"`
+	TLSBypass         []models.TLSBypassRule    `json:"tls_bypass"`
+	Sessions          []models.LearningSession  `json:"sessions"`
+	Requests          []models.AccessRequest    `json:"requests"`
+	Flows             []models.TrafficFlow      `json:"flows"`
+	NotifyConfig      models.NotificationConfig `json:"notify_config"`
+	AuditEvents       []models.AuditEvent       `json:"audit_events"`
+	SecurityPolicy    models.SecurityPolicy     `json:"security_policy"`
+	ThreatFeeds       []models.ThreatFeed       `json:"threat_feeds"`
+	Indicators        []models.Indicator        `json:"indicators"`
+	ThreatExceptions  []models.ThreatException  `json:"threat_exceptions"`
+	SecurityEvents    []models.SecurityEvent    `json:"security_events"`
+	RevokedTokens     []RevokedToken            `json:"revoked_tokens"`
 	// Policy management (schema v3). Rules above is the compiled, effective rule list derived from
 	// the published content of enabled policy sets; it is kept in the state file for diagnostics
 	// and downgrade compatibility but never edited directly.
@@ -606,6 +609,7 @@ func (s *Store) migrateLocked() {
 			}
 		}
 	}
+	s.migrateGroupMappingKeysLocked()
 	// v2 -> v3: flat rules become policy sets; hit counters move to RuleStats.
 	s.migratePolicySetsLocked()
 	if s.state.Governance.RequestSLAHours == 0 {

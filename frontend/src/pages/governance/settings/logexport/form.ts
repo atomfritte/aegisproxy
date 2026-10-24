@@ -142,6 +142,26 @@ export function usesTLS(f: SinkForm, fields: string[]): boolean {
   return !fields.includes('transport') || f.transport === 'tls';
 }
 
+/**
+ * Whether the form points a saved destination somewhere else (mirrors sameSinkDestination on the
+ * server): stored secrets, header values and client keys stay with the saved destination.
+ */
+export function destinationChanged(f: SinkForm, s: ExportSink | null | undefined): boolean {
+  if (!s) return false;
+  return (
+    f.endpoint.trim() !== (s.endpoint || '') ||
+    (f.transport || 'tcp') !== (s.transport || 'tcp') ||
+    f.username.trim() !== (s.username || '') ||
+    f.tenant_id.trim() !== (s.tenant_id || '') ||
+    f.client_id.trim() !== (s.client_id || '') ||
+    f.authority_url.trim() !== (s.authority_url || '') ||
+    f.azure_auth !== (s.azure_auth || 'client_secret') ||
+    f.tls_skip_verify !== !!s.tls_skip_verify ||
+    f.ca_cert_pem.trim() !== (s.ca_cert_pem || '').trim() ||
+    f.client_cert_pem.trim() !== (s.client_cert_pem || '').trim()
+  );
+}
+
 /** Request body for create / update / test. Write-only values follow the "empty = keep" contract. */
 export function toPayload(f: SinkForm, fields: string[]): Partial<ExportSink> {
   const has = (k: string) => fields.includes(k);
@@ -217,7 +237,7 @@ export function usesSecret(f: Pick<SinkForm, 'type' | 'azure_auth'>): boolean {
   return f.type !== 'sentinel' || f.azure_auth === 'client_secret';
 }
 
-export function validateForm(f: SinkForm, t: ExportSinkType | undefined): FormErrors {
+export function validateForm(f: SinkForm, t: ExportSinkType | undefined, saved?: ExportSink | null): FormErrors {
   const e: FormErrors = {};
   const fields = t?.fields ?? [];
   if (!f.name.trim()) e.name = 'Give the destination a name.';
@@ -285,5 +305,13 @@ export function validateForm(f: SinkForm, t: ExportSinkType | undefined): FormEr
   range('batch_size', 1, 5000);
   range('flush_seconds', 1, 300);
   range('spool_mb', 16, 102400);
+  if (destinationChanged(f, saved)) {
+    const again = 'The destination changed — enter this value again (stored values stay with the saved destination).';
+    if (f.secretMode === 'keep' && usesSecret(f)) e.secret ??= again;
+    f.headers.forEach((h, i) => {
+      if (h.stored && h.name.trim() && !h.value) e[`headers.${i}`] ??= again;
+    });
+    if (usesTLS(f, fields) && f.client_cert_pem.trim() && f.keyMode !== 'replace' && f.hasStoredKey) e.client_key_pem ??= again;
+  }
   return e;
 }

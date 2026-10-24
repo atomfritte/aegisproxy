@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 const (
@@ -131,54 +132,51 @@ func NewManager(opts Options) (*Manager, error) {
 }
 
 func newFeedClient(proxy string) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	// SSRF guard for admin-configured feed URLs: no internal addresses, checked on the resolved
+	// address for direct connections and on the feed host before it is handed to a proxy (the
+	// proxy itself is trusted).
+	guard := &netguard.ProxyGuard{Proxy: http.ProxyFromEnvironment, Blocked: isInternal, What: "feed host",
+		Dialer: &net.Dialer{Timeout: 10 * time.Second}}
+	if proxy != "" {
+		if pu, err := url.Parse(proxy); err == nil {
+			guard.Proxy = http.ProxyURL(pu)
+		}
+	}
 	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 guard.ProxyFunc,
+		DialContext:           guard.DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		MaxIdleConns:          4,
 		IdleConnTimeout:       60 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	if proxy != "" {
-		if pu, err := url.Parse(proxy); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
-		}
-	}
-	// Without an explicit proxy, refuse to connect to internal addresses (SSRF guard for
-	// admin-configured feed URLs). With a proxy, the proxy is the dial target and is trusted.
-	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if pu, _ := tr.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: addr}}); pu != nil {
-			return dialer.DialContext(ctx, network, addr)
-		}
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if err != nil || len(ips) == 0 {
-			return nil, fmt.Errorf("resolve %s: %w", host, err)
-		}
-		for _, ip := range ips {
-			if isInternal(ip) {
-				return nil, fmt.Errorf("feed host %s resolves to internal address %s", host, ip)
-			}
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
-	}
 	return &http.Client{
-		Timeout:   3 * time.Minute,
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("too many redirects")
-			}
-			if req.URL.Scheme != "https" {
-				return errors.New("refusing non-https redirect")
-			}
-			return nil
-		},
+		Timeout:       3 * time.Minute,
+		Transport:     tr,
+		CheckRedirect: feedRedirect,
 	}
+}
+
+// feedRedirect follows up to five https redirects. Feed credentials (the custom auth header) belong
+// to the configured host: a hop to any other host carries only the standard request headers.
+func feedRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if req.URL.Scheme != "https" {
+		return errors.New("refusing non-https redirect")
+	}
+	if !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+		for k := range req.Header {
+			switch k {
+			case "User-Agent", "Accept", "Accept-Encoding", "If-None-Match", "If-Modified-Since":
+			default:
+				req.Header.Del(k)
+			}
+		}
+	}
+	return nil
 }
 
 func isInternal(a netip.Addr) bool {

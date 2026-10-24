@@ -38,18 +38,27 @@ func TestHostInDomains(t *testing.T) {
 		"https://monitor.azure.com@attacker.example":                        false,
 		"https://10.0.0.5":                                                  false,
 		"https://localhost.attacker.example":                                false,
+		// IP literals whose IPv6 zone looks like a pinned domain dial the literal address.
+		"https://[fc00:f853:ccd:e793::1%25.monitor.azure.com]:19142":   false,
+		"https://[::ffff:172.17.0.1%25x.monitor.azure.com]/":           false,
+		"https://[::ffff:169.254.169.254%25.ingest.monitor.azure.com]": false,
+		"https://[::1%25lo.monitor.azure.com]:9/":                      false,
+		"https://[::ffff:127.0.0.2%25x.monitor.azure.com]/":            false,
+		"https://dce_1.monitor.azure.com":                              false,
+		"https://xn--dce-1.westeurope-1.ingest.monitor.azure.com":      true,
 	} {
 		if got := HostInDomains(raw, AzureMonitorDomains...); got != want {
 			t.Errorf("HostInDomains(%q) = %v", raw, got)
 		}
 	}
 	for raw, want := range map[string]bool{
-		"https://login.microsoftonline.com":         true,
-		"https://login.microsoftonline.us/":         true,
-		"https://login.chinacloudapi.cn":            true,
-		"https://login.partner.microsoftonline.cn":  true,
-		"https://login.microsoftonline.com.evil.io": false,
-		"https://attacker.example":                  false,
+		"https://login.microsoftonline.com":                              true,
+		"https://login.microsoftonline.us/":                              true,
+		"https://login.chinacloudapi.cn":                                 true,
+		"https://login.partner.microsoftonline.cn":                       true,
+		"https://login.microsoftonline.com.evil.io":                      false,
+		"https://attacker.example":                                       false,
+		"https://[::ffff:172.17.0.1%25.login.microsoftonline.com]:19142": false,
 	} {
 		if got := HostInDomains(raw, EntraAuthorityDomains...); got != want {
 			t.Errorf("HostInDomains(%q, entra) = %v", raw, got)

@@ -2,7 +2,6 @@ package notify
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 func isDisallowedIP(addr netip.Addr) bool {
@@ -76,26 +76,13 @@ func NewDispatcher(cfg models.NotificationConfig, logger *slog.Logger) *Dispatch
 	if logger == nil {
 		logger = slog.Default()
 	}
-	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	// SSRF guard: direct connections are checked on the resolved address; through HTTPS_PROXY the
+	// webhook host is checked before it is handed to the proxy (the proxy itself is trusted).
+	guard := &netguard.ProxyGuard{Proxy: http.ProxyFromEnvironment, Blocked: isDisallowedIP, What: "SSRF Guard: webhook host",
+		Dialer: &net.Dialer{Timeout: 3 * time.Second}}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-			if err != nil || len(ips) == 0 {
-				return nil, fmt.Errorf("DNS lookup failed for webhook host %s", host)
-			}
-			for _, ip := range ips {
-				if isDisallowedIP(ip) {
-					return nil, fmt.Errorf("SSRF Guard: DNS resolved %s to disallowed internal/private IP %s", host, ip.String())
-				}
-			}
-			// Dial the validated address (prevents DNS rebinding between check and connect).
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
-		},
+		Proxy:                 guard.ProxyFunc,
+		DialContext:           guard.DialContext,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
 	}

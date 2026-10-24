@@ -121,7 +121,11 @@ const fingerprint = (f: Form) => JSON.stringify({ ...toPayload(f), client_secret
 
 const entraIssuer = (tenant: string) => `https://login.microsoftonline.com/${tenant || '<tenant-id>'}/v2.0`;
 
-function validate(f: Form) {
+/** Issuer the client secret is sent to (Entra derives it from the tenant). */
+const issuerOf = (provider: string | undefined, issuer: string | undefined, tenant: string | undefined) =>
+  issuer?.trim() || ((provider || 'entra') === 'entra' && tenant?.trim() ? entraIssuer(tenant.trim()) : '');
+
+function validate(f: Form, stored?: EntraIDConfig) {
   const e: Partial<Record<'tenant_id' | 'client_id' | 'issuer_url' | 'redirect_uri' | 'roles' | 'username_claim' | 'groups_claim' | 'client_secret', string>> = {};
   if (f.provider === 'entra' && f.tenant_id.trim() && !GUID_RE.test(f.tenant_id.trim()))
     e.tenant_id = 'The Directory (tenant) ID is a GUID such as 72f988bf-86f1-41af-91ab-2d7cd011db47 — domain names are not accepted.';
@@ -137,6 +141,11 @@ function validate(f: Form) {
   if (f.username_claim.trim() && !CLAIM_RE.test(f.username_claim.trim())) e.username_claim = 'Letters, digits and . _ : / - only.';
   if (f.groups_claim.trim() && !CLAIM_RE.test(f.groups_claim.trim())) e.groups_claim = 'Letters, digits and . _ : / - only.';
   if (/[\r\n]/.test(f.client_secret)) e.client_secret = 'The secret must be a single line.';
+  // The stored secret belongs to one client at one IdP (the server refuses to reuse it elsewhere).
+  const newIssuer = issuerOf(f.provider, f.issuer_url, f.tenant_id);
+  if (stored?.has_client_secret && !f.client_secret && f.token_auth_method !== 'private_key_jwt' && newIssuer && f.client_id.trim() &&
+    (newIssuer !== issuerOf(stored.provider, stored.issuer_url, stored.tenant_id) || f.client_id.trim() !== (stored.client_id ?? '')))
+    e.client_secret = 'The issuer or client ID changed — enter the client secret for the new identity provider.';
   return e;
 }
 
@@ -169,7 +178,7 @@ export const SsoSection: React.FC = () => {
   useNavigationBlocker(dirty && !ro, 'Discard unsaved single sign-on settings?');
 
   const set = (p: Partial<Form>) => setF((x) => ({ ...x, ...p }));
-  const errors = validate(f);
+  const errors = validate(f, stored);
   const invalid = Object.values(errors).some(Boolean);
   const err = (k: keyof typeof errors) => (attempted || k === 'tenant_id' || k === 'issuer_url' || k === 'redirect_uri' ? errors[k] : undefined);
   const advancedInvalid = !!(errors.redirect_uri || errors.username_claim || errors.groups_claim || (f.provider === 'entra' && errors.issuer_url));
@@ -296,7 +305,11 @@ export const SsoSection: React.FC = () => {
                       resetKey={savedAt}
                       disabled={ro}
                       optional={!stored?.has_client_secret}
-                      hint={stored?.has_client_secret ? 'Stored encrypted and never shown. Replace it before it expires in the IdP.' : 'Confidential (web) clients need one. Sign-in also uses PKCE. Write-only.'}
+                      hint={
+                        stored?.has_client_secret
+                          ? 'Stored encrypted and never shown. Replace it before it expires in the IdP. A new issuer, tenant or client ID needs the secret again.'
+                          : 'Confidential (web) clients need one. Sign-in also uses PKCE. Write-only.'
+                      }
                     />
                   )}
                   <Field
@@ -418,6 +431,10 @@ export const SsoSection: React.FC = () => {
                 divider
               />
               <div className="space-y-3 p-[var(--card-p)]">
+                <p className="text-[12px] text-fg-subtle">
+                  Enter the group object ID or the value the IdP sends in the groups claim; SCIM groups match by their externalId. To match a SCIM group by its display name, prefix it with{' '}
+                  <code className="font-mono">name:</code> — group owners can often rename groups, so map privileged roles by object ID.
+                </p>
                 {f.roles.length === 0 && (
                   <p className="rounded-md border border-dashed border-border-strong px-3 py-3 text-[12.5px] text-fg-subtle">
                     No mappings yet. Users without a mapped group cannot sign in with single sign-on.
@@ -435,6 +452,9 @@ export const SsoSection: React.FC = () => {
                         onChange={(e) => set({ roles: f.roles.map((x, j) => (j === i ? { ...x, group: e.target.value } : x)) })}
                       />
                       {dupRoles.includes(r.group.trim()) && <p className="mt-1 text-[11.5px] text-danger">Mapped twice — only the last mapping is kept.</p>}
+                      {r.group.trim().startsWith('name:') && (r.role === 'SUPER_ADMIN' || r.role === 'INFOSEC_APPROVER') && (
+                        <p className="mt-1 text-[11.5px] text-warning">Matches a renameable display name — map this role by group object ID instead.</p>
+                      )}
                     </div>
                     <Select
                       aria-label={`Role for IdP group ${i + 1}`}

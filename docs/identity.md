@@ -120,11 +120,33 @@ Console fields (`provider: oidc`): `issuer_url`, `client_id`, `client_secret`, o
 
 | Field | Meaning |
 |---|---|
-| `group_role_map` | IdP group (Entra: object ID or app role value; others: group name as sent) → role. When a user is in several mapped groups, the **most privileged role wins** (Super Admin > InfoSec > Team Lead > Auditor). |
-| `group_scope_map` | IdP group → list of server group IDs. Team Leads receive the union of the groups mapped from all their IdP groups. Super Admins and InfoSec always get `*`, Auditors no scope. |
+| `group_role_map` | IdP group key (see below) → role. When a user is in several mapped groups, the **most privileged role wins** (Super Admin > InfoSec > Team Lead > Auditor). |
+| `group_scope_map` | IdP group key → list of server group IDs. Team Leads receive the union of the groups mapped from all their IdP groups. Super Admins and InfoSec always get `*`, Auditors no scope. |
+
+Group keys say which identifier of a group they match:
+
+| Key | Groups claim of the ID token | SCIM group |
+|---|---|---|
+| `<value>` or `id:<value>` | a claim value equal to `<value>` (Entra: group object ID or app role value; others: the value the IdP sends) | `externalId` equal to `<value>` (Entra: the group object ID) |
+| `name:<value>` | a claim value equal to `<value>` | `displayName` equal to `<value>` |
+
+Use object IDs for privileged roles. A SCIM `displayName` can be changed by whoever may rename the group in the IdP
+(in Entra ID group owners can, unless the group is role-assignable), and an unprefixed key never matches a display
+name: renaming a group to the object ID of a Super Admin group grants nothing. The console warns when a `name:` key
+maps to Super Admin or InfoSec Approver.
 
 A user without any mapped group cannot sign in (`sso_error=not_authorized`). Enabling SSO requires a client ID,
 the tenant ID (Entra) or issuer URL, and at least one role mapping.
+
+The stored client secret belongs to one client at one IdP: a save that changes the issuer (for Entra ID the
+tenant) or the client ID without a new secret is refused (*re-enter the client secret for the new identity
+provider*). Clearing the client ID or issuer, or switching to `private_key_jwt`, drops the stored secret instead.
+
+**Upgrade note (2.1):** up to 2.1 an unprefixed key also matched SCIM display names. On the first start of this
+version, unprefixed keys that are not GUIDs and equal the `displayName` of a provisioned SCIM group without
+`externalId` (typically Okta push groups) are rewritten to `name:<value>`, so nobody loses a role; each rewrite is
+logged and audited as `SSO_GROUP_MAPPING_MIGRATED`. Review those mappings and switch privileged ones to group IDs
+where the IdP sends them.
 
 ### Provisioning and deprovisioning
 
@@ -186,7 +208,7 @@ disables the account and revokes its sessions immediately.
 | Filters | All RFC 7644 operators (`eq ne co sw ew gt ge lt le pr`, `and`, `or`, `not`, grouping, value paths). `userName`, `displayName`, e-mail addresses compare case-insensitively, `id` and `externalId` case-exactly. |
 | User attributes | Stored: `userName` (unique), `externalId`, `active`, `displayName`, `name` (`givenName`, `familyName`, `formatted`), `title`, `emails`, enterprise extension `department`. Everything else an IdP sends (phone numbers, addresses, manager, roles, **passwords** …) is accepted and discarded, so default attribute mappings work unchanged. |
 | Console account | `auth_provider: oidc`, no password. Username from `userName` like single sign-on derives it (`a.b@corp.example` → `a.b.corp.example`); if the name is taken by another account a suffix is added — SCIM never takes over a local or break-glass account, and local accounts are never SCIM resources (`404`). |
-| Roles and scopes | **SCIM is authoritative for the accounts it manages.** Their role and Team Lead scope come from the SCIM groups they are members of, matched with the single sign-on `group_role_map` / `group_scope_map`; each group matches by its `displayName` **and** its `externalId` (Entra ID sends the group object ID there, so existing object-ID mappings keep working). The most privileged mapped role wins; Super Admin is only granted when a group is explicitly mapped to it. The groups claim of the ID token is not used for these accounts. An account in no mapped group stays **disabled** (role empty, shown as *No mapped SCIM group*). Membership changes, group renames, group deletion and changes of the mapping apply immediately and revoke the account's sessions when the role or scope changes (`USER_ROLE_SYNCED`). |
+| Roles and scopes | **SCIM is authoritative for the accounts it manages.** Their role and Team Lead scope come from the SCIM groups they are members of, matched with the single sign-on `group_role_map` / `group_scope_map`: unprefixed and `id:` keys match the group's `externalId` (Entra ID sends the group object ID there, so object-ID mappings work for the token and SCIM alike), `name:` keys its `displayName` (see [group keys](#group-to-role-and-scope-mapping)). The most privileged mapped role wins; Super Admin is only granted when a group is explicitly mapped to it. The groups claim of the ID token is not used for these accounts. An account in no mapped group stays **disabled** (role empty, shown as *No mapped SCIM group*). Membership changes, group renames, group deletion and changes of the mapping apply immediately and revoke the account's sessions when the role or scope changes (`USER_ROLE_SYNCED`). |
 | Deprovisioning | `active: false` (PATCH or PUT) or removal from the last mapped group disables the account and revokes all sessions at once (`USER_DEPROVISIONED_SCIM`); `active: true` re-enables it (`USER_REACTIVATED_SCIM`). `DELETE` disables it, revokes sessions, removes it from all SCIM groups and stops serving it (`404`); the record stays for the audit trail and is revived if the same user is provisioned again. A deactivated or deleted account cannot sign in with SSO (`sso_error=account_disabled`). An administrator lock in the console survives SCIM updates, and an administrator cannot enable an account the IdP deactivated. |
 | Linking to single sign-on | The first sign-in lands on the provisioned account when the SCIM `externalId` equals the token subject (Entra ID: map `externalId` ← `objectId`, which is the `oid` claim; Okta: the Okta user id is both `externalId` and `sub`) or, otherwise, when the SCIM `userName` equals the username claim (`preferred_username`, the UPN). E-mail addresses are never used for linking because users can change them in some IdPs. Ambiguous matches link nothing. Audited as `USER_LINKED_SSO`. |
 | Existing SSO users | Accounts created just in time before SCIM was enabled are taken over when SCIM provisions the same person (same subject via `externalId`, or same username) instead of being duplicated (`USER_LINKED_SCIM`). |
@@ -235,7 +257,9 @@ in **Identity & access**.
      `Authorization: Bearer <token>`) → **Test Connector Configuration**.
 3. **Provisioning → To App**: enable **Create Users**, **Update User Attributes**, **Deactivate Users**.
 4. **Assignments**: assign people or groups. **Push Groups**: push every group that is mapped to a role (Okta
-   sends the group name as `displayName`; map that name in `group_role_map`).
+   sends the group name as `displayName` and no `externalId`; map it as `name:<group name>` in `group_role_map`,
+   which also matches the name in the token's groups claim). Whoever can rename the group controls that mapping:
+   keep Super Admin on a group only Okta admins manage.
 5. The Okta user id is both the SCIM `externalId` and the OIDC `sub`, so the first sign-in links automatically.
    Deactivating or unassigning a user in Okta sends `active: false`.
 
@@ -244,7 +268,9 @@ in **Identity & access**.
 - The SCIM token can create accounts and, through group membership, grant every mapped role including Super Admin
   if a group is mapped to it. Treat it like an IdP admin credential: keep it only in the IdP, give it an expiry,
   rotate it (new token → update IdP → revoke old), and watch `SCIM_TOKEN_*` and `USER_ROLE_SYNCED` audit events.
-- Map Super Admin only to a small, protected IdP group (Entra: role-assignable group / PIM; Okta: admin-managed group).
+- Map Super Admin only to a small, protected IdP group (Entra: role-assignable group / PIM; Okta: admin-managed group),
+  by group object ID rather than `name:` wherever the IdP sends one: whoever can rename a group controls what a
+  `name:` key matches.
 - SCIM never creates passwords; provisioned people still authenticate at the IdP with its MFA and conditional
   access. Local and break-glass accounts cannot be read, changed or deleted over SCIM.
 - Failed SCIM authentications are logged with the source address, counted in `aegis_scim_auth_failures_total` and

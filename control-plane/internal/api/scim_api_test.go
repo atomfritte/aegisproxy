@@ -39,9 +39,10 @@ func newSCIMHarness(t *testing.T) *scimHarness {
 	h.do(t, "POST", "/api/groups", map[string]any{"id": "grp-ci", "name": "CI"}, ui)
 	cfg := map[string]any{"enabled": true, "provider": "oidc", "issuer_url": idp.Server.URL, "client_id": "aegis-console",
 		"client_secret": "client-secret-1", "allow_local_login": true,
-		"group_role_map": map[string]string{entraInfosecGroup: "INFOSEC_APPROVER", "CI Leads": "TEAM_LEAD_APPROVER",
-			"Aegis Platform Owners": "SUPER_ADMIN", "aegis-auditors": "OPERATOR_AUDITOR"},
-		"group_scope_map": map[string][]string{"CI Leads": {"grp-ci"}, entraLeadsGroup: {"grp-ci"}}}
+		// Object IDs match the SCIM externalId; Okta-style groups without externalId need name: keys.
+		"group_role_map": map[string]string{entraInfosecGroup: "INFOSEC_APPROVER", "name:CI Leads": "TEAM_LEAD_APPROVER",
+			"name:Aegis Platform Owners": "SUPER_ADMIN", "name:aegis-auditors": "OPERATOR_AUDITOR"},
+		"group_scope_map": map[string][]string{"name:CI Leads": {"grp-ci"}, entraLeadsGroup: {"grp-ci"}}}
 	if r := h.do(t, "POST", "/api/settings/entra", cfg, ui); r.StatusCode != 200 {
 		b, _ := io.ReadAll(r.Body)
 		t.Fatalf("configure SSO: %d %s", r.StatusCode, b)
@@ -548,7 +549,7 @@ func TestSCIMSafety(t *testing.T) {
 
 	// Changing the SSO group mapping re-applies roles to SCIM-managed accounts immediately.
 	cfg := h.st.SSOSettings("")
-	cfg.GroupRoleMap = map[string]models.Role{"Aegis Platform Owners": models.RoleAuditorOperator, "Everyone": models.RoleAuditorOperator}
+	cfg.GroupRoleMap = map[string]models.Role{"name:Aegis Platform Owners": models.RoleAuditorOperator, "name:Everyone": models.RoleAuditorOperator}
 	cfg.ClientSecret = ""
 	if err := h.st.UpdateEntraConfig(cfg, adminClaimsFor(h.harness)); err != nil {
 		t.Fatal(err)

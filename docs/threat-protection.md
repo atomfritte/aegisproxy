@@ -87,6 +87,19 @@ live on **private networks** (on-premises TIPs), but loopback, link-local (cloud
 multicast addresses are refused — when saving and again when connecting (DNS rebinding). Redirects are not
 followed. The auth value is write-only and encrypted at rest.
 
+Feed downloads (all feeds, including list feeds with an auth header):
+
+- List feeds follow up to five `https://` redirects. The auth header (and any other credential header) is sent
+  only to the configured host: a redirect to another host or port carries only `User-Agent`, `Accept`,
+  `Accept-Encoding` and the cache validators, so a CDN hand-off works but a compromised or hostile feed server
+  cannot pull the key elsewhere. Changing the feed URL to another origin drops the stored auth value.
+- Through a forward proxy (`AEGIS_FEED_HTTP_PROXY` or `HTTPS_PROXY`), the proxy resolves the feed host, so the
+  connect-time address check cannot run. Before handing a request to the proxy the control plane therefore checks
+  the host itself: IP literals and names that resolve (from the control plane) to refused addresses are blocked.
+  A name the control plane cannot resolve is left to the proxy — enforce egress rules (no link-local, no internal
+  ranges for public feeds) on the proxy as well. The proxy address itself is trusted and may be internal. The same
+  rule applies to Teams/Slack notification webhooks behind `HTTPS_PROXY`.
+
 ### Microsoft Defender indicators
 
 With the [Defender integration](#microsoft-defender-for-endpoint) and *Import indicators* enabled, the built-in
@@ -336,7 +349,9 @@ Setup:
    | `Machine.Read.All` | device sync (risk score, exposure, health) |
    | `Machine.ReadWrite.All` | only for `quarantine_on_isolation`: List MachineActions requires it. AegisProxy never starts machine actions; leave the option off to stay with `Machine.Read.All`. |
 
-3. In AegisProxy: tenant ID, client ID, client secret (write-only, encrypted at rest) and the cloud:
+3. In AegisProxy: tenant ID, client ID, client secret (write-only, encrypted at rest) and the cloud. The stored
+   secret stays with its tenant, client ID and endpoints: a save that changes any of them without a new secret is
+   refused (*re-enter the client secret for the new destination*); clearing tenant or client ID drops it.
 
    | Cloud | `api_base_url` | `authority_url` | Token scope (set automatically) |
    |---|---|---|---|

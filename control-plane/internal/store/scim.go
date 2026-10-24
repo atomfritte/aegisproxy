@@ -314,16 +314,14 @@ func (s *Store) touchSCIMToken(id, ip string) {
 // Role synchronization
 // ---------------------------------------------------------------------------
 
-// scimMembershipsLocked maps user IDs to the IdP group keys of their SCIM groups (display name and
-// external ID, matched against group_role_map / group_scope_map).
+// scimMembershipsLocked maps user IDs to the membership keys of their SCIM groups (scimGroupKeys:
+// external ID as identifier, display name only for "name:" mappings).
 func (s *Store) scimMembershipsLocked() map[string][]string {
 	out := map[string][]string{}
 	for _, g := range s.state.SCIMGroups {
+		keys := scimGroupKeys(g)
 		for _, m := range g.Members {
-			out[m.Value] = append(out[m.Value], g.DisplayName)
-			if g.ExternalID != "" {
-				out[m.Value] = append(out[m.Value], g.ExternalID)
-			}
+			out[m.Value] = append(out[m.Value], keys...)
 		}
 	}
 	return out
@@ -873,11 +871,7 @@ func droppedNote(n int) string {
 }
 
 func (s *Store) groupRoleLocked(g models.SCIMGroup) models.Role {
-	keys := []string{g.DisplayName}
-	if g.ExternalID != "" {
-		keys = append(keys, g.ExternalID)
-	}
-	r, _ := mapIdPGroups(s.state.EntraConfig, keys)
+	r, _ := mapIdPGroups(s.state.EntraConfig, scimGroupKeys(g))
 	return r
 }
 
