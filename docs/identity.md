@@ -274,7 +274,7 @@ in **Identity & access**.
 - SCIM never creates passwords; provisioned people still authenticate at the IdP with its MFA and conditional
   access. Local and break-glass accounts cannot be read, changed or deleted over SCIM.
 - Failed SCIM authentications are logged with the source address, counted in `aegis_scim_auth_failures_total` and
-  throttled per source address like password sign-ins (20 failures lock the address, exponential up to 15 minutes);
+  throttled per client like password sign-ins (20 failures lock the client address, exponential up to 15 minutes);
   restrict `/api/scim/` at the reverse proxy to the IdP's provisioning egress ranges where possible (Okta publishes
   its IP ranges; Entra provisioning uses the `AzureActiveDirectory` service tag).
 - Deleting a SCIM-managed account in the console is possible but the IdP re-creates it on its next cycle; offboard in
@@ -357,5 +357,5 @@ unique short name; ambiguous short names are refused.
 | Lifetime | `AEGIS_SESSION_TTL` (default `8h`, 5 min – 168 h) |
 | CSRF | state-changing cookie requests need `X-Requested-With` and a same-origin (or `AEGIS_CORS_ORIGINS`) `Origin` |
 | Revocation | logout, password change/reset, role/scope change, account disable, SSO deprovisioning |
-| Throttling | 5 failed logins lock the account key, 20 the source IP (exponential, up to 15 minutes) |
+| Throttling | 5 failed logins lock the account key, 20 the client address (exponential, up to 15 minutes); attempts are counted before the password check, so parallel bursts cannot exceed the limit. Break-glass accounts are locked only for the failing client; account-wide only after 1,000 failures within a lockout window, and then for at most one minute. Behind a reverse proxy that is not in `AEGIS_TRUSTED_PROXIES` the key is the proxy plus the client it claims, with a ceiling of 200 failures for everything behind that proxy, and a warning is logged ([trusted proxies](configuration.md#trusted-proxies-and-sign-in-throttling)) |
 | API tokens | `POST /api/auth/login` without `X-Requested-With` returns a bearer token with the same lifetime — prefer service accounts for automation |
