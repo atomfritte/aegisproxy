@@ -3,7 +3,9 @@ updates:
   - { package-ecosystem: gomod, directory: /control-plane, schedule: { interval: weekly }, groups: { go: { patterns: ["*"] } } }
   - { package-ecosystem: pip, directory: /data-plane, schedule: { interval: weekly } }
   - { package-ecosystem: npm, directory: /frontend, schedule: { interval: weekly }, groups: { npm: { patterns: ["*"] } } }
-  - { package-ecosystem: docker, directory: /, schedule: { interval: weekly } }
+  # Node.js build images stay on an LTS line (even major versions); odd majors are short-lived, so the
+  # move to the next LTS is done deliberately instead of by Dependabot.
+  - { package-ecosystem: docker, directory: /, schedule: { interval: weekly }, ignore: [{ dependency-name: node, update-types: ["version-update:semver-major"] }] }
   - { package-ecosystem: docker, directory: /data-plane, schedule: { interval: weekly } }
-  - { package-ecosystem: docker, directory: /frontend, schedule: { interval: weekly } }
+  - { package-ecosystem: docker, directory: /frontend, schedule: { interval: weekly }, ignore: [{ dependency-name: node, update-types: ["version-update:semver-major"] }] }
   - { package-ecosystem: github-actions, directory: /, schedule: { interval: weekly } }

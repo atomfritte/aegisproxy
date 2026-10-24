@@ -28,6 +28,8 @@ cosign verify ghcr.io/<owner>/aegisproxy-control-plane:v2.1.0 \
 gh attestation verify oci://ghcr.io/<owner>/aegisproxy-control-plane:v2.1.0 --owner <owner>
 ```
 
+Releases are signed with cosign 3 (Sigstore bundle format); verify with cosign 3.0 or newer.
+
 Dependencies are monitored with Dependabot, govulncheck, pip-audit, npm audit and Trivy in CI. Every GitHub
 Action is pinned to a commit SHA (Dependabot proposes updates), analysis tools run in pinned versions and the
 Trivy scanner image is pinned by digest. Pull requests fail on fixable critical/high vulnerabilities in any of the

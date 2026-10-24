@@ -27,7 +27,7 @@ function niceStep(raw: number): number {
   return nf * exp;
 }
 
-function useWidth(ref: React.RefObject<HTMLElement>): number {
+function useWidth(ref: React.RefObject<HTMLElement | null>): number {
   const [w, setW] = useState(0);
   useLayoutEffect(() => {
     const el = ref.current;

@@ -6,7 +6,7 @@ import { Portal } from './Portal';
 export interface PopoverProps {
   open: boolean;
   onClose: () => void;
-  anchorRef: RefObject<HTMLElement>;
+  anchorRef: RefObject<HTMLElement | null>;
   children: React.ReactNode;
   align?: 'start' | 'end';
   /** Match the anchor's width (select-like popovers). */
@@ -63,7 +63,7 @@ export const Popover: React.FC<PopoverProps> = ({ open, onClose, anchorRef, chil
     };
   }, [open, place, onClose, anchorRef]);
 
-  useOnClickOutside([panelRef, anchorRef as RefObject<HTMLElement>], onClose, open);
+  useOnClickOutside([panelRef, anchorRef], onClose, open);
 
   if (!open) return null;
   return (

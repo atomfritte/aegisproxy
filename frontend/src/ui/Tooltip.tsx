@@ -18,7 +18,7 @@ export const Tooltip: React.FC<TooltipProps> = ({ content, children, side = 'top
   const [pos, setPos] = useState<{ top: number; left: number; side: 'top' | 'bottom' } | null>(null);
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLDivElement>(null);
-  const timer = useRef<number>();
+  const timer = useRef<number | undefined>(undefined);
   const id = useId();
 
   const show = useCallback(() => {

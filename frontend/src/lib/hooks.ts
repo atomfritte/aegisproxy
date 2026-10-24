@@ -59,7 +59,7 @@ export function useNow(): number {
 }
 
 /** Calls handler when a pointer down happens outside all given elements. */
-export function useOnClickOutside(refs: Array<RefObject<HTMLElement>>, handler: () => void, enabled = true) {
+export function useOnClickOutside(refs: Array<RefObject<HTMLElement | null>>, handler: () => void, enabled = true) {
   const handlerRef = useRef(handler);
   handlerRef.current = handler;
   useEffect(() => {
@@ -170,7 +170,7 @@ export function useScrollLock(active: boolean) {
 }
 
 /** Keeps keyboard focus inside `ref` while active; restores focus on close. */
-export function useFocusTrap(ref: RefObject<HTMLElement>, active: boolean) {
+export function useFocusTrap(ref: RefObject<HTMLElement | null>, active: boolean) {
   useEffect(() => {
     if (!active) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -212,7 +212,7 @@ export function useFocusTrap(ref: RefObject<HTMLElement>, active: boolean) {
 /** Stable unique id for aria attributes. */
 let idCounter = 0;
 export function useStableId(prefix = 'id'): string {
-  const ref = useRef<string>();
+  const ref = useRef<string | undefined>(undefined);
   if (!ref.current) ref.current = `${prefix}-${++idCounter}`;
   return ref.current;
 }

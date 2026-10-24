@@ -9,6 +9,7 @@ permissions:
   packages: write
   id-token: write      # keyless signing (Sigstore / OIDC)
   attestations: write
+  artifact-metadata: write   # storage record of the provenance attestation (actions/attest v4)
 
 jobs:
   publish:

@@ -27,7 +27,7 @@ export interface MenuItem {
 export const Menu: React.FC<{
   items: MenuItem[];
   trigger: (props: {
-    ref: React.RefObject<HTMLButtonElement>;
+    ref: React.RefObject<HTMLButtonElement | null>;
     onClick: () => void;
     'aria-haspopup': 'menu';
     'aria-expanded': boolean;

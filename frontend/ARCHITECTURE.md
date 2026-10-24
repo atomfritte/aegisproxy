@@ -1,6 +1,6 @@
 # AegisProxy console — architecture
 
-React 18 + TypeScript + Vite 8 (Rolldown) + Tailwind 4 (`@tailwindcss/vite`) + lucide-react. No router, UI kit or
+React 19 + TypeScript 7 + Vite 8 (Rolldown) + Tailwind 4 (`@tailwindcss/vite`) + lucide-react. No router, UI kit or
 chart library: the console ships its own small router (`src/lib/router.tsx`), design system (`src/ui/`) and SVG charts.
 `npm audit` must stay at 0 findings (dev dependencies included).
 

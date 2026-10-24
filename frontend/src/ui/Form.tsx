@@ -17,7 +17,9 @@ export interface FieldProps {
   /** Extra element after the label (e.g. HelpTip). */
   labelAside?: React.ReactNode;
   className?: string;
-  children: React.ReactElement | ((ids: { id: string; describedBy?: string; invalid: boolean }) => React.ReactNode);
+  children:
+    | React.ReactElement<{ id?: string; 'aria-describedby'?: string; 'aria-invalid'?: boolean }>
+    | ((ids: { id: string; describedBy?: string; invalid: boolean }) => React.ReactNode);
 }
 
 /** Label / hint / validation wrapper for any control. */

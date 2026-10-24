@@ -34,7 +34,7 @@ export function useThreatData() {
 /** Refreshes the console state once more after a delay (feed downloads run in the background). */
 export function useDelayedRefresh(ms = 5000) {
   const { refresh } = useConsole();
-  const t = useRef<number>();
+  const t = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(t.current), []);
   return useCallback(() => {
     window.clearTimeout(t.current);

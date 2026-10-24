@@ -44,7 +44,7 @@ export const Callout: React.FC<{
       <Icon className={cn('mt-0.5 h-4 w-4 shrink-0', iconCls[tone])} aria-hidden />
       <div className="min-w-0 flex-1 leading-5">
         {title && <p className="font-semibold">{title}</p>}
-        {children && <div className={cn('text-fg-muted', title && 'mt-0.5')}>{children}</div>}
+        {children && <div className={cn('text-fg-muted', title ? 'mt-0.5' : undefined)}>{children}</div>}
       </div>
       {action && <div className="shrink-0 self-center">{action}</div>}
     </div>
