@@ -1,19 +1,53 @@
 # Signed, attested release images (tags v*): GHCR, SBOM attached as attestation, cosign keyless signing.
+# Nothing is published unless the tag matches the product version and every CI gate (ci.yml) passes for the
+# tagged commit.
 name: release
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write      # keyless signing (Sigstore / OIDC)
-  attestations: write
-  artifact-metadata: write   # storage record of the provenance attestation (actions/attest v4)
+permissions: {}
 
 jobs:
-  publish:
+  version:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      # The Helm chart pulls v<appVersion> and the binaries report the Makefile version: a tag that differs from
+      # them would publish images that nothing deploys (or mislabel them).
+      - name: tag matches the product version (Makefile, console, Helm appVersion)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          make=$(sed -n 's/^VERSION ?= *//p' Makefile)
+          console=$(jq -r .version frontend/package.json)
+          app=$(sed -n 's/^appVersion: *//p' deploy/helm/aegisproxy/Chart.yaml | tr -d '"')
+          echo "tag=$TAG Makefile=$make console=$console appVersion=$app"
+          for v in "$make" "$console" "$app"; do
+            if [ "$TAG" != "v$v" ]; then
+              echo "::error::tag $TAG does not match version $v (Makefile $make, frontend/package.json $console, Chart.yaml appVersion $app)"
+              exit 1
+            fi
+          done
+
+  # The complete CI pipeline (tests, linters, Windows services, Kubernetes, image scan) on the tagged commit.
+  verify:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: [version, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # keyless signing (Sigstore / OIDC)
+      attestations: write
+      artifact-metadata: write   # storage record of the provenance attestation (actions/attest v4)
     strategy:
       matrix:
         include:
