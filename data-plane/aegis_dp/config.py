@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from typing import List
@@ -10,6 +11,8 @@ from typing import List
 from .buffering import parse_size
 
 KNOWN_LEAKED_KEYS = {"aegis-dp-internal-key-2026-v1"}
+DEFAULT_FLOW_SPOOL_MAX = 256 << 20
+MIN_POLICY_MAX_AGE = 30.0
 
 
 class ConfigError(RuntimeError):
@@ -38,6 +41,19 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(raw: str) -> float:
+    """Seconds of "90", "90s", "15m", "2h", "1d" (or a combination such as "1h30m"); "" and "0" are 0."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return 0.0
+    if not re.fullmatch(r"\d+|(?:\d+[smhd])+", s):
+        raise ValueError(f"invalid duration {raw!r}")
+    return float(sum(int(n) * _DURATION_UNITS[u] for n, u in re.findall(r"(\d+)([smhd]?)", s)))
+
+
 @dataclass
 class Config:
     control_plane_url: str
@@ -61,6 +77,10 @@ class Config:
     access_log_keep: int = 10
     buffer_budget: int = 0  # bytes of bodies buffered for inspection at once; 0 = min(512 MiB, body_size_limit)
     buffer_client_share: int = 25  # percent of the budget one client (server identity, else address) may hold
+    policy_max_age: float = 0.0  # seconds; > 0: fail closed when the last successful policy sync is older
+    flow_spool_dir: str = ""  # durable telemetry spool ("" = memory queue only)
+    flow_spool_max: int = DEFAULT_FLOW_SPOOL_MAX
+    flow_queue_max: int = 20_000  # flow records held in memory before they are uploaded or spooled
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -95,6 +115,20 @@ class Config:
         share_raw = os.environ.get("AEGIS_BUFFER_CLIENT_SHARE", "25").strip().removesuffix("%").strip()
         if not share_raw.isdigit() or not 1 <= int(share_raw) <= 100:
             raise ConfigError("AEGIS_BUFFER_CLIENT_SHARE must be a percentage from 1 to 100 (e.g. 25%)")
+        sync_interval = float(_env_int("AEGIS_SYNC_INTERVAL_SECONDS", 2))
+        try:
+            max_age = parse_duration(os.environ.get("AEGIS_POLICY_MAX_AGE", ""))
+        except ValueError as exc:
+            raise ConfigError("AEGIS_POLICY_MAX_AGE must be a duration such as 15m, 1h or 900s (0 = unlimited)") from exc
+        if max_age and max_age < max(MIN_POLICY_MAX_AGE, 5 * sync_interval):
+            raise ConfigError(f"AEGIS_POLICY_MAX_AGE must be at least {int(max(MIN_POLICY_MAX_AGE, 5 * sync_interval))}s "
+                              "(30s and five policy sync intervals), or 0 for unlimited")
+        try:
+            spool_max = parse_size(os.environ.get("AEGIS_FLOW_SPOOL_MAX", "")) or DEFAULT_FLOW_SPOOL_MAX
+        except ValueError as exc:
+            raise ConfigError("AEGIS_FLOW_SPOOL_MAX must be a size such as 256m or 1g") from exc
+        if spool_max < 1 << 20:
+            raise ConfigError("AEGIS_FLOW_SPOOL_MAX must be at least 1m")
         return cls(
             control_plane_url=os.environ.get("CONTROL_PLANE_URL", "http://localhost:8081").rstrip("/"),
             dataplane_key=key,
@@ -108,7 +142,7 @@ class Config:
             clamd_timeout=float(_env_int("AEGIS_CLAMD_TIMEOUT_SECONDS", 60)),
             magic_hosts=magic,
             ops_addr=os.environ.get("AEGIS_OPS_ADDR", "0.0.0.0:9091").strip(),
-            sync_interval=float(_env_int("AEGIS_SYNC_INTERVAL_SECONDS", 2)),
+            sync_interval=sync_interval,
             threat_sync_interval=float(_env_int("AEGIS_THREAT_SYNC_INTERVAL_SECONDS", 30)),
             access_log=os.environ.get("AEGIS_ACCESS_LOG", "").strip(),
             access_log_format=access_format,
@@ -116,4 +150,7 @@ class Config:
             access_log_keep=keep,
             buffer_budget=budget,
             buffer_client_share=int(share_raw),
+            policy_max_age=max_age,
+            flow_spool_dir=os.environ.get("AEGIS_FLOW_SPOOL_DIR", "").strip(),
+            flow_spool_max=spool_max,
         )

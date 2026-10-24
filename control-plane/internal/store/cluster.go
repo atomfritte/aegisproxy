@@ -346,24 +346,44 @@ func (s *Store) initCluster(seed func() error) error {
 // Telemetry replication
 // ---------------------------------------------------------------------------
 
+// telemetryQueue holds telemetry not yet committed to shared storage. Data-plane batches are acknowledged only once
+// their flows left it (IngestFlowBatch → commitTelemetry); pending tracks those flow IDs until the commit.
 type telemetryQueue struct {
-	mu     sync.Mutex
-	flows  []models.TrafficFlow
-	events map[string]models.SecurityEvent
-	stats  map[string]RuleStat
+	mu      sync.Mutex
+	flows   []models.TrafficFlow
+	events  map[string]models.SecurityEvent
+	stats   map[string]RuleStat
+	pending map[string]struct{}
 }
 
 func newTelemetryQueue() *telemetryQueue {
-	return &telemetryQueue{events: map[string]models.SecurityEvent{}, stats: map[string]RuleStat{}}
+	return &telemetryQueue{events: map[string]models.SecurityEvent{}, stats: map[string]RuleStat{}, pending: map[string]struct{}{}}
 }
 
-func (q *telemetryQueue) add(flows []models.TrafficFlow, events []models.SecurityEvent, stats map[string]RuleStat) {
+// trimLocked bounds the queue (oldest flows first) and returns the IDs of the flows it dropped.
+func (q *telemetryQueue) trimLocked() []string {
+	over := len(q.flows) - telemetryQueueMax
+	if over <= 0 {
+		return nil
+	}
+	lost := make([]string, 0, over)
+	for _, f := range q.flows[:over] {
+		delete(q.pending, f.ID)
+		lost = append(lost, f.ID)
+	}
+	q.flows = q.flows[over:]
+	return lost
+}
+
+// add queues telemetry; returns the IDs of flows dropped because the queue was full.
+func (q *telemetryQueue) add(flows []models.TrafficFlow, events []models.SecurityEvent, stats map[string]RuleStat) []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.flows = append(q.flows, flows...)
-	if over := len(q.flows) - telemetryQueueMax; over > 0 {
-		q.flows = q.flows[over:]
+	for _, f := range flows {
+		q.pending[f.ID] = struct{}{}
 	}
+	lost := q.trimLocked()
 	for _, ev := range events {
 		q.events[ev.ID] = ev
 	}
@@ -371,6 +391,27 @@ func (q *telemetryQueue) add(flows []models.TrafficFlow, events []models.Securit
 		cur := q.stats[id]
 		q.stats[id] = RuleStat{Hits: cur.Hits + st.Hits, Bytes: cur.Bytes + st.Bytes}
 	}
+	return lost
+}
+
+// committed marks the flows of a pushed batch as stored.
+func (q *telemetryQueue) committed(b TelemetryBatch) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, f := range b.Flows {
+		delete(q.pending, f.ID)
+	}
+}
+
+func (q *telemetryQueue) anyPending(ids []string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, id := range ids {
+		if _, ok := q.pending[id]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (q *telemetryQueue) take() TelemetryBatch {
@@ -384,14 +425,13 @@ func (q *telemetryQueue) take() TelemetryBatch {
 	return b
 }
 
-// requeue puts a failed batch back (newer data that arrived meanwhile wins).
-func (q *telemetryQueue) requeue(b TelemetryBatch) {
+// requeue puts a failed batch back (newer data that arrived meanwhile wins); returns the IDs of flows dropped
+// because the queue was full.
+func (q *telemetryQueue) requeue(b TelemetryBatch) []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.flows = append(b.Flows, q.flows...)
-	if over := len(q.flows) - telemetryQueueMax; over > 0 {
-		q.flows = q.flows[over:]
-	}
+	lost := q.trimLocked()
 	for _, ev := range b.Events {
 		if _, newer := q.events[ev.ID]; !newer {
 			q.events[ev.ID] = ev
@@ -401,6 +441,7 @@ func (q *telemetryQueue) requeue(b TelemetryBatch) {
 		cur := q.stats[id]
 		q.stats[id] = RuleStat{Hits: cur.Hits + st.Hits, Bytes: cur.Bytes + st.Bytes}
 	}
+	return lost
 }
 
 func (q *telemetryQueue) pendingStats() map[string]RuleStat {
@@ -413,13 +454,17 @@ func (q *telemetryQueue) pendingStats() map[string]RuleStat {
 	return out
 }
 
-// seenSet is a bounded set of recently merged flow IDs.
+// seenSet is a bounded set of recently recorded or merged flow IDs: de-duplicates flows pulled from other replicas
+// and batches a data-plane worker resends (its spool delivers at least once).
 type seenSet struct {
+	mu    sync.Mutex
 	ids   map[string]struct{}
 	order []string
 }
 
 func (s *seenSet) add(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.ids == nil {
 		s.ids = make(map[string]struct{})
 	}
@@ -435,6 +480,20 @@ func (s *seenSet) add(id string) bool {
 		s.order = s.order[10_000:]
 	}
 	return true
+}
+
+func (s *seenSet) has(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.ids[id]
+	return ok
+}
+
+// forget removes an ID whose flow was never stored (its order slot is reclaimed with the oldest entries).
+func (s *seenSet) forget(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.ids, id)
 }
 
 // clusterLoops runs replication until the store is closed.
@@ -515,15 +574,43 @@ func (s *Store) refreshFromCluster(ctx context.Context) {
 	s.log.Debug("configuration refreshed from cluster", "revision", rev)
 }
 
-func (s *Store) flushTelemetry(ctx context.Context) {
+// flushTelemetry commits queued telemetry in one transaction (serialized: a data-plane ingest that finds its flows
+// in a push of the background loop waits for that push).
+func (s *Store) flushTelemetry(ctx context.Context) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	b := s.telemetry.take()
 	if b.empty() {
-		return
+		return nil
 	}
 	if err := s.cluster.PushTelemetry(ctx, b); err != nil {
 		s.log.Warn("telemetry push failed; will retry", "error", err, "flows", len(b.Flows))
-		s.telemetry.requeue(b)
+		if lost := s.telemetry.requeue(b); len(lost) > 0 {
+			for _, id := range lost {
+				s.seenFlows.forget(id)
+			}
+			s.CountFlowDrops("queue_overflow", len(lost))
+			s.log.Error("cluster telemetry queue full: oldest unsaved flows dropped", "flows", len(lost))
+		}
+		return err
 	}
+	s.telemetry.committed(b)
+	return nil
+}
+
+// commitTelemetry returns once none of the given flows waits for shared storage any more.
+func (s *Store) commitTelemetry(ctx context.Context, ids []string) error {
+	if !s.telemetry.anyPending(ids) {
+		return nil
+	}
+	if err := s.flushTelemetry(ctx); err != nil {
+		return err
+	}
+	if s.telemetry.anyPending(ids) {
+		// Taken by a concurrent push that failed meanwhile and requeued them.
+		return errors.New("flows not committed yet")
+	}
+	return nil
 }
 
 func (s *Store) pullTelemetry(ctx context.Context) {

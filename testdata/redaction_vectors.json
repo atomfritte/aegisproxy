@@ -1,0 +1,33 @@
+{
+  "description": "telemetry_query_redaction: shared by data-plane/aegis_dp/redact.py (redact_url) and control-plane/internal/store/redact.go (RedactURL). An empty or unknown mode means sensitive.",
+  "vectors": [
+    {"mode": "sensitive", "in": "https://h.example/p?token=abc&x=1", "out": "https://h.example/p?token=REDACTED&x=1"},
+    {"mode": "none", "in": "https://h.example/p?token=abc&x=1", "out": "https://h.example/p?token=abc&x=1"},
+    {"mode": "all", "in": "https://h.example/p?token=abc&x=1", "out": "https://h.example/p"},
+    {"mode": "", "in": "https://h.example/p?access_token=abc&id_token=def&refresh_token=ghi", "out": "https://h.example/p?access_token=REDACTED&id_token=REDACTED&refresh_token=REDACTED"},
+    {"mode": "bogus", "in": "https://h.example/cb?code=4%2F0Ab&state=xyz", "out": "https://h.example/cb?code=REDACTED&state=xyz"},
+    {"mode": "ALL", "in": "https://h.example/p?a=1", "out": "https://h.example/p"},
+    {"mode": "sensitive", "in": "https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260101&X-Amz-Date=20260101T000000Z&X-Amz-Expires=300&X-Amz-Security-Token=FQo&X-Amz-Signature=deadbeef", "out": "https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=REDACTED&X-Amz-Date=20260101T000000Z&X-Amz-Expires=300&X-Amz-Security-Token=REDACTED&X-Amz-Signature=REDACTED"},
+    {"mode": "sensitive", "in": "https://storage.googleapis.com/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=sa%40p.iam&X-Goog-Signature=0a1b", "out": "https://storage.googleapis.com/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=REDACTED&X-Goog-Signature=REDACTED"},
+    {"mode": "sensitive", "in": "https://acct.blob.core.windows.net/c/b?sv=2022-11-02&se=2026-01-01T00%3A00%3A00Z&sp=r&sig=abc%3D", "out": "https://acct.blob.core.windows.net/c/b?sv=REDACTED&se=REDACTED&sp=r&sig=REDACTED"},
+    {"mode": "sensitive", "in": "https://h.example/p?sv=1&se=2", "out": "https://h.example/p?sv=1&se=2"},
+    {"mode": "sensitive", "in": "https://d1.cloudfront.net/f?Expires=1700000000&Signature=AbC~&Key-Pair-Id=K2", "out": "https://d1.cloudfront.net/f?Expires=REDACTED&Signature=REDACTED&Key-Pair-Id=REDACTED"},
+    {"mode": "sensitive", "in": "https://d1.cloudfront.net/f?Policy=eyJ&KeyPair-Id=K2&Expires=1", "out": "https://d1.cloudfront.net/f?Policy=REDACTED&KeyPair-Id=REDACTED&Expires=REDACTED"},
+    {"mode": "sensitive", "in": "https://h.example/p?expires=1&policy=x", "out": "https://h.example/p?expires=1&policy=x"},
+    {"mode": "sensitive", "in": "https://h.example/p?apiKey=1&monkey=2&design=3&sort_key=4&APIKey=5&keyword=6", "out": "https://h.example/p?apiKey=REDACTED&monkey=2&design=3&sort_key=REDACTED&APIKey=REDACTED&keyword=6"},
+    {"mode": "sensitive", "in": "https://h.example/p?key=1&api_key=2&password=3&passwd=4&secret=5&client_secret=6&auth=7&sig=8&signature=9", "out": "https://h.example/p?key=REDACTED&api_key=REDACTED&password=REDACTED&passwd=REDACTED&secret=REDACTED&client_secret=REDACTED&auth=REDACTED&sig=REDACTED&signature=REDACTED"},
+    {"mode": "sensitive", "in": "https://h.example/p?a=1&&b=2&Session=s&sessionid=x&SESSION_ID=y&author=me", "out": "https://h.example/p?a=1&&b=2&Session=REDACTED&sessionid=REDACTED&SESSION_ID=REDACTED&author=me"},
+    {"mode": "sensitive", "in": "https://h.example/p?to%6Ben=1&to%6Ben%zz=2&q=a+b&my+token=3", "out": "https://h.example/p?to%6Ben=REDACTED&to%6Ben%zz=2&q=a+b&my+token=REDACTED"},
+    {"mode": "sensitive", "in": "https://h.example/p?t%C3%B6ken=1&%FFtoken=2&token%FFid=3", "out": "https://h.example/p?t%C3%B6ken=1&%FFtoken=2&token%FFid=REDACTED"},
+    {"mode": "sensitive", "in": "https://h.example/p?token&x=", "out": "https://h.example/p?token&x="},
+    {"mode": "sensitive", "in": "https://user:pw@h.example/p?code=1", "out": "https://REDACTED@h.example/p?code=REDACTED"},
+    {"mode": "all", "in": "http://user@h.example:8080/a/b?x=1", "out": "http://REDACTED@h.example:8080/a/b"},
+    {"mode": "none", "in": "https://user:pw@h.example/p?code=1", "out": "https://user:pw@h.example/p?code=1"},
+    {"mode": "sensitive", "in": "https://h.example/p", "out": "https://h.example/p"},
+    {"mode": "sensitive", "in": "https://h.example/p?", "out": "https://h.example/p?"},
+    {"mode": "all", "in": "https://h.example/p?", "out": "https://h.example/p"},
+    {"mode": "sensitive", "in": "https://h.example/p?next=%2Fa%3Ftoken%3D1&x=2?token=3", "out": "https://h.example/p?next=%2Fa%3Ftoken%3D1&x=2?token=3"},
+    {"mode": "sensitive", "in": "github.com:443", "out": "github.com:443"},
+    {"mode": "sensitive", "in": "", "out": ""}
+  ]
+}

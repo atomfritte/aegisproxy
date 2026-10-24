@@ -146,8 +146,38 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_export_sink_healthy", "sink", st.ID), up)
 	}
+	s.writeFlowMetrics(w)
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	gauge("aegis_go_heap_bytes", "Go heap in use.", float64(ms.HeapInuse))
 	gauge("aegis_go_goroutines", "Goroutines.", float64(runtime.NumGoroutine()))
+}
+
+// writeFlowMetrics reports traffic-telemetry loss: on the control-plane (aegis_flows_dropped_total) and as reported by
+// each worker in its heartbeat (aegis_dataplane_*). Refused batches are counted in aegis_flow_batches_refused_total.
+func (s *Server) writeFlowMetrics(w io.Writer) {
+	drops := s.store.FlowDrops()
+	fmt.Fprint(w, "# HELP aegis_flows_dropped_total Flow records the control-plane lost, by reason.\n# TYPE aegis_flows_dropped_total counter\n")
+	for _, reason := range []string{"queue_overflow", "batch_too_large"} {
+		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_flows_dropped_total", "reason", reason), drops[reason])
+	}
+	fmt.Fprintf(w, "# HELP aegis_flow_duplicates_total Resent flow records that were stored already.\n# TYPE aegis_flow_duplicates_total counter\naegis_flow_duplicates_total %d\n",
+		s.store.FlowDuplicates())
+	for _, dp := range s.DataPlanes() {
+		if !dp.Healthy {
+			continue
+		}
+		reasons := make([]string, 0, len(dp.FlowsDropped))
+		for r := range dp.FlowsDropped {
+			reasons = append(reasons, r)
+		}
+		sort.Strings(reasons)
+		for _, r := range reasons {
+			fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_dataplane_flows_dropped_total", "dataplane", dp.ID, "reason", r), dp.FlowsDropped[r])
+		}
+		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_dataplane_flow_backlog", "dataplane", dp.ID), dp.FlowBacklog)
+		if dp.PolicyAgeSeconds >= 0 {
+			fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_dataplane_policy_age_seconds", "dataplane", dp.ID), dp.PolicyAgeSeconds)
+		}
+	}
 }

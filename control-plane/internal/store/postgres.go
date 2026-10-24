@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS aegis_flows (
 );
 CREATE INDEX IF NOT EXISTS aegis_flows_ts ON aegis_flows (ts);
 CREATE INDEX IF NOT EXISTS aegis_flows_server_ts ON aegis_flows (server_id, ts);
+-- Data-plane workers deliver at least once (resend after a lost acknowledgement, possibly to another replica).
+ALTER TABLE aegis_flows ADD COLUMN IF NOT EXISTS flow_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS aegis_flows_flow_id ON aegis_flows (flow_id);
 CREATE TABLE IF NOT EXISTS aegis_security_events (
 	id          TEXT PRIMARY KEY,
 	ts          TIMESTAMPTZ NOT NULL,
@@ -370,8 +373,9 @@ func (b *PostgresBackend) PushTelemetry(ctx context.Context, tb TelemetryBatch) 
 		if err != nil {
 			continue
 		}
-		batch.Queue("INSERT INTO aegis_flows (ts, node_id, server_id, verdict, host, doc) VALUES ($1, $2, $3, $4, $5, $6)",
-			f.Timestamp, b.nodeID, f.ServerID, f.Verdict, f.Host, raw)
+		batch.Queue(`INSERT INTO aegis_flows (ts, node_id, server_id, verdict, host, doc, flow_id) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (flow_id) DO NOTHING`,
+			f.Timestamp, b.nodeID, f.ServerID, f.Verdict, f.Host, raw, f.ID)
 	}
 	for _, ev := range tb.Events {
 		raw, err := json.Marshal(ev)

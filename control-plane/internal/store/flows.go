@@ -2,8 +2,11 @@ package store
 
 import (
 	"aegisproxy/control-plane/internal/export"
+	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +55,8 @@ func validFlowID(id string) bool {
 
 // sanitizeFlow bounds every attacker-influenced field (URLs, user agents and hostnames come
 // straight from proxied traffic) before it is stored, rendered in the UI or forwarded to webhooks.
-func sanitizeFlow(f models.TrafficFlow, now time.Time, i int) models.TrafficFlow {
+// URLs are redacted per telemetry_query_redaction (again: workers redact before sending).
+func sanitizeFlow(f models.TrafficFlow, now time.Time, i int, redaction string) models.TrafficFlow {
 	if !validFlowID(f.ID) {
 		f.ID = fmt.Sprintf("flw-%d-%d", now.UnixNano(), i)
 	}
@@ -72,13 +76,13 @@ func sanitizeFlow(f models.TrafficFlow, now time.Time, i int) models.TrafficFlow
 	f.Scheme = clip(strings.ToLower(f.Scheme), 8)
 	f.Host = clip(engine.NormalizeHost(f.Host), 255)
 	f.Path = clip(oneLine(f.Path), 2048)
-	f.FullURL = clip(oneLine(f.FullURL), 4096)
+	f.FullURL = RedactURL(clip(oneLine(f.FullURL), 4096), redaction)
 	f.UserAgent = clip(oneLine(f.UserAgent), 512)
 	f.Verdict = clip(f.Verdict, 32)
 	f.MatchedRuleID = clip(f.MatchedRuleID, 128)
 	f.MatchedRuleName = clip(oneLine(f.MatchedRuleName), 256)
-	f.RedirectParentURL = clip(oneLine(f.RedirectParentURL), 4096)
-	f.RedirectLocation = clip(oneLine(f.RedirectLocation), 4096)
+	f.RedirectParentURL = RedactURL(clip(oneLine(f.RedirectParentURL), 4096), redaction)
+	f.RedirectLocation = RedactURL(clip(oneLine(f.RedirectLocation), 4096), redaction)
 	f.SessionID = clip(f.SessionID, 64)
 	f.BlockToken = ""
 	f.BlockReason = clip(f.BlockReason, 64)
@@ -114,12 +118,128 @@ func (s *Store) RecordFlow(flow models.TrafficFlow) models.TrafficFlow {
 	return flow
 }
 
+// RecordFlowBatch records flows generated inside the control-plane (simulations, demo traffic). Data-plane telemetry
+// goes through IngestFlowBatch (durable acknowledgement, de-duplication).
 func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow {
 	if len(flows) == 0 {
 		return nil
 	}
+	return s.applyFlows(s.prepareFlows(flows))
+}
+
+// ErrTelemetryUnavailable means a flow batch could not be stored durably; the data-plane keeps it and retries.
+var ErrTelemetryUnavailable = errors.New("telemetry storage unavailable")
+
+// IngestFlowBatch records a batch from a data-plane worker and returns only once it is stored durably: file storage
+// appends it to the fsync'd flow journal (replayed after a crash until the next state save includes it), cluster
+// storage commits it to PostgreSQL. Flow IDs that were recorded before are skipped (a worker resends a batch whose
+// acknowledgement it did not receive) and counted as duplicates. On error nothing new was acknowledged: the caller
+// answers 503 and the worker keeps the batch (backpressure).
+func (s *Store) IngestFlowBatch(ctx context.Context, flows []models.TrafficFlow) ([]models.TrafficFlow, int, error) {
+	if len(flows) == 0 {
+		return nil, 0, nil
+	}
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	prepared := s.prepareFlows(flows)
+	ids := make([]string, 0, len(prepared))
+	fresh := make([]models.TrafficFlow, 0, len(prepared))
+	inBatch := make(map[string]bool, len(prepared))
+	dups := 0
+	for _, f := range prepared {
+		ids = append(ids, f.ID)
+		if inBatch[f.ID] || s.seenFlows.has(f.ID) {
+			dups++
+			continue
+		}
+		inBatch[f.ID] = true
+		fresh = append(fresh, f)
+	}
+	if dups > 0 {
+		s.flowDuplicates.Add(int64(dups))
+	}
+	if s.cluster != nil {
+		for _, f := range fresh {
+			s.seenFlows.add(f.ID)
+		}
+		recorded := s.applyFlows(fresh)
+		// Earlier attempts of resent flows may still wait for the database as well.
+		if err := s.commitTelemetry(ctx, ids); err != nil {
+			return nil, dups, fmt.Errorf("%w: %v", ErrTelemetryUnavailable, err)
+		}
+		return recorded, dups, nil
+	}
+	if s.journal != nil && len(fresh) > 0 {
+		s.journal.gate.RLock()
+		defer s.journal.gate.RUnlock()
+		if err := s.journal.append(fresh); err != nil {
+			s.log.Error("flow journal write failed; telemetry is refused until it works again (workers keep and retry it)", "error", err)
+			return nil, dups, fmt.Errorf("%w: %v", ErrTelemetryUnavailable, err)
+		}
+	}
+	for _, f := range fresh {
+		s.seenFlows.add(f.ID)
+	}
+	return s.applyFlows(fresh), dups, nil
+}
+
+// prepareFlows sanitizes (bounds, redaction) and attributes flows; it changes no state.
+func (s *Store) prepareFlows(flows []models.TrafficFlow) []models.TrafficFlow {
 	if len(flows) > maxFlowBatch {
 		flows = flows[:maxFlowBatch]
+	}
+	s.mu.RLock()
+	redaction := s.state.SecurityPolicy.TelemetryQueryRedaction
+	s.mu.RUnlock()
+	now := time.Now().UTC()
+	out := make([]models.TrafficFlow, len(flows))
+	for i, flow := range flows {
+		flow = sanitizeFlow(flow, now, i, redaction)
+		if flow.ServerID == "" || len(flow.GroupIDs) == 0 {
+			srvID, srvHost, groups := s.ResolveServer(flow.ServerIP, flow.ProxyAuthUser)
+			flow.ServerID = srvID
+			flow.ServerHostname = srvHost
+			flow.GroupIDs = groups
+		}
+		if s.opts.DemoMode && flow.BytesReceived == 0 && flow.BytesSent == 0 {
+			flow.BytesSent, flow.BytesReceived = EstimateFlowBytes(flow)
+		}
+		out[i] = flow
+	}
+	return out
+}
+
+// FlowDuplicates is the number of resent flows that were recorded already (aegis_flow_duplicates_total).
+func (s *Store) FlowDuplicates() int64 { return s.flowDuplicates.Load() }
+
+// FlowDrops counts flow records the control-plane lost, by reason (aegis_flows_dropped_total).
+func (s *Store) FlowDrops() map[string]int64 {
+	s.flowDropsMu.Lock()
+	defer s.flowDropsMu.Unlock()
+	out := make(map[string]int64, len(s.flowDrops))
+	for k, v := range s.flowDrops {
+		out[k] = v
+	}
+	return out
+}
+
+// CountFlowDrops records flow records that were lost (reason: queue_overflow, batch_too_large, ...).
+func (s *Store) CountFlowDrops(reason string, n int) {
+	if n <= 0 {
+		return
+	}
+	s.flowDropsMu.Lock()
+	if s.flowDrops == nil {
+		s.flowDrops = map[string]int64{}
+	}
+	s.flowDrops[reason] += int64(n)
+	s.flowDropsMu.Unlock()
+}
+
+// applyFlows adds prepared flows to the state: grants, rule statistics, security events, sessions, live feed, exports.
+func (s *Store) applyFlows(flows []models.TrafficFlow) []models.TrafficFlow {
+	if len(flows) == 0 {
+		return nil
 	}
 	now := time.Now().UTC()
 	out := make([]models.TrafficFlow, len(flows))
@@ -140,16 +260,6 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 	s.mu.RUnlock()
 
 	for i, flow := range flows {
-		flow = sanitizeFlow(flow, now, i)
-		if flow.ServerID == "" || len(flow.GroupIDs) == 0 {
-			srvID, srvHost, groups := s.ResolveServer(flow.ServerIP, flow.ProxyAuthUser)
-			flow.ServerID = srvID
-			flow.ServerHostname = srvHost
-			flow.GroupIDs = groups
-		}
-		if s.opts.DemoMode && flow.BytesReceived == 0 && flow.BytesSent == 0 {
-			flow.BytesSent, flow.BytesReceived = EstimateFlowBytes(flow)
-		}
 		// Only mint a 302 redirect grant from LEARNING_ALLOWED or from ALLOWED flows whose rule has
 		// FollowRedirects. Never chain from REDIRECT_OBJECT_ALLOWED (single-hop cap).
 		if flow.RedirectLocation != "" {
@@ -201,10 +311,17 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 	}
 
 	reversed := make([]models.TrafficFlow, len(out))
+	outOfOrder := false
 	for i := range out {
 		reversed[i] = out[len(out)-1-i]
+		if len(s.state.Flows) > 0 && out[i].Timestamp.Before(s.state.Flows[0].Timestamp) {
+			outOfOrder = true // delivered late (worker spool, replay): keep the window newest first
+		}
 	}
 	s.state.Flows = append(reversed, s.state.Flows...)
+	if outOfOrder {
+		sort.SliceStable(s.state.Flows, func(i, j int) bool { return s.state.Flows[i].Timestamp.After(s.state.Flows[j].Timestamp) })
+	}
 	if len(s.state.Flows) > maxFlows {
 		s.state.Flows = s.state.Flows[:maxFlows]
 	}
@@ -221,7 +338,14 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 	s.mu.Unlock()
 
 	if s.telemetry != nil {
-		s.telemetry.add(out, touchedEvents, statDeltas)
+		if lost := s.telemetry.add(out, touchedEvents, statDeltas); len(lost) > 0 {
+			// Never acknowledged as durable: a worker that resends them has them recorded again.
+			for _, id := range lost {
+				s.seenFlows.forget(id)
+			}
+			s.CountFlowDrops("queue_overflow", len(lost))
+			s.log.Error("cluster telemetry queue full: oldest unsaved flows dropped", "flows", len(lost))
+		}
 	}
 
 	for _, flow := range out {
@@ -299,6 +423,10 @@ func securityEventsForFlow(f models.TrafficFlow) []models.SecurityEvent {
 		case "internal_error", "unevaluated":
 			// The worker failed closed; frequent occurrences point to a bug or an attack on the parser.
 			add(models.SecurityEventPolicy, "high", "blocked", firstNonEmpty(f.MatchedRuleName, "Data-plane failed closed ("+f.BlockReason+")"), f.Host, "Data-plane")
+		case "policy_stale":
+			// AEGIS_POLICY_MAX_AGE exceeded: the worker blocks everything until it can sync again.
+			add(models.SecurityEventPolicy, "high", "blocked", "Data-plane worker "+firstNonEmpty(f.DataPlaneID, "?")+
+				" failed closed: its policy is older than AEGIS_POLICY_MAX_AGE", f.DataPlaneID, "Data-plane")
 		}
 	}
 	for _, flag := range f.SecurityFlags {
@@ -319,9 +447,42 @@ func securityEventsForFlow(f models.TrafficFlow) []models.SecurityEvent {
 			add(models.SecurityEventPunycode, "low", "detected", "Internationalized (punycode) domain accessed — check for homograph spoofing", f.Host, "Homograph guard")
 		case "AV_ERROR":
 			add(models.SecurityEventAVError, "medium", "detected", "Content scan failed: "+val, "", scanEngine(val))
+		case "CONNECTION_TERMINATED":
+			// A WebSocket, tunnel, stream or relay that was allowed when it opened was closed by a policy change.
+			sev := "medium"
+			if val == "quarantined" || val == "threat_intel" {
+				sev = "high"
+			}
+			add(models.SecurityEventPolicy, sev, "blocked", "Open connection terminated after a policy change: "+connectionTerminationText(val), f.Host, "Data-plane")
 		}
 	}
 	return out
+}
+
+func connectionTerminationText(reason string) string {
+	switch reason {
+	case "quarantined":
+		return "server quarantined"
+	case "threat_intel":
+		return "destination listed by threat intelligence"
+	case "rule_revoked":
+		return "allow rule revoked, disabled or expired"
+	case "block_rule":
+		return "block rule now covers the destination"
+	case "group_changed":
+		return "server group memberships changed"
+	case "learning_session_ended":
+		return "learning session ended"
+	case "redirect_grant_expired":
+		return "redirect grant expired"
+	case "tls_bypass_revoked":
+		return "TLS passthrough rule removed"
+	case "raw_tcp_disabled":
+		return "raw TCP/UDP relaying disabled"
+	case "policy_stale":
+		return "worker policy older than AEGIS_POLICY_MAX_AGE"
+	}
+	return reason
 }
 
 // scanEngine names the engine behind a data-plane scan flag value ("YARA: rule", "icap: timeout", …).

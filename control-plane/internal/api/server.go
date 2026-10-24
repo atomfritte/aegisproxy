@@ -80,6 +80,12 @@ type DataPlaneStatus struct {
 	YARAStatus      string    `json:"yara_status"`
 	ICAPStatus      string    `json:"icap_status"`
 	Healthy         bool      `json:"healthy"`
+	// Policy freshness and telemetry delivery; -1 = not reported (older worker). PolicyMaxAgeSeconds 0 = no limit.
+	PolicyAgeSeconds    int64            `json:"policy_age_seconds"`
+	PolicyMaxAgeSeconds int64            `json:"policy_max_age_seconds"`
+	FlowBacklog         int64            `json:"flow_backlog"`
+	FlowsDropped        map[string]int64 `json:"flows_dropped,omitempty"`
+	FlowsDroppedTotal   int64            `json:"flows_dropped_total"`
 }
 
 func NewServer(d Deps) *Server {

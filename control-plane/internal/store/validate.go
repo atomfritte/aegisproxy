@@ -56,6 +56,7 @@ func DefaultSecurityPolicy() models.SecurityPolicy {
 		ICAPAllowModified:        true,
 		YARAMode:                 "off",
 		YARAMaxBytes:             25 << 20,
+		TelemetryQueryRedaction:  RedactSensitive,
 	}
 }
 
@@ -368,6 +369,12 @@ func validateSecurityPolicy(p *models.SecurityPolicy, groups []models.ServerGrou
 		return err
 	}
 	if err := validateMode("yara_mode", p.YARAMode, "off", "monitor", "block"); err != nil {
+		return err
+	}
+	if p.TelemetryQueryRedaction == "" {
+		p.TelemetryQueryRedaction = RedactSensitive // clients that predate the field
+	}
+	if err := validateMode("telemetry_query_redaction", p.TelemetryQueryRedaction, RedactNone, RedactSensitive, RedactAll); err != nil {
 		return err
 	}
 	if err := validICAPURL("icap_respmod_url", p.ICAPRespmodURL); err != nil {

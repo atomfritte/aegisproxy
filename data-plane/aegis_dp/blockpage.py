@@ -78,6 +78,38 @@ def render_cli(ctx: Dict[str, str], groups: List[str]) -> str:
     )
 
 
+def render_stale(ctx: Dict[str, str], cli: bool) -> Tuple[str, str]:
+    """503 while the worker's policy is older than AEGIS_POLICY_MAX_AGE: (body, csp). Nothing to request — the
+    worker blocks every destination until it can sync with the control-plane again."""
+    text = (f"The security policy of this proxy worker is out of date (last successful update {ctx['age']} ago, "
+            f"maximum {ctx['max_age']}). Every request is blocked until it can reach the control-plane again "
+            "(fail-closed). Retry in a few minutes; if this persists, contact the proxy operators with the trace ID.")
+    if cli:
+        return (
+            "================================================================================\n"
+            " 🛡️  AEGISPROXY — POLICY STALE, REQUEST BLOCKED (HTTP 503)\n"
+            "================================================================================\n"
+            f" {text}\n"
+            f" Blocked URL : [{_clean(ctx['method'])}] {_clean(ctx['url'])}\n"
+            f" Trace ID    : {_clean(ctx['trace_id'])}\n"
+            "================================================================================\n"
+        ), ""
+    nonce = secrets.token_urlsafe(16)
+    e = {k: html.escape(_clean(str(v))) for k, v in ctx.items()}
+    page = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>AegisProxy: policy out of date</title><style nonce="{nonce}">{_STYLE}</style></head>
+<body><div class="c"><div class="card">
+<span class="badge">🛡️ AEGISPROXY • HTTP 503 POLICY STALE</span>
+<h1>Outbound access temporarily blocked</h1>
+<p>{html.escape(text)}</p>
+<div class="grid">
+<div><label>Blocked URL</label><span>[{e['method']}] {e['url']}</span></div>
+<div><label>Trace ID</label><span>{e['trace_id']}</span></div>
+</div></div></div></body></html>"""
+    return page, _csp(nonce, "")
+
+
 _STYLE = """
 :root{--bg:#f8fafc;--card:#fff;--border:#e2e8f0;--accent:#2563eb;--danger:#dc2626;--text:#0f172a;--muted:#64748b}
 @media (prefers-color-scheme:dark){:root{--bg:#0b1220;--card:#111a2e;--border:#24324d;--text:#e2e8f0;--muted:#94a3b8}}

@@ -2,8 +2,9 @@
 
 Served on AEGIS_OPS_ADDR (default 0.0.0.0:9091), separate from the proxy port:
   /healthz  process alive
-  /readyz   a policy bundle has been loaded (the worker enforces the last known policy even if the
-            control-plane becomes unreachable later; staleness is exposed as a metric)
+  /readyz   a policy bundle has been loaded and is not older than AEGIS_POLICY_MAX_AGE (without a maximum age the
+            worker enforces the last known policy however long the control-plane is unreachable; the age is
+            exposed as a metric either way)
   /metrics  Prometheus text format
 """
 
@@ -44,7 +45,8 @@ class Metrics:
         return "\n".join(lines) + "\n"
 
 
-def start_ops_server(addr: str, metrics: Metrics, gauges: Callable[[], Dict[str, float]], ready: Callable[[], bool]):
+def start_ops_server(addr: str, metrics: Metrics, gauges: Callable[[], Dict[str, float]], ready: Callable[[], str]):
+    """``ready`` returns "" when the worker can serve traffic, otherwise why it cannot."""
     host, _, port = addr.rpartition(":")
 
     class Handler(BaseHTTPRequestHandler):
@@ -66,7 +68,8 @@ def start_ops_server(addr: str, metrics: Metrics, gauges: Callable[[], Dict[str,
             if self.path == "/healthz":
                 self._send(200, "ok\n")
             elif self.path == "/readyz":
-                self._send(200, "ready\n") if ready() else self._send(503, "policy not loaded\n")
+                reason = ready()
+                self._send(503, reason + "\n") if reason else self._send(200, "ready\n")
             elif self.path == "/metrics":
                 self._send(200, metrics.render(gauges()), "text/plain; version=0.0.4; charset=utf-8")
             else:

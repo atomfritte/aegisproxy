@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Bug, FileCode2, GitCommitHorizontal, Network, ServerCog, ShieldCheck } from 'lucide-react';
+import { Activity, Bug, FileCode2, GitCommitHorizontal, Inbox, Network, ServerCog, ShieldCheck, Timer } from 'lucide-react';
 import { useConsoleState } from '../../../data/AppData';
 import { useSession } from '../../../data/session';
 import { toTime } from '../../../lib/format';
@@ -38,6 +38,55 @@ export const IcapStatus: React.FC<{ v?: string }> = ({ v }) => {
 const ClamAV: React.FC<{ v: string }> = ({ v }) =>
   v === 'yes' ? <StatusChip tone="success" label="Available" /> : v === 'no' ? <StatusChip tone="warning" label="Not available" /> : <StatusChip tone="neutral" label="Unknown" />;
 
+function shortDuration(s: number): string {
+  if (s >= 3600) return `${Math.round(s / 360) / 10}h`;
+  if (s >= 60) return `${Math.round(s / 60)}m`;
+  return `${s}s`;
+}
+
+/** AEGIS_POLICY_MAX_AGE of the worker: it refuses new connections once its policy is older (fail closed). */
+const PolicyMaxAge: React.FC<{ w: DataPlaneStatus }> = ({ w }) => {
+  const max = w.policy_max_age_seconds ?? -1;
+  const age = w.policy_age_seconds ?? -1;
+  if (max < 0) return <span className="text-[12px] text-fg-subtle">Max age not reported</span>;
+  if (max === 0)
+    return (
+      <Tooltip content="AEGIS_POLICY_MAX_AGE is not set: cut off from the control plane, this worker keeps enforcing its last policy indefinitely — revocations and quarantines do not reach it.">
+        <Badge tone="warning">No max age</Badge>
+      </Tooltip>
+    );
+  const stale = age > max;
+  return (
+    <Tooltip content={`Policy ${age >= 0 ? shortDuration(age) : '?'} old at the last heartbeat. Older than ${shortDuration(max)}, the worker refuses new connections (503 policy_stale).`}>
+      <Badge tone={stale ? 'danger' : 'neutral'}>{stale ? 'Stale — failing closed' : `Max age ${shortDuration(max)}`}</Badge>
+    </Tooltip>
+  );
+};
+
+/** Traffic-record delivery: records lost since the worker started, or waiting for delivery. */
+const Telemetry: React.FC<{ w: DataPlaneStatus }> = ({ w }) => {
+  const lost = w.flows_dropped_total ?? 0;
+  const backlog = w.flow_backlog ?? 0;
+  if (w.flows_dropped_total === undefined && w.flow_backlog === undefined) return <StatusChip tone="neutral" label="Unknown" />;
+  if (lost > 0) {
+    const reasons = Object.entries(w.flows_dropped ?? {})
+      .map(([r, n]) => `${r.replace(/_/g, ' ')}: ${n.toLocaleString()}`)
+      .join(' · ');
+    return (
+      <Tooltip content={`Traffic records lost since the worker started — ${reasons}${backlog ? ` · ${backlog.toLocaleString()} waiting` : ''}`}>
+        <StatusChip tone="warning" label={`${lost.toLocaleString()} lost`} />
+      </Tooltip>
+    );
+  }
+  if (backlog > 0)
+    return (
+      <Tooltip content="Traffic records waiting for delivery to the control plane (kept in memory or in the spool and retried).">
+        <StatusChip tone="info" label={`${backlog.toLocaleString()} waiting`} />
+      </Tooltip>
+    );
+  return <StatusChip tone="success" label="Delivered" />;
+};
+
 /** Data-plane workers (mitmproxy): heartbeat, versions, policy and threat-intel freshness. */
 export const DataPlanesSection: React.FC = () => {
   const state = useConsoleState();
@@ -56,15 +105,19 @@ export const DataPlanesSection: React.FC = () => {
   const icapConfigured = !!(state.security?.policy?.icap_respmod_url || state.security?.policy?.icap_reqmod_url);
   const icapOk = workers.filter((w) => icapState(w.icap_status).tone === 'success').length;
   const icapDown = workers.filter((w) => icapState(w.icap_status).tone === 'danger').length;
+  const lost = workers.reduce((n, w) => n + (w.flows_dropped_total ?? 0), 0);
+  const lossy = workers.filter((w) => (w.flows_dropped_total ?? 0) > 0).length;
+  const noMaxAge = workers.filter((w) => w.healthy && w.policy_max_age_seconds === 0).length;
 
   const policyState = (w: DataPlaneStatus) => {
     const r = bundleRevision(w.bundle_revision);
     if (r === null) return <span className="text-fg-subtle">—</span>;
     const behind = rev - r;
     return (
-      <span className="inline-flex items-center gap-1.5">
+      <span className="inline-flex flex-wrap items-center gap-1.5">
         <MonoValue>r{r}</MonoValue>
         {behind <= 0 ? <Badge tone="success">Current</Badge> : <Badge tone="warning">{behind} behind</Badge>}
+        <PolicyMaxAge w={w} />
       </span>
     );
   };
@@ -127,6 +180,7 @@ export const DataPlanesSection: React.FC = () => {
     { id: 'clamav', header: 'ClamAV', width: 120, sortValue: (w) => w.clamav_available, cell: (w) => <ClamAV v={w.clamav_available} /> },
     { id: 'yara', header: 'YARA', width: 130, sortValue: (w) => yaraState(w.yara_status).key, cell: (w) => <YaraStatus v={w.yara_status} /> },
     { id: 'icap', header: 'ICAP', width: 120, sortValue: (w) => icapState(w.icap_status).label, cell: (w) => <IcapStatus v={w.icap_status} /> },
+    { id: 'telemetry', header: 'Traffic records', width: 130, sortValue: (w) => (w.flows_dropped_total ?? 0) * 1e9 + (w.flow_backlog ?? 0), cell: (w) => <Telemetry w={w} /> },
   ];
 
   const base = (meta?.public_url || window.location.origin).replace(/\/+$/, '');
@@ -135,10 +189,10 @@ export const DataPlanesSection: React.FC = () => {
     <>
       <SectionTitle
         title="Data-plane workers"
-        description="mitmproxy workers that enforce the policy. Each worker reports a heartbeat — versions, ClamAV, YARA compile state and ICAP connectivity — when it fetches the policy bundle; workers without a heartbeat for 60 seconds are shown as unhealthy. Status is that of the control-plane replica answering this request."
+        description="mitmproxy workers that enforce the policy. Each worker reports a heartbeat — versions, ClamAV, YARA compile state, ICAP connectivity, policy age and traffic records it lost or still has to deliver — when it fetches the policy bundle; workers without a heartbeat for 60 seconds are shown as unhealthy. Status is that of the control-plane replica answering this request."
       />
       {workers.length > 0 && (
-        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-3">
+        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
           <StatTile label="Healthy workers" value={`${healthy} / ${workers.length}`} icon={Activity} tone={healthy === workers.length ? 'success' : 'danger'} attention={healthy < workers.length} />
           <StatTile label="On the current policy" value={`${current} / ${workers.length}`} icon={GitCommitHorizontal} tone={current === workers.length ? 'success' : 'warning'} hint={`Revision ${rev}`} />
           <StatTile label="Threat intel" value={tiVersion ? tiVersion.slice(0, 10) : '—'} icon={ShieldCheck} hint="Version compiled by the control plane" />
@@ -167,6 +221,21 @@ export const DataPlanesSection: React.FC = () => {
             hint={icapConfigured ? (icapDown ? `Unreachable from ${icapDown}` : 'RESPMOD / REQMOD services') : 'No ICAP service configured'}
             to="/threats/policy#icap"
           />
+          <StatTile
+            label="Traffic records lost"
+            value={lost.toLocaleString()}
+            icon={Inbox}
+            tone={lost ? 'warning' : 'neutral'}
+            attention={lost > 0}
+            hint={lost ? `Reported by ${lossy} worker${lossy === 1 ? '' : 's'} since their start` : 'No loss reported by the workers'}
+          />
+          <StatTile
+            label="Policy max age set"
+            value={`${workers.filter((w) => w.healthy && (w.policy_max_age_seconds ?? -1) > 0).length} / ${healthy}`}
+            icon={Timer}
+            tone={noMaxAge ? 'warning' : 'neutral'}
+            hint={noMaxAge ? `${noMaxAge} without AEGIS_POLICY_MAX_AGE` : 'Workers fail closed on a stale policy'}
+          />
         </div>
       )}
       <DataTable
@@ -193,6 +262,9 @@ export const DataPlanesSection: React.FC = () => {
               </span>
               <span className="inline-flex items-center gap-1 text-fg-subtle">
                 ICAP <IcapStatus v={w.icap_status} />
+              </span>
+              <span className="inline-flex items-center gap-1 text-fg-subtle">
+                Records <Telemetry w={w} />
               </span>
             </div>
           </div>
