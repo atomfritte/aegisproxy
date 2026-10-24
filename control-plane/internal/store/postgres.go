@@ -287,9 +287,40 @@ func (b *PostgresBackend) RecentAudit(ctx context.Context, limit int) ([]models.
 }
 
 func (b *PostgresBackend) StreamAudit(ctx context.Context, fn func(raw []byte) error) error {
+	return streamAudit(ctx, b.pool, fn)
+}
+
+// AuditSnapshot reads the configuration and streams the complete audit trail from one consistent
+// snapshot (REPEATABLE READ), so the anchor and checkpoint stored with the configuration and the
+// trail they seal belong together.
+func (b *PostgresBackend) AuditSnapshot(ctx context.Context, config func(doc []byte, rev uint64) error, fn func(raw []byte) error) error {
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var rev int64
+	var doc []byte
+	if err := tx.QueryRow(ctx, "SELECT revision, doc FROM aegis_config WHERE id = 1").Scan(&rev, &doc); err != nil {
+		return fmt.Errorf("read the stored configuration: %w", err)
+	}
+	if err := config(doc, uint64(rev)); err != nil {
+		return err
+	}
+	return streamAudit(ctx, tx, fn)
+}
+
+// CountAudit counts the stored audit events, including the ones written in this transaction.
+func (t *pgTx) CountAudit(ctx context.Context) (int, error) {
+	var n int64
+	err := t.tx.QueryRow(ctx, "SELECT count(*) FROM aegis_audit").Scan(&n)
+	return int(n), err
+}
+
+func streamAudit(ctx context.Context, q pgQuerier, fn func(raw []byte) error) error {
 	var last int64
 	for {
-		rows, err := b.pool.Query(ctx, "SELECT seq, doc FROM aegis_audit WHERE seq > $1 ORDER BY seq LIMIT 5000", last)
+		rows, err := q.Query(ctx, "SELECT seq, doc FROM aegis_audit WHERE seq > $1 ORDER BY seq LIMIT 5000", last)
 		if err != nil {
 			return err
 		}

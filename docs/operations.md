@@ -124,6 +124,9 @@ Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prom
 - `aegis_audit_log_writable == 0` — the audit log cannot be written (disk full, replaced file); with file
   storage configuration changes are refused until it recovers ([audit trail](#audit-trail); not yet part of the
   shipped `PrometheusRule`)
+- `aegis_audit_trail_intact == 0` — an audit trail integrity violation was detected; `aegis_audit_legacy_pending
+  == 1` — unkeyed pre-2.1 events await acceptance ([audit trail](#audit-trail); not yet part of the shipped
+  `PrometheusRule`)
 
 Logs are structured JSON (`AEGIS_LOG_FORMAT=json`). Audit events are written as `msg="audit"` log lines and to
 `audit.jsonl`. To forward audit, traffic ("browsing") and security records to a SIEM or observability platform
@@ -145,16 +148,48 @@ refuses to start with it. The console keeps the latest 2,000 events in memory; t
 hash the trail starts from (genesis, or a retention point) and the end of the pre-2.1 prefix. Events written
 before 2.1 keep their unkeyed SHA-256 hash (`hash_version` absent) and stay verifiable — but only as that sealed
 prefix: an unkeyed event after the first keyed one, or anywhere in a trail that has no pre-2.1 prefix, fails the
-verification (a "hash-version downgrade": the unkeyed hash can be recomputed by anyone). The anchor is sealed at
-the first start of a release that has it: from the complete trail on upgrade (recorded as `AUDIT_ANCHOR_SEALED`),
-at initialization for new installations. During a rolling cluster upgrade, replicas of older releases drop it from
-the configuration when they write; it is sealed again (and audited again) once they are gone.
+verification (a "hash-version downgrade": the unkeyed hash can be recomputed by anyone). A new installation seals
+its anchor at initialization; an existing installation without one is handled as a [legacy
+trail](#legacy-trail-after-an-upgrade-from-20) that a Super Admin must accept.
+
+**Head checkpoint.** Every change also stores a sealed *checkpoint* in the configuration: `event_hash` and revision
+of the newest event, the number of events since the anchor and the configuration revision, with a MAC keyed with
+the audit chain key. It is written in the same atomic step as the state (file mode: the state file; cluster: the
+configuration row, in the transaction that inserts the audit rows). The verification compares the complete trail
+with it, so deleting the newest events — lines of `audit.jsonl`, the newest generation, `aegis_audit` rows — is
+detected although the remaining chain still links correctly, and so is a checkpoint copied from an older state.
+
+**Integrity violations.** At start-up, and on every cluster reload, the control-plane checks anchor and
+checkpoint against the trail. A missing anchor or checkpoint in a trail written by 2.1 or later (keyed events, an
+audit chain key or a checkpoint exist), an invalid seal, a cut start or a cut end is an *integrity violation*: it is
+logged, recorded as an `AUDIT_INTEGRITY_VIOLATION` audit event and raised as a high-severity security event (sent to
+Teams/Slack/webhooks when *notify on security events* is on); `aegis_audit_trail_intact` drops to 0, the posture
+check *Audit hash chain intact* fails and `GET /api/audit/verify` reports it. The control-plane keeps running. The
+violation is sealed into the checkpoint and **stays** — across restarts, on every replica and also when the
+evidence is put back afterwards — until the data is restored from a backup taken before it: compare the trail with
+your SIEM copy, preserve the affected `DATA_DIR` or database for the investigation, then restore. The same alert
+(without a violation) is raised for every retention point (`AUDIT_RETENTION_APPLIED`), every anchor sealed for an
+existing installation (`AUDIT_LEGACY_PENDING`) and every acceptance of legacy events (`AUDIT_LEGACY_ACCEPTED`).
+
+**What only an independent copy reveals.** A complete rollback — state (or configuration row) and trail replaced
+together by an older, consistent copy such as a backup — is internally intact and cannot be detected by the
+control-plane. Neither can anything done by somebody who also holds the encryption key (and with it the audit chain
+key): keep `AEGIS_ENCRYPTION_KEY` outside `DATA_DIR` ([encryption key](#encryption-key)). Forward the audit stream
+to a SIEM in real time ([log-export.md](log-export.md)); without it the posture check *Audit trail forwarded to a
+SIEM* fails in production. Besides the audit events the stream carries `AUDIT_CHECKPOINT` records — at start-up,
+every 100 events and at least every 15 minutes while the trail grows — whose `after_state` holds the checkpoint
+(`head`, `head_revision`, `events`, `state_revision`, `violation`). Alert in the SIEM when checkpoint records stop
+arriving, when `events` decreases, or when a later verification reports fewer `events_checked` than the last
+checkpoint received (allow for retention points, which are audited). Checkpoint records are not audit events: they
+are neither in `audit.jsonl`/`aegis_audit` nor in the console, have no `event_hash` and must be skipped when you
+check the links of the exported stream.
 
 | Endpoint | Content |
 |---|---|
-| `GET /api/audit/verify` | `{valid, events_checked, first_id, last_id, legacy_events, starts_at_genesis, head_matches[, error]}` — checks every hash and link of the **complete** trail (same sources as the export), that it starts at its sealed origin, that unkeyed events occur only in the sealed pre-2.1 prefix, and that it reaches the newest event known to the control-plane (missing newest events or generations fail); Super Admin, InfoSec, Auditor |
+| `GET /api/audit/verify` | `{valid, events_checked, first_id, last_id, legacy_events, starts_at_genesis, head_matches, checkpoint_matches, checkpoint_events, legacy_pending[, legacy_head][, error]}` — checks every hash and link of the **complete** trail (same sources as the export), that it starts at its sealed origin, that unkeyed events occur only in the sealed pre-2.1 prefix, that it reaches the newest event known to the control-plane (missing newest events or generations fail) and that it matches the sealed checkpoint (newest hash, event count, configuration revision); fails with `legacy_pending` while a legacy prefix awaits acceptance; Super Admin, InfoSec, Auditor |
 | `GET /api/audit/export` | the **complete** trail as JSON Lines, oldest first: cluster mode streams the `aegis_audit` table; file mode streams `audit.jsonl` and all its rotated generations (`audit.jsonl-YYYYMMDD[.gz]`, `audit.jsonl-YYYYMMDDhhmmss[.gz]`, `audit.jsonl.N[.gz]`) in the same directory — also while `audit.jsonl` itself is missing after a logrotate rename — as a consistent snapshot of the moment the export started |
-| `POST /api/audit/retention` | after you removed old generations (or `aegis_audit` rows) for retention: verifies the remaining trail and re-seals its start (Super Admin; recorded as `AUDIT_RETENTION_APPLIED`). Until then the verification reports the missing start |
+| `POST /api/audit/retention` | after you removed old generations (or `aegis_audit` rows) for retention: verifies the remaining trail and re-seals its start (Super Admin; recorded as `AUDIT_RETENTION_APPLIED`, raises a security event). Until then the verification reports the missing start. Refused while an integrity violation is recorded |
+| `POST /api/audit/anchor/accept-legacy` | `{legacy_events, legacy_head}`: accepts the pending legacy prefix ([below](#legacy-trail-after-an-upgrade-from-20); Super Admin; recorded as `AUDIT_LEGACY_ACCEPTED`, raises a security event) |
 
 The export is streamed (no size limit, no write timeout) and is available to Super Admins, InfoSec Approvers and
 Auditors (Team Leads see only the audit events of their groups in the console). Generations are ordered by
@@ -167,7 +202,7 @@ nanoseconds, UTC)|actor|actor_role|action|category|entity_type|entity_id|entity_
 `GET /api/audit/verify` (reference implementation: `computeAuditEventHash` in
 `control-plane/internal/store/audit.go`). Shipping the audit stream to a SIEM in real time gives you an
 independent copy to compare against — the only defence against somebody who controls the server and replaces
-state, key and trail together.
+state, key and trail together (see [above](#audit-trail)).
 
 **Durability (file mode).** Every event is written and flushed (`fsync`) to `audit.jsonl` before the change is
 acknowledged; the state file follows within a second. After a crash in between, the next start adopts the events
@@ -177,8 +212,9 @@ log. A failed or partial write (disk full) is cut off again — the log never ke
 cannot be written the control-plane refuses configuration changes with HTTP 503 (`audit log unavailable`); the
 posture check *Audit log writable* fails, `aegis_audit_log_writable` is 0 and `/readyz` reports
 `"audit_log": "unavailable"` (reads and policy distribution continue). Changes resume, and the log is completed,
-as soon as it can be written again. The audit log and its generations must be regular files: a symbolic link or
-FIFO at their names is refused (point `AEGIS_AUDIT_LOG` at the real location instead of linking it).
+as soon as it can be written again. A break-glass sign-in is refused (HTTP 503) while its audit event cannot be
+written. The audit log and its generations must be regular files: a symbolic link, junction or FIFO at their names
+is refused (point `AEGIS_AUDIT_LOG` at the real location instead of linking it).
 
 Rotation works on every platform without losing events:
 
@@ -201,6 +237,58 @@ audit log starts a new chain (with a new key) behind the old one, which then no 
 with all generations, plus events only the state held) into `aegis_audit`; events already stored are skipped, so a
 repeated migration does not duplicate them.
 
+### Legacy trail after an upgrade from 2.0
+
+The first 2.1 start on an existing installation without an anchor seals the unkeyed prefix as **pending**
+(`AUDIT_ANCHOR_SEALED`, security event `AUDIT_LEGACY_PENDING`). Somebody who removed the audit chain key, anchor
+and checkpoint and re-hashed a rewritten trail with the unkeyed algorithm produces exactly the same picture, so
+AegisProxy never trusts such a prefix on its own: until a Super Admin accepts it, the verification fails with
+`legacy_pending`, the posture check *Audit hash chain intact* fails and `aegis_audit_legacy_pending` is 1. Everything
+else works normally and new events are keyed.
+
+1. **Before the upgrade**, archive the complete trail outside the server: the export, a copy of `audit.jsonl*`
+   (cluster: `pg_dump -t aegis_audit`) or the SIEM copy.
+2. After the upgrade, **Audit trail → Verify hash chain** (or `GET /api/audit/verify`) shows the number of legacy
+   events (`legacy_events`) and the `event_hash` of the last one (`legacy_head`).
+3. Compare both with the archive: the number of events and the `event_hash` of the newest event before the upgrade
+   (export: `wc -l < audit.jsonl` and `tail -n1 audit.jsonl | jq -r .event_hash`).
+4. If they match, a Super Admin chooses **Review and accept…** and enters the count and the hash from the archive
+   (`POST /api/audit/anchor/accept-legacy` with `{"legacy_events": 1234, "legacy_head": "…"}`); both must match
+   exactly and the rest of the trail must verify. The acceptance applies to every replica, is audited and raises a
+   high-severity security event; afterwards the posture check warns as long as legacy events exist.
+5. If they do not match, there is no archive to compare with, or the installation already ran 2.1 before (then
+   the audit chain key and anchor were removed): **do not accept** — restore from a backup and investigate.
+
+Installations that ran a pre-release 2.1 build without checkpoints report an integrity violation after
+the update: archive the trail and [start a new one](#starting-a-new-trail). The same applies to the [lost
+encryption key](#encryption-key): the keyed trail can no longer be verified.
+
+### Starting a new trail
+
+Only when the existing trail cannot be verified any more (encryption key lost, pre-release data) and is archived:
+stop all replicas; file mode: move `audit.jsonl*` away and remove `audit_chain_key`, `audit_anchor`,
+`audit_checkpoint` and `audit_events` from `aegis_state.json` (`jq 'del(.audit_chain_key, .audit_anchor,
+.audit_checkpoint, .audit_events)'`); cluster: archive and empty `aegis_audit` and remove the same keys from
+`aegis_config.doc`. The next start seals an empty pending prefix: accept it with `legacy_events` 0 and
+`legacy_head` of 64 zeros. Like every acceptance this is audited and alerted — which is also what an insider who
+discards the trail would have to get past.
+
+### What somebody with access to the storage can and cannot do
+
+Against a person who can write `DATA_DIR` or the database but does not hold `AEGIS_ENCRYPTION_KEY` (key kept
+outside `DATA_DIR`):
+
+| They can | They cannot (detected locally) |
+|---|---|
+| Delete or corrupt the data — detected as a violation (or, without a state file, a new installation without its configuration); recoverable from backups | Change, insert, reorder or delete individual events, also not at the start or the end (keyed chain, anchor, checkpoint) |
+| Replace state and trail together with an older complete copy (rollback) — **only the SIEM copy reveals it** | Remove the anchor, checkpoint or audit chain key without an integrity violation or a pending legacy prefix plus alert |
+| Discard key, seals and trail and present a re-hashed unkeyed trail — it stays untrusted (`legacy_pending`, posture fail, alert) unless a Super Admin accepts it | Forge a seal, hide a recorded violation, or make an unkeyed trail verify without a Super Admin's audited acceptance |
+
+Whoever also holds the encryption key (key in `DATA_DIR`, root on the host, database plus secret store) can
+recompute chain and seals: only the real-time SIEM copy protects against that. Super Admins can accept legacy
+prefixes and apply retention points through the API — both audited and alerted — but cannot delete or change
+events. See also the [threat model](threat-model.md#audit-trail-against-insiders).
+
 ## Security posture
 
 The console's security posture page (summarized on the overview) and `GET /api/system/posture` (InfoSec, Super
@@ -216,9 +304,9 @@ Score: every `pass` counts 2 points, `warn` 1 and `fail` 0 out of 2; `info` chec
 | Category | Checks |
 |---|---|
 | platform | HTTPS for console and API · demo mode off · `/metrics` protected · interception CA validity (warn < 90 days, fail < 30 days) · data-plane workers reporting |
-| data | secrets encrypted at rest |
+| data | secrets encrypted at rest (warn when the key is stored in `DATA_DIR`) |
 | identity | bootstrap password file removed · SSO enabled · password login limited to break-glass accounts · 2–5 Super Admins · 1–2 break-glass accounts · no accounts unused for 90 days · no service-account key expiring within 14 days · service accounts restricted to source networks |
-| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM · audit hash chain intact (warn while legacy pre-2.1 events exist) · audit log writable (shown when it is not) |
+| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM (fail in production, warn in demo mode) · audit hash chain intact (fail after an integrity violation and while legacy events await acceptance, warn while accepted pre-2.1 events exist) · audit log writable (shown when it is not) |
 | detection | threat intelligence in `block` mode · downloads scanned (ClamAV, ICAP or YARA) · DLP active · threat-intel sources up to date |
 
 ## Backup and restore
@@ -294,6 +382,10 @@ on the local network, threat intelligence on, YARA/ICAP/ClamAV off:
   `AEGIS_ENCRYPTION_KEY`** (identical on every replica, `openssl rand -hex 32`, Helm: `secrets.encryptionKey` or
   the `encryption-key` entry of `secrets.existingSecret`, systemd: `/etc/aegis/secrets/encryption.key`, Windows:
   `secrets\encryption.key`); replicas refuse to start without it. Provision the key before rolling out 2.1.
+- **Audit trail**: archive the complete trail before upgrading; after the first start a Super Admin compares and
+  accepts the pre-2.1 events ([legacy trail](#legacy-trail-after-an-upgrade-from-20)) — until then the posture
+  check *Audit hash chain intact* fails. Configure a log export destination with the audit stream: production
+  installations without one fail the posture check *Audit trail forwarded to a SIEM*.
 - Identity: existing local Super Admins are marked as break-glass accounts; review the flag
   ([identity.md](identity.md#break-glass-accounts)). SSO settings can now only be changed by Super Admins.
 - Learning sessions: publishing rules of a session that is still recording is rejected with HTTP 409 — stop the
@@ -341,6 +433,13 @@ on the local network, threat intelligence on, YARA/ICAP/ClamAV off:
 
 ### Encryption key
 
+Keep the key outside `DATA_DIR` (Kubernetes or Docker secret, systemd credential, vault agent): it also protects
+the audit chain key, and a key next to the data protects neither against anybody who can read the data directory.
+A key read from `DATA_DIR` — the auto-generated `secrets/encryption.key` or an `AEGIS_ENCRYPTION_KEY_FILE` inside it
+— logs a warning at start-up and turns the posture check *Secrets encrypted at rest* into a warning. To move it,
+copy the key to the secret store, point `AEGIS_ENCRYPTION_KEY_FILE` (or `AEGIS_ENCRYPTION_KEY`) at it, restart and
+delete it from `DATA_DIR`.
+
 Secrets in the configuration are stored as `enc:v1:<key id>:<ciphertext>`. The key id (8 hex characters) is
 logged at start-up (`secrets at rest are encrypted … key_id=…`); `grep -o 'enc:v1:[0-9a-f]*' aegis_state.json |
 sort | uniq -c` shows which keys are in use. With `AEGIS_ENCRYPTION_KEY_PREVIOUS` the control-plane decrypts
@@ -381,7 +480,9 @@ Where to set the variables:
 **Wrong or missing key**: the control-plane refuses to start and names the key id it needs (`secret was
 encrypted with key <id>, which is not configured`) — nothing is overwritten. Restore the key from your vault.
 If it is irrecoverably lost, stop all replicas, blank the encrypted values and re-enter the integration secrets
-(SSO and Defender client secrets, feed auth headers, export credentials, webhook URLs) after the start:
+(SSO and Defender client secrets, feed auth headers, export credentials, webhook URLs) after the start. Blanking
+also removes the audit chain key: the existing trail can no longer be verified and is reported as an integrity
+violation — archive it and [start a new trail](#starting-a-new-trail).
 
 ```bash
 # file mode

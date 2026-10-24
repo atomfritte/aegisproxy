@@ -532,11 +532,11 @@ func IsDomainWidePathPattern(pattern string) bool {
 // and request path are canonicalized first (CanonicalizePath: query ignored, dot-segments and repeated slashes
 // resolved), then:
 //
-//	*      a whole segment ("/simple/*"): exactly one non-empty segment; inside a segment ("/v*.json"): any
-//	       characters except '/'
-//	/**    a whole segment: zero or more segments ("/acme/**" matches /acme, /acme/x and /acme/x/y;
-//	       "/a/**/b" matches /a/b and /a/x/y/b)
-//	**     inside a segment ("/release-asset-**"): any characters including '/'
+//   - a whole segment ("/simple/*"): exactly one non-empty segment; inside a segment ("/v*.json"): any
+//     characters except '/'
+//     /**    a whole segment: zero or more segments ("/acme/**" matches /acme, /acme/x and /acme/x/y;
+//     "/a/**/b" matches /a/b and /a/x/y/b)
+//     **     inside a segment ("/release-asset-**"): any characters including '/'
 //
 // Matching is a linear-time automaton (no backtracking), so hostile request paths cannot blow it up.
 const (

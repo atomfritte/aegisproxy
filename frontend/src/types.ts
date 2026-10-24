@@ -1141,6 +1141,17 @@ export interface AuditVerifyResult {
   starts_at_genesis?: boolean;
   /** The trail reaches the newest event known to the control-plane. */
   head_matches?: boolean;
+  /** The trail matches the sealed head checkpoint (newest hash, event count, configuration revision). */
+  checkpoint_matches?: boolean;
+  /** Event count recorded in the sealed head checkpoint. */
+  checkpoint_events?: number;
+  /**
+   * The unkeyed pre-2.1 prefix has not been accepted yet: the trail is not trusted until a Super Admin
+   * accepts it (api.audit.acceptLegacy) after comparing count and last hash with an archived export.
+   */
+  legacy_pending?: boolean;
+  /** Hash of the last legacy event; only set while legacy_pending. */
+  legacy_head?: string;
 }
 
 export interface UserInput {

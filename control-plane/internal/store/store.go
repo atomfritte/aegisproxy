@@ -96,6 +96,9 @@ type StateSnapshot struct {
 	// AuditAnchor seals where the audit trail starts and where its unkeyed pre-2.1 prefix ends
 	// (JSON keyed with the audit chain key, sealed at rest); never exposed by the API.
 	AuditAnchor sealed.String `json:"audit_anchor,omitempty"`
+	// AuditCheckpoint seals the newest end of the audit trail together with this state (keyed with
+	// the audit chain key, recomputed on every save); never exposed by the API.
+	AuditCheckpoint *AuditCheckpoint `json:"audit_checkpoint,omitempty"`
 	// SSOClientKeys authenticate the console to the IdP with private_key_jwt (private keys sealed).
 	SSOClientKeys []models.SSOClientKey `json:"sso_client_keys,omitempty"`
 	// SCIM configures inbound provisioning (token digests only); SCIMGroups are the pushed groups.
@@ -152,11 +155,18 @@ type Store struct {
 	importedTelemetry bool
 	importedFileState bool // the cluster was initialized from a single-node state file
 	// auditIntegrityErr is set at start-up when the audit trail cannot be trusted (state and audit log
-	// diverged, invalid anchor); verification and the posture check report it.
+	// diverged, invalid or missing anchor or checkpoint); verification and the posture check report
+	// it. auditViolations are the violations not yet recorded (reportAuditViolationsLocked).
 	auditIntegrityErr string
-	closed            chan struct{}
-	closeOnce         sync.Once
-	persistWG         sync.WaitGroup
+	auditViolations   []string
+	auditAtLoad       auditLoaded
+	// Last AUDIT_CHECKPOINT record published to the audit export stream.
+	lastCheckpointExport time.Time
+	lastCheckpointHead   string
+	lastCheckpointEvents int
+	closed               chan struct{}
+	closeOnce            sync.Once
+	persistWG            sync.WaitGroup
 
 	engine   *engine.PolicyEngine
 	notifier *notify.Dispatcher
@@ -212,6 +222,7 @@ func NewStore(opts Options) (*Store, error) {
 			s.log.Error("could not seal the audit trail anchor", "error", err)
 		}
 		s.mu.Lock()
+		s.exportAuditCheckpointLocked()
 		for _, f := range s.state.Flows {
 			s.traffic.add(f)
 		}
@@ -375,6 +386,7 @@ func (s *Store) asyncDiskPersistLoop() {
 		}
 		s.persist(false)
 		s.retryAuditSink()
+		s.exportAuditCheckpointIfDue()
 	}
 }
 
@@ -394,7 +406,7 @@ func (s *Store) persist(force bool) {
 	s.mu.Unlock()
 
 	s.mu.RLock()
-	data, err := json.Marshal(s.state)
+	data, err := s.marshalStateLocked()
 	s.mu.RUnlock()
 	if err != nil {
 		s.log.Error("state marshal failed", "error", err)
@@ -461,6 +473,7 @@ func (s *Store) loadOrSeed() error {
 			return fmt.Errorf("state file %s is corrupt (%v); restore %s.bak or move it away to start fresh", s.filePath, err, s.filePath)
 		}
 		_ = os.Chmod(s.filePath, 0o600)
+		s.noteAuditLoadedLocked()
 		s.log.Info("state loaded", "path", s.filePath, "revision", s.state.Revision, "schema", s.state.SchemaVersion)
 	case err == nil || errors.Is(err, os.ErrNotExist):
 		s.state = StateSnapshot{SchemaVersion: currentSchemaVersion}
@@ -473,12 +486,18 @@ func (s *Store) loadOrSeed() error {
 	default:
 		return fmt.Errorf("read state: %w", err)
 	}
-	// Before anything appends to the chain: line up the audit log with the loaded state and seal or
-	// check the trail anchor.
+	// Before anything appends to the chain: check the sealed end of the trail saved with the state,
+	// line up the audit log with it, then check (or seal) the anchor; violations are recorded last.
+	var recovered *models.AuditEvent
 	if existing {
-		s.reconcileAuditTrailLocked()
+		s.checkAuditCheckpointLocked()
+		recovered = s.reconcileAuditTrailLocked()
 	}
 	s.ensureFileAuditAnchorLocked(existing)
+	if recovered != nil {
+		s.appendAuditLocked(*recovered)
+	}
+	s.reportAuditViolationsLocked()
 
 	s.migrateLocked()
 	if err := s.ensureBootstrapAdminLocked(); err != nil {
@@ -504,6 +523,7 @@ func (s *Store) loadOrSeed() error {
 	}
 	s.dirty = true // always rewritten at start: migrations and re-encryption after a key rotation
 	s.persistNow()
+	s.exportAuditCheckpointLocked()
 	return nil
 }
 
@@ -525,10 +545,20 @@ func (s *Store) emitAudit(ev models.AuditEvent) {
 		_ = s.opts.AuditSink.Write(ev)
 	}
 	s.opts.Exporter.Publish(export.AuditEvent(ev))
+	if cp := s.state.AuditCheckpoint; cp != nil && cp.Events/auditCheckpointEvery != s.lastCheckpointEvents/auditCheckpointEvery {
+		s.exportAuditCheckpointLocked()
+	}
+}
+
+// marshalStateLocked serializes the state with its audit checkpoint sealed for exactly this content.
+func (s *Store) marshalStateLocked() ([]byte, error) {
+	snap := s.state
+	snap.AuditCheckpoint = s.sealedCheckpointLocked()
+	return json.Marshal(snap)
 }
 
 func (s *Store) persistNow() {
-	data, err := json.Marshal(s.state)
+	data, err := s.marshalStateLocked()
 	if err != nil {
 		return
 	}

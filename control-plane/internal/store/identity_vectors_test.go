@@ -34,14 +34,14 @@ func TestIdentityVectorsSharedWithDataPlane(t *testing.T) {
 			RuleName  string `json:"rule_name"`
 		} `json:"grants"`
 		Cases []struct {
-			Name        string `json:"name"`
-			IP          string `json:"ip"`
-			Auth        string `json:"auth"`
-			Method      string `json:"method"`
-			Host        string `json:"host"`
-			Path        string `json:"path"`
-			Verdict     string `json:"verdict"`
-			ServerID    string `json:"server_id"`
+			Name        string  `json:"name"`
+			IP          string  `json:"ip"`
+			Auth        string  `json:"auth"`
+			Method      string  `json:"method"`
+			Host        string  `json:"host"`
+			Path        string  `json:"path"`
+			Verdict     string  `json:"verdict"`
+			ServerID    string  `json:"server_id"`
 			BlockReason *string `json:"block_reason"`
 		} `json:"cases"`
 	}

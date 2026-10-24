@@ -273,7 +273,8 @@ sessions immediately. Details and IdP setup: [identity.md](identity.md#scim-prov
 |---|---|---|---|
 | POST | `/api/tls-bypass` · `/{id}/toggle`; DELETE `/{id}` | InfoSec | TLS no-break exceptions |
 | POST | `/api/settings/notifications` · `/notifications/test` | InfoSec | Teams/Slack webhook settings (URLs write-only, masked in responses) |
-| GET | `/api/audit/verify` | any | `{valid, events_checked[, error]}` for the events in memory |
+| GET | `/api/audit/verify` | any | verifies the **complete** trail against its sealed anchor and head checkpoint: `{valid, events_checked, legacy_events, legacy_pending[, legacy_head], checkpoint_matches, …[, error]}` ([operations.md](operations.md#audit-trail)) |
+| POST | `/api/audit/anchor/accept-legacy` | Super Admin | `{legacy_events, legacy_head}` — accepts the pending unkeyed pre-2.1 prefix after comparing it with an archived copy; audited, raises an alert ([operations.md](operations.md#legacy-trail-after-an-upgrade-from-20)) |
 | GET | `/api/audit/export` | any | the **complete** audit trail as JSON Lines, oldest first (cluster: database; file mode: `audit.jsonl` and its rotated generations), streamed |
 | POST | `/api/security/feeds/refresh` | InfoSec | `{id}` or `{}` for all |
 | POST/DELETE | `/api/security/indicators`, `/{id}` | InfoSec | custom IOCs |

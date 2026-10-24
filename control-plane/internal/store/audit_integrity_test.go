@@ -138,6 +138,7 @@ func writeLegacyInstallation(t *testing.T, dir, path string) models.AuditEvent {
 	editStateFile(t, dir, func(state map[string]json.RawMessage) {
 		delete(state, "audit_chain_key")
 		delete(state, "audit_anchor")
+		delete(state, "audit_checkpoint")
 		state["audit_events"], _ = json.Marshal([]models.AuditEvent{legacy})
 	})
 	writeAuditLines(t, path, []models.AuditEvent{legacy})
@@ -197,15 +198,52 @@ func TestAuditLegacyPrefixIsSealedAtUpgrade(t *testing.T) {
 	legacy := writeLegacyInstallation(t, dir, path)
 	st, sink := openAuditStore(t, dir, path)
 	mkAuditGroups(t, st, 2)
+	// The unkeyed prefix is sealed but not trusted: verification fails until a Super Admin accepts it.
 	res := st.VerifyCompleteAudit(context.Background(), path)
-	if !res.OK || res.Legacy != 1 || res.FirstID != legacy.ID {
-		t.Fatalf("upgraded trail: %+v", res)
+	if res.OK || !res.LegacyPending || res.LegacyHead != legacy.EventHash || res.Legacy != 1 || !strings.Contains(res.Error, "legacy_pending") {
+		t.Fatalf("upgraded trail accepted without a Super Admin: %+v", res)
 	}
-	if st.AuditStatus().LegacyEvents != 1 {
-		t.Fatalf("legacy events not reported: %+v", st.AuditStatus())
+	if s := st.AuditStatus(); s.LegacyEvents != 1 || !s.LegacyPending || s.LegacyHead != legacy.EventHash {
+		t.Fatalf("pending legacy events not reported: %+v", s)
 	}
 	if got := st.GetSnapshot().AuditEvents; got[len(got)-2].Action != "AUDIT_ANCHOR_SEALED" {
 		t.Fatalf("sealing the anchor is not audited: %+v", got[len(got)-2])
+	}
+	if !hasAuditAlert(st, SecurityEventAuditLegacyPending) {
+		t.Fatal("no alert for the pending legacy prefix")
+	}
+	ctx := context.Background()
+	infosec := &auth.TokenClaims{Username: "infosec", Role: models.RoleInfoSecApprover, AllowedGroups: []string{"*"}}
+	if _, err := st.AcceptLegacyAudit(ctx, path, 1, legacy.EventHash, infosec); err == nil || !strings.HasPrefix(err.Error(), "RBAC") {
+		t.Fatalf("legacy prefix accepted by an InfoSec Approver: %v", err)
+	}
+	if _, err := st.AcceptLegacyAudit(ctx, path, 2, legacy.EventHash, adminClaims); err == nil {
+		t.Fatal("legacy prefix accepted with a wrong event count")
+	}
+	if _, err := st.AcceptLegacyAudit(ctx, path, 1, zeroHash, adminClaims); err == nil {
+		t.Fatal("legacy prefix accepted with a wrong last hash")
+	}
+	if res, err := st.AcceptLegacyAudit(ctx, path, 1, strings.ToUpper(legacy.EventHash), adminClaims); err != nil || !res.OK {
+		t.Fatalf("accept legacy prefix: %v %+v", err, res)
+	}
+	res = st.VerifyCompleteAudit(ctx, path)
+	if !res.OK || res.Legacy != 1 || res.FirstID != legacy.ID || res.LegacyPending || !res.CheckpointMatches {
+		t.Fatalf("accepted trail: %+v", res)
+	}
+	if got := st.GetSnapshot().AuditEvents[0]; got.Action != "AUDIT_LEGACY_ACCEPTED" || got.Actor != "admin" {
+		t.Fatalf("acceptance not audited: %+v", got)
+	}
+	if !hasAuditAlert(st, SecurityEventAuditLegacyAccepted) {
+		t.Fatal("no alert for the accepted legacy prefix")
+	}
+	if _, err := st.AcceptLegacyAudit(ctx, path, 1, legacy.EventHash, adminClaims); err == nil {
+		t.Fatal("legacy prefix accepted twice")
+	}
+	// Accepted for good: after a restart nothing is pending.
+	closeAuditStore(st, sink)
+	st, sink = openAuditStore(t, dir, path)
+	if res := st.VerifyCompleteAudit(ctx, path); !res.OK || st.AuditStatus().LegacyPending {
+		t.Fatalf("after a restart: %+v", res)
 	}
 	// An unkeyed event appended after the cutover is refused although its own hash is correct.
 	events := readAuditLines(t, path)

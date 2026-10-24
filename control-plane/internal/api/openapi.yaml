@@ -4796,9 +4796,13 @@ paths:
       description: |
         Verifies every hash and link of the complete audit trail (database in cluster mode; audit.jsonl and
         its rotated generations in file mode), that it starts at its sealed origin (genesis or a retention
-        point), that unkeyed pre-2.1 events occur only in the sealed prefix before the keyed cutover, and that
-        it reaches the newest event known to the control-plane. A broken chain is reported with `200` and
-        `valid: false`.
+        point), that unkeyed pre-2.1 events occur only in the accepted prefix before the keyed cutover, that
+        it reaches the newest event known to the control-plane, and that this event is exactly where the
+        sealed checkpoint saved with the configuration says (`checkpoint_matches`: no events cut off the
+        end). In cluster mode the anchor, the checkpoint and the trail are read from one database snapshot.
+        A broken chain is reported with `200` and `valid: false`; so is an integrity violation detected at
+        start-up (it stays recorded until the data is restored from a backup) and a legacy prefix that
+        still awaits acceptance (`legacy_pending: true`, error starting with `legacy_pending:`).
 
         **Roles:** Super Admin, InfoSec Approver, Auditor (Team Leads: 403).
       responses:
@@ -4825,6 +4829,52 @@ paths:
       responses:
         '200':
           description: Verification of the remaining trail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditVerifyResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/audit/anchor/accept-legacy:
+    post:
+      tags: [Audit]
+      operationId: acceptLegacyAudit
+      summary: Accept the unkeyed pre-2.1 prefix of the audit trail
+      description: |
+        The first start after an upgrade from a release before 2.1 (or after somebody removed the audit
+        chain key and anchor) seals the unkeyed prefix as **pending**: verification fails and the posture
+        check `audit-chain` reports `fail` until a Super Admin compares the legacy events with an
+        independent copy (the trail exported before the upgrade, the SIEM) and accepts them here. The
+        request repeats the number of legacy events and the `event_hash` of the last one as reported by
+        `GET /api/audit/verify` (`legacy_events`, `legacy_head`); the rest of the trail must verify. The
+        acceptance is recorded as `AUDIT_LEGACY_ACCEPTED` and raises a high-severity security event.
+        `400` when nothing awaits acceptance, the confirmation does not match or the trail does not verify.
+
+        **Roles:** Super Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legacy_events, legacy_head]
+              properties:
+                legacy_events:
+                  type: integer
+                  minimum: 0
+                  description: Number of unkeyed events in the prefix.
+                legacy_head:
+                  type: string
+                  description: '`event_hash` of the last unkeyed event (64 zeros when the prefix is empty).'
+      responses:
+        '200':
+          description: Verification of the trail after the acceptance.
           content:
             application/json:
               schema:
@@ -8851,7 +8901,7 @@ components:
           format: date-time
         type:
           type: string
-          description: Known values - `THREAT_INTEL`, `MALWARE`, `DLP`, `FILE_TYPE`, `POLICY`, `ANOMALY`, `PUNYCODE`, `AV_UNSCANNED`, `AV_ERROR`, `BLOCK_BURST`, `QUARANTINE`, `BREAK_GLASS_LOGIN`.
+          description: Known values - `THREAT_INTEL`, `MALWARE`, `DLP`, `FILE_TYPE`, `POLICY`, `ANOMALY`, `PUNYCODE`, `AV_UNSCANNED`, `AV_ERROR`, `BLOCK_BURST`, `QUARANTINE`, `BREAK_GLASS_LOGIN`, `AUDIT_INTEGRITY_VIOLATION`, `AUDIT_LEGACY_PENDING`, `AUDIT_LEGACY_ACCEPTED`, `AUDIT_RETENTION_APPLIED` (audit trail alerts, severity high).
         severity:
           type: string
           enum: [critical, high, medium, low]
@@ -9400,12 +9450,24 @@ components:
         legacy_events:
           type: integer
           description: Events in the pre-2.1 (unkeyed) hash format; accepted only in the sealed prefix before the keyed cutover.
+        legacy_pending:
+          type: boolean
+          description: The unkeyed prefix awaits acceptance by a Super Admin (`POST /api/audit/anchor/accept-legacy`); verification fails until then.
+        legacy_head:
+          type: string
+          description: '`event_hash` of the last unkeyed event while `legacy_pending` is true (64 zeros for an empty prefix).'
         starts_at_genesis:
           type: boolean
           description: The first event links to the genesis hash (false after an audit retention point was applied).
         head_matches:
           type: boolean
           description: The trail reaches the newest event known to the control-plane.
+        checkpoint_matches:
+          type: boolean
+          description: The newest event is exactly the `checkpoint_events`-th event from the sealed origin and carries the revision the sealed checkpoint names (no events cut off the end or inserted).
+        checkpoint_events:
+          type: integer
+          description: Events from the sealed origin up to the newest event according to the sealed checkpoint.
         scope:
           type: string
           enum: [complete]

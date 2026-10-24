@@ -72,7 +72,9 @@ func (s *Store) AuthenticateLocal(username, password string) (*models.User, erro
 		return nil, fail
 	}
 	if !localAllowed && u.BreakGlass {
-		s.alertBreakGlass(u)
+		if err := s.alertBreakGlass(u); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now().UTC()
@@ -440,19 +442,32 @@ func (s *Store) UpdateNotificationConfig(cfg models.NotificationConfig, actor *a
 	return nil
 }
 
-// alertBreakGlass audits and announces an emergency password login while SSO is mandatory.
-func (s *Store) alertBreakGlass(u models.User) {
-	_ = s.withWrite(func() error {
+// alertBreakGlass audits and announces an emergency password login while SSO is mandatory. The login
+// is refused (ErrAuditUnavailable) when its audit event cannot be written: an emergency login must
+// never go unrecorded.
+func (s *Store) alertBreakGlass(u models.User) error {
+	err := s.withWrite(func() error {
 		s.appendAuditLocked(models.AuditEvent{
 			Actor: u.Username, ActorRole: string(u.Role), Action: "BREAK_GLASS_LOGIN", Category: "IDENTITY",
 			EntityType: "user", EntityID: u.ID, EntityName: u.Username,
 			Summary: "Emergency (break-glass) password login while single sign-on is mandatory",
 		})
 		s.markDirtyLocked()
+		if s.cluster == nil {
+			return s.opts.AuditSink.Err() // written synchronously; the cluster commit reports its own failure
+		}
 		return nil
 	})
+	if err != nil {
+		s.log.Error("break-glass login refused: it cannot be recorded in the audit trail", "user", u.Username, "error", err)
+		if !errors.Is(err, ErrAuditUnavailable) {
+			err = fmt.Errorf("%w (%v)", ErrAuditUnavailable, err)
+		}
+		return fmt.Errorf("break-glass sign-in refused: %w", err)
+	}
 	if s.notifier != nil {
 		s.notifier.NotifySecurityEvent(models.SecurityEvent{Timestamp: time.Now().UTC(), Type: "BREAK_GLASS_LOGIN", Severity: "high",
 			Action: "detected", Detail: fmt.Sprintf("Break-glass account %s signed in with a password", u.Username), Count: 1})
 	}
+	return nil
 }

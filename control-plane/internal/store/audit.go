@@ -126,14 +126,15 @@ func (s *Store) VerifyAuditChain() (int, error) {
 }
 
 func (s *Store) VerifyAuditChainLocked() error {
-	if s.auditIntegrityErr != "" {
-		return errors.New(s.auditIntegrityErr)
+	if trust := s.auditTrustErrLocked(); trust != "" {
+		return errors.New(trust)
 	}
 	anchor, err := s.auditAnchorLocked()
 	if err != nil {
 		return err
 	}
-	v := &auditVerifier{key: s.auditKeyLocked(false), anchor: anchor, window: true}
+	v := newAuditVerifier(s.auditKeyLocked(false), anchor)
+	v.window = true
 	for i := len(s.state.AuditEvents) - 1; i >= 0; i-- {
 		if err := v.add(s.state.AuditEvents[i]); err != nil {
 			return fmt.Errorf("audit chain integrity violation: %w", err)
@@ -575,6 +576,7 @@ func (s *Store) appendAuditLocked(ev models.AuditEvent) {
 	if len(s.state.AuditEvents) > maxAuditEvents {
 		s.state.AuditEvents = s.state.AuditEvents[:maxAuditEvents]
 	}
+	s.auditCheckpointLocked().Events++
 	if s.cluster != nil {
 		// Committed (and written to the local sink) together with the configuration change.
 		s.pendingAudit = append(s.pendingAudit, ev)
@@ -707,6 +709,7 @@ func (s *Store) seedAuditEventsLocked(now time.Time) {
 	}
 
 	s.state.AuditEvents = events
+	s.auditCheckpointLocked().Events = len(events)
 	if s.state.Revision < 6 {
 		s.state.Revision = 6
 	}
@@ -792,9 +795,16 @@ func (s *Store) auditKeyLocked(create bool) []byte {
 		s.state.AuditChainKey = sealed.String(hex.EncodeToString(b))
 		s.markDirtyLocked()
 	}
-	k, err := hex.DecodeString(string(s.state.AuditChainKey))
+	return decodeAuditKey(s.state.AuditChainKey)
+}
+
+func decodeAuditKey(v sealed.String) []byte {
+	if v == "" {
+		return nil
+	}
+	k, err := hex.DecodeString(string(v))
 	if err != nil {
-		return []byte(s.state.AuditChainKey)
+		return []byte(v)
 	}
 	return k
 }
@@ -810,32 +820,64 @@ type AuditVerification struct {
 	// a retention point; the trail must then start exactly there).
 	StartsAtGenesis bool `json:"starts_at_genesis"`
 	// HeadMatches: the trail reaches the newest event known to the control-plane.
-	HeadMatches bool   `json:"head_matches"`
-	Error       string `json:"error,omitempty"`
+	HeadMatches bool `json:"head_matches"`
+	// CheckpointMatches: the newest event is exactly the CheckpointEvents-th event from the sealed
+	// origin, as the sealed checkpoint saved with the configuration says (complete verification).
+	CheckpointMatches bool `json:"checkpoint_matches"`
+	CheckpointEvents  int  `json:"checkpoint_events,omitempty"`
+	// LegacyPending: the unkeyed prefix ending at LegacyHead awaits acceptance by a Super Admin.
+	LegacyPending bool   `json:"legacy_pending"`
+	LegacyHead    string `json:"legacy_head,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 // VerifyCompleteAudit streams the complete audit trail (database or audit.jsonl plus rotated
 // generations, oldest first) and checks every hash and link, that the trail starts at its sealed
-// origin, that unkeyed (pre-2.1) events occur only in the sealed prefix before the keyed cutover,
-// and that it reaches the newest event of the store.
+// origin, that unkeyed (pre-2.1) events occur only in the accepted prefix before the keyed cutover,
+// that it reaches the newest event of the store, and that this newest event is exactly where the
+// sealed checkpoint saved with the configuration says (no events cut off the end).
 func (s *Store) VerifyCompleteAudit(ctx context.Context, auditLogPath string) AuditVerification {
+	res, err := s.verifyCompleteTrail(ctx, auditLogPath, false)
+	if err != nil {
+		res.OK, res.Error = false, err.Error()
+	} else {
+		res.OK = true
+	}
+	return res
+}
+
+// verifyCompleteTrail verifies the complete trail; allowPending accepts a legacy prefix that still
+// awaits acceptance (used to accept it).
+func (s *Store) verifyCompleteTrail(ctx context.Context, auditLogPath string, allowPending bool) (AuditVerification, error) {
 	s.mu.RLock()
+	trust := s.auditTrustErrLocked()
 	key := s.auditKeyLocked(false)
 	anchor, anchorErr := s.auditAnchorLocked()
-	integrity := s.auditIntegrityErr
-	head := ""
+	head, headRev, events := "", uint64(0), 0
 	if len(s.state.AuditEvents) > 0 {
-		head = s.state.AuditEvents[0].EventHash
+		head, headRev = s.state.AuditEvents[0].EventHash, s.state.AuditEvents[0].Revision
+	}
+	if cp := s.state.AuditCheckpoint; cp != nil {
+		events = cp.Events
 	}
 	s.mu.RUnlock()
 	switch {
-	case integrity != "":
-		return AuditVerification{Error: integrity}
+	case trust != "":
+		return AuditVerification{}, errors.New(trust)
 	case anchorErr != nil:
-		return AuditVerification{Error: anchorErr.Error()}
+		return AuditVerification{}, anchorErr
 	}
+	if snap, ok := s.cluster.(auditSnapshotter); ok {
+		// The anchor and checkpoint stored with the trail, from the same database snapshot.
+		return s.verifyClusterTrail(ctx, snap, allowPending)
+	}
+	v := newAuditVerifier(key, anchor)
+	v.head, v.allowPending = head, allowPending
 	// Without an audit log file the trail is the in-memory window, which may start anywhere.
-	v := &auditVerifier{key: key, anchor: anchor, head: head, window: s.cluster == nil && s.opts.AuditSink == nil}
+	v.window = s.cluster == nil && s.opts.AuditSink == nil
+	if s.cluster == nil {
+		v.headEvents, v.headRevision = events, headRev
+	}
 	pr, pw := io.Pipe()
 	go func() { pw.CloseWithError(s.ExportAudit(ctx, pw, auditLogPath)) }()
 	defer pr.Close()
@@ -843,13 +885,7 @@ func (s *Store) VerifyCompleteAudit(ctx context.Context, auditLogPath string) Au
 	if err == nil {
 		err = v.finish()
 	}
-	res := v.res
-	if err != nil {
-		res.Error = err.Error()
-	} else {
-		res.OK = true
-	}
-	return res
+	return v.res, err
 }
 
 // auditVerifier checks a trail event by event, oldest first.
@@ -858,12 +894,27 @@ type auditVerifier struct {
 	anchor auditAnchor
 	head   string // newest event known to the store ("" = none)
 	window bool   // a window of the trail: it may start anywhere and the head is not required
+	// headEvents and headRevision are the sealed checkpoint: the head is the headEvents-th event from
+	// the origin and carries headRevision (0 = not checked).
+	headEvents   int
+	headRevision uint64
+	allowPending bool // accept a legacy prefix that awaits acceptance
 
 	res        AuditVerification
 	prev       string
 	keyed      bool // a keyed (version 2) event was seen
 	legacyDone bool // the sealed end of the unkeyed prefix was seen
 	sawHead    bool
+	headAt     int    // position of the head event
+	headRevAt  uint64 // revision of the head event
+}
+
+func newAuditVerifier(key []byte, anchor auditAnchor) *auditVerifier {
+	v := &auditVerifier{key: key, anchor: anchor}
+	if anchor.LegacyPending {
+		v.res.LegacyPending, v.res.LegacyHead = true, anchor.LegacyHead
+	}
+	return v
 }
 
 func (v *auditVerifier) add(ev models.AuditEvent) error {
@@ -899,7 +950,7 @@ func (v *auditVerifier) add(ev models.AuditEvent) error {
 		v.legacyDone = true
 	}
 	if ev.EventHash == v.head {
-		v.sawHead = true
+		v.sawHead, v.headAt, v.headRevAt = true, v.res.Events, ev.Revision
 	}
 	v.prev = ev.EventHash
 	return nil
@@ -909,6 +960,21 @@ func (v *auditVerifier) finish() error {
 	v.res.HeadMatches = v.head == "" || v.sawHead
 	if !v.res.HeadMatches {
 		return fmt.Errorf("the trail ends before the newest event known to the control-plane (%s): newest events are missing", shortHash(v.head))
+	}
+	if !v.window && v.headEvents > 0 {
+		v.res.CheckpointEvents = v.headEvents
+		if v.headAt != v.headEvents {
+			return fmt.Errorf("the trail holds %d events from its sealed origin up to its newest event %s, the sealed checkpoint %d: events were removed or inserted",
+				v.headAt, shortHash(v.head), v.headEvents)
+		}
+		if v.headRevAt != v.headRevision {
+			return fmt.Errorf("the newest event %s carries revision %d, the sealed checkpoint %d (replaced)", shortHash(v.head), v.headRevAt, v.headRevision)
+		}
+		v.res.CheckpointMatches = true
+	}
+	if v.anchor.LegacyPending && !v.allowPending {
+		return fmt.Errorf("legacy_pending: the %d unkeyed (pre-2.1) events up to event hash %s are not trusted until a Super Admin accepts them after comparing them with an independent copy (the trail exported before the upgrade)",
+			v.anchor.LegacyEvents, v.anchor.LegacyHead)
 	}
 	return nil
 }

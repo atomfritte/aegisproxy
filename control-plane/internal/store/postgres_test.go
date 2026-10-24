@@ -260,7 +260,9 @@ func TestClusterMigratesV2Document(t *testing.T) {
 	doc["rules"] = []map[string]any{{"id": "r-legacy", "name": "legacy gh", "action": "ALLOW", "host_pattern": "github.com", "path_pattern": "/**",
 		"group_ids": []string{"grp-ci"}, "enabled": true}}
 	raw, _ = json.Marshal(doc)
-	if _, err := be.pool.Exec(context.Background(), "UPDATE aegis_config SET doc = $1, revision = revision + 1 WHERE id = 1", raw); err != nil {
+	// Same revision: the audit checkpoint sealed with it stays valid (a changed revision without a
+	// new checkpoint is reported as a replaced configuration).
+	if _, err := be.pool.Exec(context.Background(), "UPDATE aegis_config SET doc = $1 WHERE id = 1", raw); err != nil {
 		t.Fatal(err)
 	}
 	be.Close()

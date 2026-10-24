@@ -76,8 +76,7 @@ func (s *Server) postureChecks() []PostureCheck {
 		"Terminate TLS at the ingress/reverse proxy and set AEGIS_PUBLIC_URL to the https URL.", "docs/security.md#hardening-checklist")
 	add("demo", "platform", "Demo mode disabled", pass(!s.store.DemoMode(), "fail"), "AEGIS_DEMO_MODE",
 		"Never run demo mode with real data: it seeds public demo credentials.", "docs/configuration.md")
-	add("encryption", "data", "Secrets encrypted at rest", pass(sealed.Enabled(), "fail"), "AES-256-GCM key "+sealed.KeyID(),
-		"Set AEGIS_ENCRYPTION_KEY (required in cluster mode).", "docs/security.md")
+	s.encryptionPostureCheck(add)
 	if _, err := os.Stat(filepath.Join(s.cfg.DataDir, "secrets", "initial-admin-password")); err == nil {
 		add("bootstrap-file", "identity", "Initial admin password file removed", "warn", "secrets/initial-admin-password still exists",
 			"Sign in, change the password and delete the file.", "docs/operations.md#day-one-checklist")
@@ -170,29 +169,7 @@ func (s *Server) postureChecks() []PostureCheck {
 	}
 	add("catch-all", "governance", "No catch-all ALLOW rules", pass(catchAll == 0, "fail"), itoa(catchAll)+" rules",
 		"Replace '*' allow rules with explicit destinations.", "")
-	auditExport := false
-	for _, sink := range s.store.ExportSinks() {
-		if sink.Enabled && slices.Contains(sink.Streams, models.StreamAudit) {
-			auditExport = true
-		}
-	}
-	add("audit-export", "governance", "Audit trail forwarded to a SIEM", pass(auditExport, "warn"), "",
-		"Add a log export destination with the audit stream (Settings → Integrations → Log export).", "docs/log-export.md")
-	audit := s.store.AuditStatus()
-	if n, err := s.store.VerifyAuditChain(); err != nil {
-		add("audit-chain", "governance", "Audit hash chain intact", "fail", err.Error(), "Investigate tampering; compare with the exported audit trail.", "docs/security.md")
-	} else if audit.LegacyEvents > 0 {
-		// Pre-2.1 events use the unkeyed hash; they are accepted only before the sealed cutover.
-		add("audit-chain", "governance", "Audit hash chain intact", "warn", itoa(n)+" events verified; "+itoa(audit.LegacyEvents)+" legacy events (pre-2.1, unkeyed hash) before the sealed cutover",
-			"Keep an archived copy of the legacy part of the trail (exported before the upgrade) as independent evidence.", "docs/operations.md#audit-trail")
-	} else {
-		add("audit-chain", "governance", "Audit hash chain intact", "pass", itoa(n)+" events verified", "", "")
-	}
-	if !audit.Writable {
-		// File storage refuses changes meanwhile; in a cluster the database stays the trail of record.
-		add("audit-log", "governance", "Audit log writable", pass(s.store.StorageName() != "file", "fail"), audit.Error,
-			"Free disk space or fix the audit log file (no symbolic link or FIFO); changes resume automatically.", "docs/operations.md#audit-trail")
-	}
+	s.auditPostureChecks(add)
 
 	// Detection
 	p := snap.SecurityPolicy
@@ -259,6 +236,77 @@ func (s *Server) postureChecks() []PostureCheck {
 	}
 	add("workers", "platform", "Data-plane workers reporting", pass(healthy > 0, "warn"), itoa(healthy)+" healthy", "", "docs/operations.md#monitoring")
 	return out
+}
+
+type postureAdd func(id, cat, title, status, detail, fix, doc string)
+
+// encryptionPostureCheck: secrets at rest are encrypted, with a key kept outside the data directory.
+func (s *Server) encryptionPostureCheck(add postureAdd) {
+	const title = "Secrets encrypted at rest"
+	switch {
+	case !sealed.Enabled():
+		add("encryption", "data", title, "fail", "secrets are stored unencrypted",
+			"Set AEGIS_ENCRYPTION_KEY (required in cluster mode).", "docs/security.md")
+	case s.cfg.EncryptionKeyInDataDir:
+		// Encrypted, but the key sits next to the data: a copy of DATA_DIR decrypts the secrets and
+		// the audit chain key, which defeats the keyed audit hash chain.
+		add("encryption", "data", title, "warn", "AES-256-GCM key "+sealed.KeyID()+" — but the key is stored in the data directory (the generated secrets/encryption.key, or AEGIS_ENCRYPTION_KEY_FILE pointing into DATA_DIR), so anyone who can read DATA_DIR can decrypt the secrets and the audit chain key",
+			"Provide AEGIS_ENCRYPTION_KEY or AEGIS_ENCRYPTION_KEY_FILE from a secret store outside DATA_DIR (Kubernetes/Docker secret, systemd credential, vault agent); move the key there and delete it from DATA_DIR.",
+			"docs/operations.md#encryption-key")
+	default:
+		add("encryption", "data", title, "pass", "AES-256-GCM key "+sealed.KeyID()+" provided from outside the data directory", "", "docs/security.md")
+	}
+}
+
+// auditPostureChecks: the audit trail is forwarded, intact, trusted end to end and writable.
+func (s *Server) auditPostureChecks(add postureAdd) {
+	auditExport := false
+	for _, sink := range s.store.ExportSinks() {
+		if sink.Enabled && slices.Contains(sink.Streams, models.StreamAudit) {
+			auditExport = true
+		}
+	}
+	// Only an exported copy (with its AUDIT_CHECKPOINT records) reveals a rollback of the state and
+	// the audit log together, so production installations must forward the audit stream.
+	exportStatus := "fail"
+	if s.store.DemoMode() {
+		exportStatus = "warn"
+	}
+	if auditExport {
+		exportStatus = "pass"
+	}
+	add("audit-export", "governance", "Audit trail forwarded to a SIEM", exportStatus,
+		"without an exported copy a rollback of state and audit log together cannot be detected",
+		"Add a log export destination with the audit stream (Settings → Integrations → Log export).", "docs/log-export.md")
+	audit := s.store.AuditStatus()
+	n, err := s.store.VerifyAuditChain()
+	switch {
+	case audit.Integrity != "":
+		add("audit-chain", "governance", "Audit hash chain intact", "fail", audit.Integrity,
+			"Investigate tampering: compare with the exported audit trail and restore the data from a backup taken before the violation.", "docs/operations.md#audit-trail")
+	case err != nil:
+		add("audit-chain", "governance", "Audit hash chain intact", "fail", err.Error(), "Investigate tampering; compare with the exported audit trail.", "docs/operations.md#audit-trail")
+	case audit.LegacyPending:
+		add("audit-chain", "governance", "Audit hash chain intact", "fail",
+			itoa(audit.LegacyEvents)+" unkeyed (pre-2.1) events up to "+audit.LegacyHead+" are not trusted until a Super Admin accepts them",
+			"Compare the legacy events with the trail exported before the upgrade, then accept them (Audit trail → Verify hash chain → Review and accept). If this installation already ran 2.1, the audit chain key and anchor were removed: do not accept, restore from a backup.",
+			"docs/operations.md#audit-trail")
+	case audit.LegacyEvents > 0:
+		// Pre-2.1 events use the unkeyed hash; a Super Admin accepted them as the prefix before the cutover.
+		add("audit-chain", "governance", "Audit hash chain intact", "warn", itoa(n)+" events verified; "+itoa(audit.LegacyEvents)+" accepted legacy events (pre-2.1, unkeyed hash) before the sealed cutover",
+			"Keep an archived copy of the legacy part of the trail (exported before the upgrade) as independent evidence.", "docs/operations.md#audit-trail")
+	default:
+		add("audit-chain", "governance", "Audit hash chain intact", "pass", itoa(n)+" events verified", "", "")
+	}
+	if !audit.Writable {
+		// File storage refuses changes meanwhile; in a cluster the database stays the trail of record.
+		status := "fail"
+		if s.store.StorageName() != "file" {
+			status = "pass"
+		}
+		add("audit-log", "governance", "Audit log writable", status, audit.Error,
+			"Free disk space or fix the audit log file (no symbolic link or FIFO); changes resume automatically.", "docs/operations.md#audit-trail")
+	}
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
