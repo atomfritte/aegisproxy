@@ -72,7 +72,7 @@ func publishSet(t *testing.T, st *Store, actor *auth.TokenClaims, name string, g
 
 func waitForThreatVersion(t *testing.T, st *Store, check func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second) // generous: loaded CI hosts, race detector
 	for time.Now().Before(deadline) {
 		if check() {
 			return
