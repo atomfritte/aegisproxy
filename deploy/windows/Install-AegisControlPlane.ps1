@@ -400,21 +400,56 @@ function Get-AclProblem {
     return $problems
 }
 
+function Assert-PlainItem($Item) {
+    # Refuses a junction or symbolic link (ACL changes and deletions would act on its target) and a file with further
+    # hard links (its ACL is shared with a file elsewhere).
+    if ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Junction/symbolic link in the installation directories: $($Item.FullName). Remove it and re-run."
+    }
+    if (-not $Item.PSIsContainer -and "$($Item.LinkType)" -eq 'HardLink') {
+        throw "$($Item.FullName) has further hard links (they share its ACL with a file elsewhere). Remove it and re-run."
+    }
+}
+
 function Protect-Directory {
-    # Takes over a directory that may have existed before the installation: Administrators become owner of Root
-    # and of everything in -Children, Root gets a protected ACL with -Grant (explicit ACEs of principals that are
-    # not -Allowed are removed) and the children are reset to inherit from Root only.
+    # Takes over a directory that may have existed before the installation, top-down, so that whoever created it
+    # cannot swap in a link while it is processed. Root first: owner Administrators and a protected ACL with -Grant
+    # (explicit ACEs of principals that are not -Allowed are removed) - from then on nobody else can create, delete
+    # or rename entries in it. Then -Children and everything below them, each item only after its parent: owner
+    # Administrators, explicit ACEs dropped (it inherits from Root only). icacls always gets /L (a link itself is
+    # changed, never its target) and never /T (which follows links). A link or hard-linked file stops the
+    # installation; items are checked again once taken over (until then their creator could still turn an empty
+    # directory into a junction). -AllChildren takes the entries of Root as listed after it was locked.
+    # -Trusted (upgrade of an intact installation: only administrators could write there) resets each child with
+    # one recursive icacls run instead.
     param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$Grant,
-        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @())
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', $SidAdmins, '/Q') | Out-Null
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/Q')) | Out-Null
+        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @(), [switch]$AllChildren, [switch]$Trusted)
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', $SidAdmins, '/L', '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/L', '/Q')) | Out-Null
     $foreign = @((Get-Acl -LiteralPath $Root).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
             ForEach-Object { "$($_.IdentityReference.Value)" } | Where-Object { -not $Allowed.ContainsKey($_) } | Sort-Object -Unique)
-    foreach ($sid in $foreign) { Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/Q') | Out-Null }
-    foreach ($child in $Children) {
-        if (-not (Test-Path -LiteralPath $child)) { continue }
-        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', $SidAdmins, '/T', '/C', '/Q') | Out-Null
-        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/C', '/Q') | Out-Null
+    foreach ($sid in $foreign) { Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/L', '/Q') | Out-Null }
+    Assert-PlainItem (Get-Item -LiteralPath $Root -Force)
+    if ($AllChildren) { $Children = @(Get-ChildItem -LiteralPath $Root -Force | ForEach-Object { $_.FullName }) }
+    if ($Trusted) {
+        foreach ($child in $Children) {
+            if (-not (Test-Path -LiteralPath $child)) { continue }
+            Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', $SidAdmins, '/T', '/L', '/C', '/Q') | Out-Null
+            Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/L', '/C', '/Q') | Out-Null
+        }
+        return
+    }
+    $pending = New-Object System.Collections.Stack
+    foreach ($child in $Children) { $pending.Push($child) }
+    while ($pending.Count) {
+        $path = [string]$pending.Pop()
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        Assert-PlainItem $item
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($path, '/setowner', $SidAdmins, '/L', '/Q') | Out-Null
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($path, '/reset', '/L', '/Q') | Out-Null
+        Assert-PlainItem (Get-Item -LiteralPath $path -Force)
+        if ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $path -Force)) { $pending.Push($child.FullName) } }
     }
 }
 
@@ -425,7 +460,8 @@ function Test-ReparsePoint([string]$Path) {
 
 function Find-ReparsePoint([string[]]$Path) {
     # Junctions and symbolic links at or below Path, found without following them (icacls /T, robocopy and
-    # Remove-Item -Recurse of Windows PowerShell 5.1 act on their targets). Unreadable directories throw.
+    # Remove-Item -Recurse of Windows PowerShell 5.1 act on their targets), and files with further hard links (they
+    # share their ACL with a file elsewhere). Unreadable directories throw.
     $found = @()
     $pending = New-Object System.Collections.Stack
     foreach ($p in $Path) { if (Test-Path -LiteralPath $p) { $pending.Push((Get-Item -LiteralPath $p -Force)) } }
@@ -433,6 +469,7 @@ function Find-ReparsePoint([string[]]$Path) {
         $item = $pending.Pop()
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $found += $item.FullName }
         elseif ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { $pending.Push($child) } }
+        elseif ("$($item.LinkType)" -eq 'HardLink') { $found += "$($item.FullName) (hard link)" }
     }
     return $found
 }
@@ -454,18 +491,32 @@ function Remove-DirectoryTree([string]$Path) {
 
 function Assert-EncryptedSmbSource {
     # Secrets read from an SMB share cross the network in clear text unless the connection is encrypted (share or
-    # server with SMB encryption, or a mapping created with New-SmbMapping -RequirePrivacy $true).
+    # server with SMB encryption, or a mapping created with New-SmbMapping -RequirePrivacy $true). Every spelling of
+    # a network path counts: \\server\share, //server/share and mixed separators, \\?\UNC\ and \\.\UNC\, FileSystem::
+    # provider paths, drive letters mapped to a share (also as \\?\Z:\). Other device paths (\\?\GLOBALROOT\...,
+    # \\?\Volume{...}) are refused. Loopback servers (localhost, 127.0.0.0/8, ::1) are shares of this host: the files
+    # do not cross the network.
     param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnencrypted)
-    $remote = $Path
-    if ($Path -match '^(?<drive>[A-Za-z]:)') {
+    $remote = ($Path -replace '^(Microsoft\.PowerShell\.Core\\)?FileSystem::', '').Replace('/', '\')
+    # Device namespace prefixes: \\?\, \\.\ and the NT form \??\.
+    if ($remote -match '^(\\\\[?.]|\\\?\?)\\UNC\\(?<rest>.*)$') { $remote = '\\' + $Matches['rest'] }
+    elseif ($remote -match '^(\\\\[?.]|\\\?\?)\\(?<rest>[A-Za-z]:(\\.*)?)$') { $remote = $Matches['rest'] }
+    elseif ($remote -match '^(\\\\[?.]|\\\?\?)\\') { throw "$Name '$Path' is a device path. Pass a drive-letter or UNC path (\\server\share\...)." }
+    if ($remote -match '^(?<drive>[A-Za-z]:)') {
         $mapping = @(Get-SmbMapping -LocalPath $Matches['drive'] -ErrorAction SilentlyContinue)
         if (-not $mapping.Count) { return }
-        $remote = "$($mapping[0].RemotePath)".TrimEnd('\') + $Path.Substring(2)
+        $remote = "$($mapping[0].RemotePath)".TrimEnd('\') + '\' + $remote.Substring(2).TrimStart('\')
     }
-    $remote = $remote -replace '^\\\\[?.]\\UNC\\', '\\'
-    if ($remote -notmatch '^\\\\(?<server>[^\\?.][^\\]*)\\(?<share>[^\\]+)') { return }
-    $server = $Matches['server']; $share = $Matches['share']
-    $null = Test-Path -LiteralPath $remote   # opens the SMB session if there is none yet
+    if (-not $remote.StartsWith('\\')) { return }
+    # \\server\share\x, \\\server\share\x and \\server\\share\x name the same share.
+    $parts = @($remote.Split([char]'\') | Where-Object { $_ })
+    $server = if ($parts.Count) { $parts[0] } else { '' }
+    $share = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+    if ($server -match '^(localhost|127(\.\d{1,3}){3}|::1|\[::1\]|0--1\.ipv6-literal\.net)$') {
+        Write-Note "${Name}: \\$server\$share is a share of this host (loopback); the files do not cross the network."
+        return
+    }
+    $null = Test-Path -LiteralPath ('\\' + ($parts -join '\'))   # opens the SMB session if there is none yet
     $connections = @(Get-SmbConnection -ServerName $server -ErrorAction SilentlyContinue | Where-Object { $_.ShareName -eq $share })
     if ($connections.Count -and -not @($connections | Where-Object { -not $_.Encrypted }).Count) {
         Write-Ok "${Name}: the SMB connection to \\$server\$share is encrypted."
@@ -635,7 +686,8 @@ if ($UiDir) {
 # may exist before the first installation - created by a local user with a known jwt.key/encryption.key, a CA
 # whose key they hold or a state file with their admin account. Such content is only kept on an upgrade of an
 # intact installation (service registered, directories owned by Administrators with the ACLs set below) or
-# with -AdoptExistingSecrets. Links are refused: ACL changes and deletions would act on their targets.
+# with -AdoptExistingSecrets. Links are refused: ACL changes and deletions would act on their targets (hard-linked
+# files: on the file elsewhere). Protect-Directory checks again while it takes the directories over.
 try {
     $links = @(Find-ReparsePoint @($InstallDir, $DataDir, $CertsDir, $SecretsDir, $LogsDir))
     if (Test-ReparsePoint $DataRoot) { $links += $DataRoot }
@@ -646,7 +698,7 @@ try {
     if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $DataDir, $CertsDir, $SecretsDir)) }
 }
 catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
-if ($links.Count) { throw "Junctions/symbolic links are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
+if ($links.Count) { throw "Junctions/symbolic links and hard-linked files are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
 if ($preExisting.Count -and -not $AdoptExistingSecrets) {
     throw ("Refusing to adopt {0} file(s) that existed before this installation ({1}):`n  {2}`nA local user may have planted them (known keys, CA or admin account). Delete them, or - if they are yours (restored backup, reinstallation after -Uninstall, interrupted first run) - re-run with -AdoptExistingSecrets; the script then takes ownership and resets their ACLs." -f
         $preExisting.Count, ($trustIssues -join '; '), (($preExisting | Select-Object -First 10) -join "`n  "))
@@ -664,13 +716,22 @@ if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and r
     # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
     # protected roots. A custom -InstallDir outside %ProgramFiles% inherits "create files/folders" for users from
     # the volume root; the binary and the log rotation script must not be replaceable by them.
-    Protect-Directory -Root $InstallDir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed $AclProgram `
-        -Children @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object { $_.FullName })
+    $intact = -not $trustIssues.Count
+    Protect-Directory -Root $InstallDir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed $AclProgram -AllChildren -Trusted:$intact
     # Only the directories of this script are reset below the data root (a data-plane on this host keeps its subtree).
     Protect-Directory -Root $DataRoot -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F") -Allowed $AclAdmins `
-        -Children @($DataDir, $CertsDir, $SecretsDir, $LogsDir)
+        -Children @($DataDir, $CertsDir, $SecretsDir, $LogsDir) -Trusted:$intact
     Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/inheritance:r', '/grant:r',
-        "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", '/Q') | Out-Null
+        "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", '/L', '/Q') | Out-Null
+    # Nobody else can add files from here on; files that appeared since the inspection above were planted meanwhile
+    # (a jwt.key or encryption.key written now would be kept instead of generated).
+    if (-not $intact) {
+        $planted = @(Get-ExistingFile @($InstallDir, $DataDir, $CertsDir, $SecretsDir) | Where-Object { $preExisting -notcontains $_ })
+        if ($planted.Count) {
+            throw ("{0} file(s) appeared in the installation directories while this script ran:`n  {1}`nA local user may have planted them. Delete them and re-run." -f
+                $planted.Count, (($planted | Select-Object -First 10) -join "`n  "))
+        }
+    }
     Write-Ok "Directories ready under $DataRoot (owner Administrators, foreign ACEs removed)"
 }
 
@@ -770,7 +831,7 @@ if ($PSCmdlet.ShouldProcess($CertsDir, 'Provision enterprise root CA')) {
     }
     if (Test-Path -LiteralPath $caKey) {
         # The control-plane only reads the public certificate. The CA private key stays admin-only.
-        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($caKey, '/inheritance:r', '/grant:r', "${SidSystem}:F", "${SidAdmins}:F", '/Q') | Out-Null
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($caKey, '/inheritance:r', '/grant:r', "${SidSystem}:F", "${SidAdmins}:F", '/L', '/Q') | Out-Null
     }
 }
 
@@ -814,14 +875,14 @@ if ($PSCmdlet.ShouldProcess($EventLogKey, 'Register Application event log source
 
 # --- ACLs for the service account (requires the service to exist so the SID resolves) ----------------
 if ($PSCmdlet.ShouldProcess($DataRoot, "Grant $ServiceAccount access")) {
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($InstallDir, '/grant:r', "${ServiceAccount}:(OI)(CI)RX", '/Q') | Out-Null
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($DataDir, '/grant:r', "${ServiceAccount}:(OI)(CI)M", '/Q') | Out-Null
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($LogsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)M", '/Q') | Out-Null
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($CertsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)RX", '/Q') | Out-Null
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)R", '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($InstallDir, '/grant:r', "${ServiceAccount}:(OI)(CI)RX", '/L', '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($DataDir, '/grant:r', "${ServiceAccount}:(OI)(CI)M", '/L', '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($LogsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)M", '/L', '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($CertsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)RX", '/L', '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/grant:r', "${ServiceAccount}:(OI)(CI)R", '/L', '/Q') | Out-Null
     if (Test-Path -LiteralPath $caKey) {
         # re-assert after the certs grant: no inherited ACE may reach the CA key
-        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($caKey, '/inheritance:r', '/grant:r', "${SidSystem}:F", "${SidAdmins}:F", '/Q') | Out-Null
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($caKey, '/inheritance:r', '/grant:r', "${SidSystem}:F", "${SidAdmins}:F", '/L', '/Q') | Out-Null
     }
     # Read the result back: only SYSTEM, Administrators, the service (and users: read program files) may have access.
     $aclProblems = @(Get-InstallationAclProblem -IncludeLogs)

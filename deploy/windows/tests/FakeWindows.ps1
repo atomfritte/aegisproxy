@@ -38,6 +38,7 @@ function Initialize-FakeWindows {
         Acl           = @{}
         Owner         = @{}        # full path -> owner SID; everything else is owned by Administrators
         IcaclsIgnore  = @()        # icacls switches that report success but change nothing (broken ACL tooling)
+        IcaclsHook    = $null      # scriptblock run before each icacls call (args), e.g. a local user racing the installer
         Smb           = @{ Connections = @(); Mappings = @{} }
         Calls         = New-Object System.Collections.Generic.List[object]
         Aliases       = New-Object System.Collections.Generic.List[string]
@@ -258,13 +259,21 @@ function Initialize-FakeWindows {
 
     function global:icacls.exe {
         # Supports the subset the installers use: <path> [/setowner principal] [/reset] [/inheritance:r]
-        # [/grant:r principal:(flags)rights ...] [/remove[:g|:d] principal] [/T] [/C] [/Q]. With /T, /setowner and
+        # [/grant:r principal:(flags)rights ...] [/remove[:g|:d] principal] [/T] [/L] [/C] [/Q]. With /T, /setowner and
         # /reset also apply to everything below <path>; /reset drops the explicit ACEs (the item inherits again).
+        # Like the real tool, a link (junction / symbolic link) is followed - its target is changed, and /T descends
+        # into linked directories - unless /L is given, which changes the link itself. FakeWin.IcaclsHook (if set)
+        # runs before each call with its arguments, e.g. to let a "local user" race the installer.
         $a = @($args)
         Add-FakeCall 'icacls.exe' $a
+        if ($global:FakeWin.IcaclsHook) { & $global:FakeWin.IcaclsHook $a }
         $global:LASTEXITCODE = 0
         $path = Get-FakeFullPath $a[0]
         if (-not ([System.IO.File]::Exists($path) -or [System.IO.Directory]::Exists($path))) { "${path}: The system cannot find the file specified."; $global:LASTEXITCODE = 2; return }
+        if ($a -notcontains '/L') {
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.LinkTarget) { $path = Get-FakeFullPath ([System.IO.Path]::Combine((Split-Path -Parent $path), $item.LinkTarget)) }
+        }
         $ops = New-Object System.Collections.Generic.List[object]
         $mode = $null; $recurse = $false
         for ($i = 1; $i -lt $a.Count; $i++) {
@@ -281,7 +290,7 @@ function Initialize-FakeWindows {
                     $ops.Add(@(($t -replace ':[gd]$', '').TrimStart('/'), $principal)); $mode = $null; continue
                 }
                 '^/T$' { $recurse = $true; continue }
-                '^/[CQ]$' { $mode = $null; continue }
+                '^/[CQL]$' { $mode = $null; continue }
                 '^/' { "Invalid parameter `"$t`""; $global:LASTEXITCODE = 87; return }
                 default {
                     if ($mode -ne 'grant' -or $t -notmatch '^(?<p>[^:]+):(?<ace>(\((OI|CI|IO|NP)\))*(F|M|RX|R|W|\([A-Z]+(,[A-Z]+)*\)))$') {
@@ -297,7 +306,18 @@ function Initialize-FakeWindows {
         }
         $targets = @($path)
         if ($recurse -and [System.IO.Directory]::Exists($path)) {
-            $targets += @(Get-ChildItem -LiteralPath $path -Recurse -Force | ForEach-Object { Get-FakeFullPath $_.FullName })
+            # Without /L, linked directories are entered and their content is changed at its real location.
+            $follow = $a -notcontains '/L'
+            $pending = New-Object System.Collections.Stack
+            $pending.Push($path)
+            while ($pending.Count) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
+                    $real = Get-FakeFullPath $child.FullName
+                    if ($follow -and $child.LinkTarget) { $real = Get-FakeFullPath $child.ResolveLinkTarget($true).FullName }
+                    $targets += $real
+                    if ([System.IO.Directory]::Exists($real) -and ($follow -or -not $child.LinkTarget)) { $pending.Push($real) }
+                }
+            }
         }
         foreach ($op in $ops) {
             if ($global:FakeWin.IcaclsIgnore -contains "/$($op[0])") { continue }

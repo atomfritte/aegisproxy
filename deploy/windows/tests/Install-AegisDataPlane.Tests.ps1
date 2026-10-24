@@ -17,6 +17,17 @@ BeforeAll {
     function Get-PipCall([string]$Command = 'install') {
         @(Get-FakeCall 'python' | Where-Object { $_.Args[0] -eq '-m' -and $_.Args[1] -eq 'pip' -and $_.Args[2] -eq $Command })
     }
+
+    function New-FakePythonHome([string]$PyHome) {
+        # An all-users Python below a directory whose ACL is like %ProgramFiles%; returns python.exe.
+        $py = Join-Path $PyHome 'python.exe'
+        New-FakeBinary -Path $py
+        Register-FakeExecutable -Path $py -Function FakePython
+        foreach ($dir in @('Lib\site-packages', 'DLLs')) { New-Item -ItemType Directory -Path (Join-Path $PyHome $dir) -Force | Out-Null }
+        $global:FakeWin.Acl[(Get-FakeFullPath (Split-Path -Parent $PyHome))] = @{ Protected = $true; Grants = [ordered]@{
+                '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
+        return $py
+    }
 }
 
 Describe 'Install-AegisDataPlane.ps1' {
@@ -133,6 +144,24 @@ Describe 'Install-AegisDataPlane.ps1' {
             Test-Path -LiteralPath $InstallDir | Should -BeFalse
         }
 
+        It 'recognises the unencrypted share in -DataPlaneKeyFile written as <Form>' -TestCases @(
+            @{ Form = 'forward slashes'; Path = '//cp1/c$/ProgramData/AegisProxy/secrets/dataplane.key' },
+            @{ Form = 'mixed separators'; Path = '\\cp1/c$\ProgramData/AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'an extra leading separator'; Path = '\\\cp1\c$\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'a \\?\UNC\ path'; Path = '\\?\UNC\cp1\c$\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'a \\.\UNC\ path'; Path = '\\.\UNC\cp1\c$\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'an NT \??\UNC\ path'; Path = '\??\UNC\cp1\c$\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'a provider path'; Path = 'Microsoft.PowerShell.Core\FileSystem::\\cp1\c$\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'a mapped drive'; Path = 'Z:\ProgramData\AegisProxy\secrets\dataplane.key' },
+            @{ Form = 'a mapped drive as device path'; Path = '\\?\z:/ProgramData/AegisProxy/secrets/dataplane.key' }
+        ) {
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'cp1'; ShareName = 'c$'; Encrypted = $false })
+            $FakeWin.Smb.Mappings['Z:'] = '\\cp1\c$'
+            $p = Join-Parameters $Base @{ DataPlaneKeyFile = $Path }
+            { & $Installer @p } | Should -Throw '*-DataPlaneKeyFile reads secrets from \\cp1\c$ over an SMB connection that is not encrypted*'
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
         It 'refuses a base interpreter that <Case>' -TestCases @(
             @{ Case = 'non-administrators can modify (C:\Python312 below a client volume root)'; Dir = 'Python312'; Relative = ''; Ace = $null; Groups = 'Authenticated Users' },
             @{ Case = 'lets users create files in Lib (sitecustomize.py)'; Dir = 'Program Files\Python313'; Relative = 'Lib'; Ace = '(CI)(WD,AD)'; Groups = 'Users' },
@@ -154,6 +183,48 @@ Describe 'Install-AegisDataPlane.ps1' {
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py; AllowWritablePython = $true })
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Match 'Continuing because of -AllowWritablePython'
+        }
+
+        It 'refuses a base interpreter when <Case> (only SYSTEM, Administrators, TrustedInstaller and the service may write)' -TestCases @(
+            @{ Case = 'a custom group may modify its directory'; Relative = ''; Grantee = '*S-1-5-21-111-222-333-1105'; Ace = '(OI)(CI)M'; Expect = 'S-1-5-21-111-222-333-1105' },
+            @{ Case = 'a specific user may modify python.exe'; Relative = 'python.exe'; Grantee = '*S-1-5-21-111-222-333-1007'; Ace = 'M'; Expect = 'S-1-5-21-111-222-333-1007' },
+            @{ Case = 'Remote Desktop Users may create files in DLLs'; Relative = 'DLLs'; Grantee = '*S-1-5-32-555'; Ace = '(CI)(WD,AD)'; Expect = 'Remote Desktop Users' },
+            @{ Case = 'Power Users may change the permissions of site-packages'; Relative = 'Lib\site-packages'; Grantee = '*S-1-5-32-547'; Ace = '(WDAC)'; Expect = 'Power Users' },
+            @{ Case = 'users get write access to new files in Lib (inherit-only)'; Relative = 'Lib'; Grantee = '*S-1-5-32-545'; Ace = '(OI)(IO)W'; Expect = 'Users' },
+            @{ Case = 'a user owns Lib'; Relative = 'Lib'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'a .pth file in site-packages is writable'; Relative = 'Lib\site-packages\evil.pth'; Grantee = '*S-1-1-0'; Ace = 'M'; Expect = 'Everyone' },
+            @{ Case = 'the ._pth file is writable'; Relative = 'python313._pth'; Grantee = '*S-1-5-11'; Ace = 'W'; Expect = 'Authenticated Users' },
+            @{ Case = 'a user owns Lib\sitecustomize.py'; Relative = 'Lib\sitecustomize.py'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'users may delete entries of the directory above'; Relative = '..'; Grantee = '*S-1-5-32-545'; Ace = '(DC)'; Expect = 'Users' },
+            @{ Case = 'a user owns the directory above'; Relative = '..'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' }
+        ) {
+            $py = New-FakePythonHome (Join-Path $env:SystemDrive 'Tools\Python313')
+            $pyHome = Split-Path -Parent $py
+            $weak = if ($Relative -eq '..') { Split-Path -Parent $pyHome } elseif ($Relative) { Join-Path $pyHome $Relative } else { $pyHome }
+            if ($Relative -match '\.(pth|_pth|py)$') { Set-Content -LiteralPath $weak -Value '' }
+            $weak = (Get-Item -LiteralPath $weak -Force).FullName
+            $key = Get-FakeFullPath $weak
+            if ($Owner) { $FakeWin.Owner[$key] = $Owner }
+            else {
+                if (-not $FakeWin.Acl.ContainsKey($key)) { $FakeWin.Acl[$key] = @{ Protected = $false; Grants = [ordered]@{} } }
+                $FakeWin.Acl[$key].Grants[$Grantee] = $Ace
+            }
+            $err = { & $Installer @Base -PythonExe $py } | Should -Throw '*can be modified by non-administrators*-AllowWritablePython*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($Expect)"))
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'accepts a base interpreter that only SYSTEM, Administrators, TrustedInstaller and the service can modify' {
+            $py = New-FakePythonHome (Join-Path $env:SystemDrive 'Tools\Python313')
+            $pyHome = Get-FakeFullPath (Split-Path -Parent $py)
+            $trustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+            $FakeWin.Acl[$pyHome] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; "*$trustedInstaller" = '(OI)(CI)F'
+                    'NT SERVICE\AegisDataPlane' = '(OI)(CI)M'; '*S-1-3-0' = '(OI)(CI)(IO)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
+            $FakeWin.Owner[$pyHome] = $trustedInstaller
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'can be modified by non-administrators'
         }
 
         It 'rejects clamd address <Address>' -TestCases @(@{ Address = 'unix:///var/run/clamd.ctl' }, @{ Address = 'clamd' }, @{ Address = 'tcp://h:p' }) {
@@ -577,9 +648,86 @@ Describe 'Install-AegisDataPlane.ps1' {
             New-Item -ItemType Directory -Path $target | Out-Null
             Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
             New-Item -ItemType SymbolicLink -Path (Join-Path $LogsDir 'link') -Target $target | Out-Null
-            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed*link*'
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links and hard-linked files are not allowed*link*'
             (Get-FakeCall 'icacls.exe').Count | Should -Be 0
             Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
+        }
+
+        It 'refuses a file with further hard links (its ACL is shared with the file elsewhere)' {
+            $outside = Join-Path $FakeWin.Root 'outside.txt'
+            Set-Content -LiteralPath $outside -Value 'x'
+            New-Item -ItemType HardLink -Path (Join-Path $ConfDir 'config.yaml') -Target $outside | Out-Null
+            { & $Installer @Base } | Should -Throw '*hard-linked files are not allowed*config.yaml (hard link)*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+        }
+
+        It 'takes the directories over top-down with /L and without /T' {
+            New-Item -ItemType Directory -Path (Join-Path $ConfDir 'sub') | Out-Null
+            Set-FakeOwner -Path (Join-Path $ConfDir 'sub') -Sid $Planter
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $calls = @(Get-FakeCall 'icacls.exe')
+            @($calls | Where-Object { $_.Args -notcontains '/L' }).Count | Should -Be 0
+            @($calls | Where-Object { $_.Args -contains '/T' }).Count | Should -Be 0 -Because 'icacls /T follows junctions'
+            $order = @($calls | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $first = @($DataRoot, $ConfDir, (Join-Path $ConfDir 'sub')) | ForEach-Object { $order.IndexOf((Get-FakeFullPath $_)) }
+            $first | Should -Not -Contain -1
+            $first[0] | Should -BeLessThan $first[1]
+            $first[1] | Should -BeLessThan $first[2]
+            (Get-Acl -LiteralPath (Join-Path $ConfDir 'sub')).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+        }
+
+        It 'refuses a <Kind> that the owner of a pre-existing directory swaps in while the installer runs, and leaves its target alone' -TestCases @(
+            @{ Kind = 'symbolic link to a directory'; Directory = $true }, @{ Kind = 'symbolic link to a file'; Directory = $false }
+        ) {
+            $target = Join-Path $FakeWin.Root 'victim'
+            if ($Directory) { New-Item -ItemType Directory -Path $target | Out-Null; Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x' }
+            else { Set-Content -LiteralPath $target -Value 'x' }
+            # The planter still owns confdir (and may write to it) until the installer has taken it over.
+            $race = @{ Done = $false; Dir = (Get-FakeFullPath $ConfDir); Link = (Join-Path $ConfDir 'link'); Target = $target }
+            $FakeWin.IcaclsHook = {
+                param($a)
+                if (-not $race.Done -and (Get-FakeFullPath $a[0]) -eq $race.Dir) {
+                    $race.Done = $true
+                    New-Item -ItemType SymbolicLink -Path $race.Link -Target $race.Target | Out-Null
+                }
+            }.GetNewClosure()
+            { & $Installer @Base } | Should -Throw '*Junction/symbolic link in the installation directories*link*'
+            $race.Done | Should -BeTrue
+            $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            $FakeWin.Acl.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            @(Get-FakeCall 'icacls.exe' | Where-Object { $_.Args[0] -like '*link' }).Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'refuses an empty directory that its owner turns into a junction while it is taken over' {
+            $sub = Join-Path $ConfDir 'sub'
+            New-Item -ItemType Directory -Path $sub | Out-Null
+            $target = Join-Path $FakeWin.Root 'victim'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            $race = @{ Done = $false; Dir = (Get-FakeFullPath $sub); Target = $target }
+            $FakeWin.IcaclsHook = {
+                param($a)
+                if (-not $race.Done -and (Get-FakeFullPath $a[0]) -eq $race.Dir -and $a[1] -eq '/setowner') {
+                    $race.Done = $true
+                    [System.IO.Directory]::Delete($race.Dir)
+                    New-Item -ItemType SymbolicLink -Path $race.Dir -Target $race.Target | Out-Null
+                }
+            }.GetNewClosure()
+            { & $Installer @Base } | Should -Throw '*Junction/symbolic link in the installation directories*sub*'
+            $race.Done | Should -BeTrue
+            $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            $FakeWin.Acl.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+        }
+
+        It 'refuses a <Name> planted after the inspection, before the directories were locked' -TestCases @(
+            @{ Name = 'staged CA'; PlantIn = 'ConfDir'; PlantFile = 'mitmproxy-ca.pem' },
+            @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' }
+        ) {
+            # The planter writes the file right after the inspection, before the first icacls call locks the directories.
+            $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
+            $FakeWin.IcaclsHook = { param($a) if (-not [System.IO.File]::Exists($planted)) { [System.IO.File]::WriteAllText($planted, 'planted') } }.GetNewClosure()
+            { & $Installer @Base } | Should -Throw "*1 file(s) appeared in the installation directories while this script ran*$PlantFile*"
+            $FakeWin.Services.Count | Should -Be 0
         }
     }
 
@@ -692,6 +840,19 @@ Describe 'Install-AegisDataPlane.ps1' {
         It 'Invoke-Native -NoThrow returns the exit code instead of throwing' {
             (Invoke-Native -FilePath 'sc.exe' -ArgumentList @('privs', 'Nope', 'x') -NoThrow).ExitCode | Should -Be 1060
             { Invoke-Native -FilePath 'sc.exe' -ArgumentList @('privs', 'Nope', 'x') } | Should -Throw '*exit code 1060*'
+        }
+
+        It 'Assert-EncryptedSmbSource treats loopback shares as local and refuses other device paths' {
+            . ([scriptblock]::Create((Import-ScriptFunction -Path $Installer -Name 'Assert-EncryptedSmbSource', 'Write-Ok', 'Write-Note')))
+            foreach ($path in @('\\localhost\c$\keys\dataplane.key', '//127.0.0.1/c$/keys/dataplane.key', '\\?\UNC\127.0.0.2\c$\keys', '\\[::1]\c$\keys', '\\0--1.ipv6-literal.net\c$\keys')) {
+                Assert-EncryptedSmbSource -Name '-X' -Path $path 6>&1 | Should -Match 'share of this host' -Because $path
+            }
+            foreach ($path in @('\\?\GLOBALROOT\Device\Mup\cp1\c$\keys', '\\.\pipe\keys', '\??\Volume{00000000-0000-0000-0000-000000000000}\keys')) {
+                { Assert-EncryptedSmbSource -Name '-X' -Path $path } | Should -Throw '*is a device path*' -Because $path
+            }
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'cp1'; ShareName = 'c$'; Encrypted = $true })
+            Assert-EncryptedSmbSource -Name '-X' -Path '//cp1/c$/keys' 6>&1 | Should -Match 'is encrypted'
+            Assert-EncryptedSmbSource -Name '-X' -Path 'C:\keys\dataplane.key' 6>&1 | Should -BeNullOrEmpty
         }
 
         It 'Get-HttpStatus returns the status of a direct HTTP request, also for errors, and 0 if unreachable' {

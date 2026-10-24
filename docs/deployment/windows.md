@@ -105,10 +105,15 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 > necessarily contain every standard-library module the addon imports (`http.server`, `hmac`, `gzip`, ...).
 > The data-plane script creates a virtual environment from the python.org interpreter and installs
 > `mitmproxy==12.3.0` with pip. The Microsoft Store Python and per-user installations (`C:\Users\...`) are
-> rejected because the service account cannot read them. An interpreter whose directory, `Lib`, `DLLs` or
-> `Lib\site-packages` non-administrators (Users, Authenticated Users, Everyone, INTERACTIVE, ...) can write to or
-> create files in is rejected as well - code planted there (`python3XX.dll`, `Lib\sitecustomize.py`, a `.pth`
-> file) would run in the service. `-AllowWritablePython` overrides this check (not recommended).
+> rejected because the service account cannot read them. The interpreter must also be writable by nobody but
+> SYSTEM, Administrators, TrustedInstaller and the data-plane service (an allowlist: any other user or group,
+> e.g. Users, Power Users, Remote Desktop Users, a domain group or a single account, counts). Checked are the
+> owner and every allow ACE - also inherited and inherit-only ones - of the Python directory, `python.exe`, `Lib`,
+> `DLLs`, `Lib\site-packages`, the `*.dll` and `*._pth` files next to `python.exe`, and `*.pth`,
+> `sitecustomize.py` and `usercustomize.py` in `Lib` and `site-packages`; for the directory above the Python
+> directory, its owner and whether others may delete or rename its entries or change its ACL. Code planted there
+> (`python3XX.dll`, `Lib\sitecustomize.py`, a `.pth` file, a replaced Python directory) would run in the service.
+> `-AllowWritablePython` overrides this check (not recommended).
 
 Copy a deployment package to the target host, for example:
 
@@ -149,11 +154,17 @@ What the script does (idempotent - re-running it upgrades the binary and keeps s
    custom `-InstallDir` outside `Program Files` - the log rotation script there must not be replaceable.
 2. Creates `C:\ProgramData\AegisProxy\{data,certs,secrets,logs}`, removes the inherited ProgramData ACL
    (which lets every user create files) and grants SYSTEM/Administrators full control. Directories that already
-   exist are taken over: Administrators become owner (recursively), explicit ACEs of other accounts are removed
-   and the content is reset to inherit the new ACL. After the service grants the script reads every ACL back
+   exist are taken over top-down, so that their creator cannot swap in a link meanwhile: first the root
+   (Administrators become owner, protected ACL, explicit ACEs of other accounts removed - from then on nobody
+   else can add, delete or rename entries in it), then each entry below, always after its parent (owner
+   Administrators, explicit ACEs dropped so that it inherits the new ACL). `icacls` runs with `/L` (a link itself
+   is changed, never its target) and without `/T` (which follows links); only an upgrade of an intact
+   installation resets each subdirectory with one recursive `icacls /T /L` run. Junctions, symbolic links and
+   files with further hard links (they share their ACL with a file elsewhere) are refused, before any change
+   and again while each item is taken over. Files that appear in the directories between the inspection and the
+   lock-down are reported and stop the installation. After the service grants the script reads every ACL back
    (owner Administrators/SYSTEM; only SYSTEM, Administrators, the service and - for program files - Users
-   read) and stops before starting the service if anything else is found. Junctions/symbolic links inside these
-   directories are refused.
+   read) and stops before starting the service if anything else is found.
    **Pre-existing files.** Because every user may create `C:\ProgramData\AegisProxy` before the first
    installation, files found there (and in the program directory) are only kept on an upgrade of an intact
    installation - service registered, directories owned by Administrators with exactly these ACLs. Otherwise the
@@ -297,8 +308,12 @@ cd C:\Install\AegisProxy\deploy\windows
 On a separate host, copy `dataplane.key` and `mitmproxy-ca.pem` from the control-plane over an
 administrative channel (SMB with encryption - `New-SmbMapping -RemotePath '\\cp1\c$' -RequirePrivacy $true` - or
 your secret store), run the script, then delete the copies - the script stages its own copies with tight ACLs.
-When `-DataPlaneKeyFile` / `-CaFile` point to an SMB path (UNC or mapped drive), the script checks
-`Get-SmbConnection` and refuses an unencrypted connection unless `-AllowUnencryptedImport` is given. Without
+When `-DataPlaneKeyFile` / `-CaFile` point to an SMB path, the script checks `Get-SmbConnection` and refuses an
+unencrypted connection unless `-AllowUnencryptedImport` is given. Every spelling of a network path counts:
+`\\server\share`, `//server/share` and mixed separators, `\\?\UNC\...`, `\\.\UNC\...`, `\??\UNC\...`,
+`FileSystem::\\...` and drive letters mapped to a share (also as `\\?\Z:\...`). Other device paths
+(`\\?\GLOBALROOT\...`, `\\?\Volume{...}\...`) are refused - pass a drive-letter or UNC path. Shares of the host
+itself (`localhost`, `127.x.x.x`, `::1`) are accepted with a note: the files do not cross the network. Without
 `-CaFile`, the CA of a control-plane on the same host is used only if the `AegisControlPlane` service is installed
 and `C:\ProgramData\AegisProxy\certs\mitmproxy-ca.pem` is restricted to SYSTEM/Administrators.
 
@@ -310,8 +325,8 @@ The script:
    full control, Users and the service read/execute) and installs `mitmproxy==12.3.0`, `yara-x==1.22.0` and the
    security overrides of `data-plane\requirements-security.txt`, then verifies that `http.server`, `hmac`,
    `gzip`, `ssl` and the addon import correctly. Existing program and data directories are taken over like on the
-   control-plane (owner Administrators, foreign ACEs removed, links refused, ACLs verified after the
-   installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
+   control-plane (top-down, owner Administrators, foreign ACEs removed, links and hard-linked files refused, files
+   planted during the run refused, ACLs verified after the installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
    `confdir\config.yaml` (mitmdump options and scripts), a prepared venv or .NET extraction cache - are refused
    unless `-AdoptExistingSecrets` is given. Logs are kept either way.
 2. Copies `aegis_addon.py` and `aegis_dp\` to `...\data-plane\app` (byte-compiled; the program directory is
@@ -398,7 +413,8 @@ application pool with *No Managed Code*, mirrors `dist`, writes `config.js`
 (CSP, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, COOP, HSTS,
 `/assets/*` cached one year as immutable, SPA fallback that excludes `/assets`, `/config.js`, `/api`), binds HTTPS
 with SNI and restricts the site directory to the pool identity. An existing site directory is taken over before
-the first file is copied (owner Administrators, foreign ACEs removed, junctions refused); the ACL is verified
+the first file is copied (top-down like the service directories: owner Administrators, foreign ACEs removed,
+junctions, symbolic links and hard-linked files refused); the ACL is verified
 before the site is started.
 
 Cookies: `AEGIS_COOKIE_SAMESITE=strict` works for `console.corp.example` + `api.corp.example` (same site).
@@ -461,8 +477,8 @@ Limitations and recommendations:
   Remove-SmbMapping -RemotePath '\\node1\c$' -Force
   ```
   (`$dsn` ends up in `secrets\database-url`, readable only by the service and administrators.) The secrets and
-  the CA private key cross the network: for UNC paths and mapped drives the script checks `Get-SmbConnection` and
-  stops unless the connection is encrypted (`-RequirePrivacy $true` as above, or a share with
+  the CA private key cross the network: for UNC paths and mapped drives (in every spelling, see section 6) the
+  script checks `Get-SmbConnection` and stops unless the connection is encrypted (`-RequirePrivacy $true` as above, or a share with
   `Set-SmbShare -EncryptData $true`). `-AllowUnencryptedImport` overrides the check; copying over another
   protected channel to a local directory works as well.
 * **Control-plane load balancer:** round robin, no stickiness needed (sessions are signed JWTs, live updates are
@@ -631,8 +647,11 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | A new CA appeared after a restore | `certs\mitmproxy-ca-cert.pem` was missing, the control-plane generated a new CA | Restore the original `certs\` and restart; re-stage the CA on the workers |
 | Installer: `Refusing to adopt N file(s) that existed before this installation` | first installation (no service) or directories with an unexpected owner/ACL contain files | Check the listed files. Delete them if you do not know where they come from; re-run with `-AdoptExistingSecrets` for a restore, a reinstallation after `-Uninstall` or an interrupted first run |
 | Installer: `ACL verification failed` | an ACE or owner could not be changed (e.g. an inheritance-blocking policy, a tool that re-adds ACEs) | Fix the listed paths (`icacls <path>`), re-run; the service is not started until the check passes |
-| Installer: `Python at ... can be modified by non-administrators` | interpreter outside `Program Files` (e.g. `C:\Python312`) | Reinstall python.org Python for all users into `C:\Program Files\Python312` |
-| Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
+| Installer: `Python at ... can be modified by non-administrators` | interpreter outside `Program Files` (e.g. `C:\Python312`), or an account other than SYSTEM/Administrators/TrustedInstaller/the service owns or may write to one of the listed paths (also the directory above the Python directory) | Reinstall python.org Python for all users into `C:\Program Files\Python312`, or remove the listed ACEs (`icacls <path> /remove <account>`). An `owner <SID>` entry on a Windows client edition is usually the administrator account that created the files: after checking it, `icacls <path> /setowner *S-1-5-32-544 /T /L` |
+| Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share (any spelling: `//host/share`, `\\?\UNC\...`, mapped drive) | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
+| Installer: `... is a device path` | a source path like `\\?\GLOBALROOT\...` or `\\?\Volume{...}\...` | Pass a drive-letter or UNC path |
+| Installer: `Junctions/symbolic links and hard-linked files are not allowed`, `Junction/symbolic link in the installation directories`, `... has further hard links` | a link or a hard-linked file in a directory that existed before (ACL changes and deletions would reach the file elsewhere) | Remove the listed entries (`Remove-Item` on the link itself; `fsutil hardlink list <file>` shows the other names of a hard-linked file) and re-run |
+| Installer: `N file(s) appeared in the installation directories while this script ran` | someone who could still write to a pre-existing directory added files between the inspection and the lock-down | Find out where they come from, delete them and re-run; the directories are locked now, so a re-run is not raced |
 
 Run the control-plane in the foreground with its service environment (stop the service first):
 
@@ -676,13 +695,15 @@ Remove-Item Env:AEGIS_LOG_FILE
 
 The CI job `windows` (`.github/workflows/ci.yml`) runs on every push on Windows Server 2022 and 2025:
 
-1. the installer unit tests (Pester, 226 tests against an in-memory Windows model with owners, ACL
-   inheritance, links and SMB connections; nothing on the runner changes);
+1. the installer unit tests (Pester, 273 tests against an in-memory Windows model with owners, ACL
+   inheritance, links, hard links, SMB connections and a local user racing the installer; nothing on the runner
+   changes);
 2. the control-plane Go test suite and the data-plane unit tests on Windows CPython 3.12;
 3. installs Python for all users into `C:\Program Files\Python312` and WinSW 2.12.0 (pinned SHA-256), then both
    services, checks the event log source and the `service` ImagePath, and runs the log rotation task once as
    `NT SERVICE\AegisControlPlane` (result 0, archive created);
-4. rolls out the enterprise CA with `install-windows.ps1`, registers the runner as a server, publishes a policy
+4. rolls out the enterprise CA the documented way (downloads `install-windows.ps1`, compares its SHA-256 with
+   `windows_script_sha256` of `/api/public/ca/info`, runs it with `-File`), registers the runner as a server, publishes a policy
    set and checks an allowed HTTPS request (200), a denied one (403), the worker heartbeat and the recorded flow;
 5. grows the audit trail past the (CI) rotation size of 1 MB, checks the rotated and compressed generations and
    verifies the complete hash chain across them;

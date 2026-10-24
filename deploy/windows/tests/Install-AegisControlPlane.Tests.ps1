@@ -353,10 +353,58 @@ Describe 'Install-AegisControlPlane.ps1' {
             Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
             Remove-Item -LiteralPath $SecretsDir -Recurse -Force
             New-Item -ItemType SymbolicLink -Path $SecretsDir -Target $target | Out-Null
-            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed*secrets*'
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links and hard-linked files are not allowed*secrets*'
             (Get-FakeCall 'icacls.exe').Count | Should -Be 0
             $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
+        }
+
+        It 'refuses a hard-linked key file (its ACL is shared with the file elsewhere)' {
+            $outside = Join-Path $FakeWin.Root 'outside.key'
+            Set-Content -LiteralPath $outside -Value ('p' * 64)
+            New-Item -ItemType HardLink -Path (Join-Path $SecretsDir 'jwt.key') -Target $outside | Out-Null
+            { & $Installer @Base -AdoptExistingSecrets } | Should -Throw '*hard-linked files are not allowed*jwt.key (hard link)*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+        }
+
+        It 'takes the directories over top-down with /L and without /T' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $calls = @(Get-FakeCall 'icacls.exe')
+            @($calls | Where-Object { $_.Args -notcontains '/L' }).Count | Should -Be 0
+            @($calls | Where-Object { $_.Args -contains '/T' }).Count | Should -Be 0 -Because 'icacls /T follows junctions'
+            $order = @($calls | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $first = @($DataRoot, $SecretsDir) | ForEach-Object { $order.IndexOf((Get-FakeFullPath $_)) }
+            $first | Should -Not -Contain -1
+            $first[0] | Should -BeLessThan $first[1]
+        }
+
+        It 'refuses a symbolic link that the owner of secrets swaps in while the installer runs, and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'victim'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
+            $race = @{ Done = $false; Dir = (Get-FakeFullPath $SecretsDir); Link = (Join-Path $SecretsDir 'link'); Target = $target }
+            $FakeWin.IcaclsHook = {
+                param($a)
+                if (-not $race.Done -and (Get-FakeFullPath $a[0]) -eq $race.Dir) {
+                    $race.Done = $true
+                    New-Item -ItemType SymbolicLink -Path $race.Link -Target $race.Target | Out-Null
+                }
+            }.GetNewClosure()
+            { & $Installer @Base -SkipFirewall } | Should -Throw '*Junction/symbolic link in the installation directories*link*'
+            $race.Done | Should -BeTrue
+            $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            $FakeWin.Acl.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'refuses a <Name> planted after the inspection, before the directories were locked' -TestCases @(
+            @{ Name = 'JWT key'; PlantIn = 'SecretsDir'; PlantFile = 'jwt.key' }, @{ Name = 'CA'; PlantIn = 'CertsDir'; PlantFile = 'mitmproxy-ca.pem' }
+        ) {
+            $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
+            $FakeWin.IcaclsHook = { param($a) if (-not [System.IO.File]::Exists($planted)) { [System.IO.File]::WriteAllText($planted, 'p' * 64) } }.GetNewClosure()
+            { & $Installer @Base -SkipFirewall } | Should -Throw "*1 file(s) appeared in the installation directories while this script ran*$PlantFile*"
+            $FakeWin.Services.Count | Should -Be 0
         }
     }
 
@@ -696,6 +744,33 @@ Describe 'Install-AegisControlPlane.ps1' {
             Assert-EncryptedSmbSource -Name '-X' -Path 'Z:\secrets' -AllowUnencrypted 6>&1 | Should -Match 'Continuing because of -AllowUnencryptedImport'
             Assert-EncryptedSmbSource -Name '-X' -Path 'C:\Backup\secrets' 6>&1 | Should -BeNullOrEmpty
             Assert-EncryptedSmbSource -Name '-X' -Path (Join-Path $FakeWin.Root 'secrets') 6>&1 | Should -BeNullOrEmpty
+        }
+
+        It 'Assert-EncryptedSmbSource recognises the unencrypted share written as <Form>' -TestCases @(
+            @{ Form = 'forward slashes'; Path = '//fs/aegis/secrets' },
+            @{ Form = 'mixed separators'; Path = '\\fs/aegis\secrets' },
+            @{ Form = 'an extra leading separator'; Path = '\\\fs\aegis\secrets' },
+            @{ Form = 'a \\?\UNC\ path'; Path = '\\?\UNC\fs\aegis\secrets' },
+            @{ Form = 'a \\.\UNC\ path with forward slashes'; Path = '//./UNC/fs/aegis/secrets' },
+            @{ Form = 'an NT \??\UNC\ path'; Path = '\??\UNC\fs\aegis\secrets' },
+            @{ Form = 'a provider path'; Path = 'FileSystem::\\fs\aegis\secrets' },
+            @{ Form = 'a mapped drive'; Path = 'z:/secrets' },
+            @{ Form = 'a mapped drive as device path'; Path = '\\?\Z:\secrets' }
+        ) {
+            . ([scriptblock]::Create((Import-ScriptFunction -Path $Installer -Name 'Assert-EncryptedSmbSource', 'Write-Ok', 'Write-Note')))
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'fs'; ShareName = 'aegis'; Encrypted = $false })
+            $FakeWin.Smb.Mappings['Z:'] = '\\fs\aegis'
+            { Assert-EncryptedSmbSource -Name '-X' -Path $Path } | Should -Throw '*\\fs\aegis over an SMB connection that is not encrypted*'
+        }
+
+        It 'Assert-EncryptedSmbSource treats loopback shares as local and refuses other device paths' {
+            . ([scriptblock]::Create((Import-ScriptFunction -Path $Installer -Name 'Assert-EncryptedSmbSource', 'Write-Ok', 'Write-Note')))
+            foreach ($path in @('\\localhost\c$\ProgramData\AegisProxy\secrets', '//127.0.0.1/c$/secrets', '\\.\UNC\127.0.0.1\c$\secrets', '\\[::1]\c$\secrets')) {
+                Assert-EncryptedSmbSource -Name '-X' -Path $path 6>&1 | Should -Match 'share of this host' -Because $path
+            }
+            foreach ($path in @('\\?\GLOBALROOT\Device\Mup\fs\aegis\secrets', '\\.\pipe\secrets', '\\?\Volume{00000000-0000-0000-0000-000000000000}\secrets')) {
+                { Assert-EncryptedSmbSource -Name '-X' -Path $path } | Should -Throw '*is a device path*' -Because $path
+            }
         }
 
         It 'Get-ServiceSid computes virtual account SIDs like Windows' {

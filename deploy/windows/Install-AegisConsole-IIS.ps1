@@ -140,27 +140,52 @@ function Get-AclProblem {
     return $problems
 }
 
+function Assert-PlainItem($Item) {
+    # Refuses a junction or symbolic link (ACL changes and robocopy /MIR would act on its target) and a file with
+    # further hard links (its ACL is shared with a file elsewhere).
+    if ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Junction/symbolic link in the site directory: $($Item.FullName). Remove it and re-run."
+    }
+    if (-not $Item.PSIsContainer -and "$($Item.LinkType)" -eq 'HardLink') {
+        throw "$($Item.FullName) has further hard links (they share its ACL with a file elsewhere). Remove it and re-run."
+    }
+}
+
 function Protect-Directory {
-    # Takes over a directory that may have existed before the installation: Administrators become owner of Root
-    # and of everything in -Children, Root gets a protected ACL with -Grant (explicit ACEs of principals that are
-    # not -Allowed are removed) and the children are reset to inherit from Root only.
+    # Takes over a directory that may have existed before the installation, top-down, so that whoever created it
+    # cannot swap in a link while it is processed. Root first: owner Administrators and a protected ACL with -Grant
+    # (explicit ACEs of principals that are not -Allowed are removed) - from then on nobody else can create, delete
+    # or rename entries in it. Then every entry below it (listed after Root was locked), each item only after its
+    # parent: owner Administrators, explicit ACEs dropped (it inherits from Root only). icacls always gets /L (a
+    # link itself is changed, never its target) and never /T (which follows links). A link or hard-linked file
+    # stops the installation; items are checked again once taken over (until then their creator could still turn
+    # an empty directory into a junction).
     param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$Grant,
-        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @())
-    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', '*S-1-5-32-544', '/Q')
-    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/Q'))
+        [Parameter(Mandatory = $true)][hashtable]$Allowed)
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', '*S-1-5-32-544', '/L', '/Q')
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/L', '/Q'))
     $foreign = @((Get-Acl -LiteralPath $Root).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
             ForEach-Object { "$($_.IdentityReference.Value)" } | Where-Object { -not $Allowed.ContainsKey($_) } | Sort-Object -Unique)
-    foreach ($sid in $foreign) { $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/Q') }
-    foreach ($child in $Children) {
-        if (-not (Test-Path -LiteralPath $child)) { continue }
-        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q')
-        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/C', '/Q')
+    foreach ($sid in $foreign) { $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/L', '/Q') }
+    Assert-PlainItem (Get-Item -LiteralPath $Root -Force)
+    $pending = New-Object System.Collections.Stack
+    foreach ($child in @(Get-ChildItem -LiteralPath $Root -Force)) { $pending.Push($child.FullName) }
+    while ($pending.Count) {
+        $path = [string]$pending.Pop()
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        Assert-PlainItem $item
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($path, '/setowner', '*S-1-5-32-544', '/L', '/Q')
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($path, '/reset', '/L', '/Q')
+        Assert-PlainItem (Get-Item -LiteralPath $path -Force)
+        if ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $path -Force)) { $pending.Push($child.FullName) } }
     }
 }
 
 function Find-ReparsePoint([string[]]$Path) {
     # Junctions and symbolic links at or below Path, found without following them (icacls /T and robocopy /MIR
-    # would act on their targets). Unreadable directories throw.
+    # would act on their targets), and files with further hard links (they share their ACL with a file elsewhere).
+    # Unreadable directories throw.
     $found = @()
     $pending = New-Object System.Collections.Stack
     foreach ($p in $Path) { if (Test-Path -LiteralPath $p) { $pending.Push((Get-Item -LiteralPath $p -Force)) } }
@@ -168,6 +193,7 @@ function Find-ReparsePoint([string[]]$Path) {
         $item = $pending.Pop()
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $found += $item.FullName }
         elseif ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { $pending.Push($child) } }
+        elseif ("$($item.LinkType)" -eq 'HardLink') { $found += "$($item.FullName) (hard link)" }
     }
     return $found
 }
@@ -181,9 +207,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $DistDir 'index.html'))) {
 if (-not (Test-Path -LiteralPath $WebConfigTemplate)) { throw "web.config template not found: $WebConfigTemplate" }
 $PhysicalPath = [System.IO.Path]::GetFullPath($PhysicalPath)
 # The site directory may exist already (created by anyone who can write to its parent). Links in it are refused:
-# robocopy /MIR and icacls /T would act on their targets.
+# ACL changes and robocopy /MIR would act on their targets (hard-linked files: on the file elsewhere).
+# Protect-Directory checks again while it takes the directory over.
 $links = @(Find-ReparsePoint @($PhysicalPath))
-if ($links.Count) { throw "Junctions/symbolic links are not allowed in the site directory: $($links -join ', '). Remove them and re-run." }
+if ($links.Count) { throw "Junctions/symbolic links and hard-linked files are not allowed in the site directory: $($links -join ', '). Remove them and re-run." }
 $SiteAcl = @{ 'S-1-5-18' = 'F'; 'S-1-5-32-544' = 'F'; (Get-AppPoolSid $AppPoolName) = 'RX' }
 
 $ApiBaseUrl = $ApiBaseUrl.Trim().TrimEnd('/')
@@ -257,8 +284,7 @@ if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Take ownership, restrict ACL and dep
     if (-not (Test-Path -LiteralPath $PhysicalPath)) { New-Item -ItemType Directory -Path $PhysicalPath -Force | Out-Null }
     # Before anything is written: Administrators take ownership, only SYSTEM/Administrators (full) and the pool
     # identity (read) keep access, and existing content is reset to inherit that (planted ACEs are removed).
-    Protect-Directory -Root $PhysicalPath -Grant @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "IIS AppPool\${AppPoolName}:(OI)(CI)RX") -Allowed $SiteAcl `
-        -Children @(Get-ChildItem -LiteralPath $PhysicalPath -Force | ForEach-Object { $_.FullName })
+    Protect-Directory -Root $PhysicalPath -Grant @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "IIS AppPool\${AppPoolName}:(OI)(CI)RX") -Allowed $SiteAcl
     # /MIR removes stale hashed assets of previous builds; web.config/config.js are written afterwards.
     $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @($DistDir, $PhysicalPath, '/MIR', '/XJ', '/XF', 'web.config',
         '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
