@@ -7,6 +7,9 @@
 # The audit trail is rotated by renaming: the control-plane notices the rename and reopens the file on
 # the next event (nothing is lost). GET /api/audit/export includes the rotated generations
 # (audit.jsonl-YYYYMMDD[.gz]) in the same directory, so keep them for your retention period.
+# When logrotate removes the oldest generation (after "rotate 24" months), call POST /api/audit/retention
+# as a Super Admin to re-seal the start of the trail; until then GET /api/audit/verify reports the missing
+# start (see docs/operations.md, audit trail).
 # The optional application log file is not reopened and therefore uses "copytruncate".
 
 # Append-only audit trail (AEGIS_AUDIT_LOG). Low volume, long retention for compliance.
