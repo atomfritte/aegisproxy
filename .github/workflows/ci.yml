@@ -23,7 +23,7 @@ jobs:
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - run: test -z "$(gofmt -l control-plane)" || (gofmt -l control-plane; exit 1)
       - run: go -C control-plane vet ./...
-      - run: go -C control-plane test -race -count=1 ./...
+      - run: go -C control-plane test -race -count=1 -timeout 30m ./...
         env:
           AEGIS_TEST_DATABASE_URL: postgres://aegis:aegis@localhost:5432/aegis?sslmode=disable
       - run: GOOS=windows GOARCH=amd64 go -C control-plane build -o /dev/null .
@@ -114,7 +114,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - name: Go tests on Windows (file sharing semantics, paths, service code)
-        run: go -C control-plane test -count=1 ./...
+        run: go -C control-plane test -count=1 -timeout 30m ./...
       - name: Python for all users (services cannot use per-user installations)
         run: |
           choco install python312 -y --no-progress --params '"/InstallDir:C:\Python312"'

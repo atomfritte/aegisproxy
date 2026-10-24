@@ -67,9 +67,13 @@ def render_cli(ctx: Dict[str, str], groups: List[str]) -> str:
         f" Policy Verdict  : {_clean(ctx['verdict'])} — {_clean(ctx['reason'])}\n"
         "--------------------------------------------------------------------------------\n"
         f"{action}\n"
-        " 🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER:\n"
-        f"    Linux:   curl -fsSL {public}/api/public/ca/install-linux.sh | sudo bash\n"
-        f"    Windows: iwr -UseBasicParsing {public}/api/public/ca/install-windows.ps1 | iex\n"
+        " 🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER (compare the installer's SHA-256 with\n"
+        "    the AegisProxy console, TLS & CA, before running it):\n"
+        f"    Linux:   curl -fsSLo aegis-ca-install.sh {public}/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh\n"
+        "             sudo bash aegis-ca-install.sh\n"
+        f"    Windows: iwr -UseBasicParsing {public}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1\n"
+        "             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n"
+        "             powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n"
         "================================================================================\n"
     )
 
@@ -147,9 +151,14 @@ duration:document.getElementById('duration').value,reason:document.getElementByI
 </div>{form}
 </div>
 <div class="card"><h2 class="h2">Enterprise Root CA</h2>
-<p>Install the AegisProxy root certificate to avoid TLS errors on this server:</p>
-<pre>curl -fsSL {e['public_url']}/api/public/ca/install-linux.sh | sudo bash
-iwr -UseBasicParsing {e['public_url']}/api/public/ca/install-windows.ps1 | iex   # Windows (admin)</pre>
+<p>Install the AegisProxy root certificate to avoid TLS errors on this server. Compare the installer's SHA-256
+with the AegisProxy console (TLS &amp; CA) before running it:</p>
+<pre>curl -fsSLo aegis-ca-install.sh {e['public_url']}/api/public/ca/install-linux.sh &amp;&amp; sha256sum aegis-ca-install.sh
+sudo bash aegis-ca-install.sh
+
+iwr -UseBasicParsing {e['public_url']}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1   # Windows (admin)
+Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
+powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1</pre>
 <p><a href="{e['public_url']}/api/public/ca/aegis-ca.crt">Download CA (PEM)</a> · <a href="{e['public_url']}/api/public/ca/aegis-ca.der">Download CA (DER)</a></p>
 </div></div>
 <script type="application/json" id="aegis-data">{data}</script>

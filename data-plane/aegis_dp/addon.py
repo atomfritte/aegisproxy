@@ -563,9 +563,17 @@ class AegisAddon:
                 flow.response = http.Response.make(200, body, {"Content-Type": ctype, "Cache-Control": "no-store"})
             return
         host = printable(flow.request.host, 255)
-        page = (f"AegisProxy Root CA portal\n\n  CA (PEM):   http://{host}/ca.crt\n  CA (DER):   http://{host}/ca.der\n"
-                f"  Linux:      curl -fsSL http://{host}/install-linux.sh | sudo bash\n"
-                f"  Windows:    iwr -UseBasicParsing http://{host}/install-windows.ps1 | iex\n\n"
+        def digest(b: bytes) -> str:
+            return hashlib.sha256(b).hexdigest() if b else "not cached yet"
+        page = (f"AegisProxy Root CA portal\n\n  CA (PEM):   http://{host}/ca.crt\n  CA (DER):   http://{host}/ca.der\n\n"
+                "Download the installer, compare its SHA-256 with the AegisProxy console (TLS & CA), then run it:\n"
+                f"  Linux:      curl -fsSLo aegis-ca-install.sh http://{host}/install-linux.sh && sha256sum aegis-ca-install.sh\n"
+                "              sudo bash aegis-ca-install.sh\n"
+                f"              expected SHA-256: {digest(self.cp.install_sh)}\n"
+                f"  Windows:    iwr -UseBasicParsing http://{host}/install-windows.ps1 -OutFile aegis-ca-install.ps1\n"
+                "              Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n"
+                "              powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n"
+                f"              expected SHA-256: {digest(self.cp.install_ps1)}\n\n"
                 f"Control-plane: {public}\n")
         flow.response = http.Response.make(200, page.encode("utf-8", "replace"), {"Content-Type": "text/plain; charset=utf-8"})
 

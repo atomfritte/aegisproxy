@@ -119,7 +119,14 @@ const SinkCard: React.FC<{
       </div>
       <div className="grid grid-cols-3 gap-x-4 gap-y-3 border-t border-border bg-surface-2 px-[var(--card-p)] py-3 sm:grid-cols-6">
         <Counter label="Sent" value={status?.sent ?? 0} hint="Records delivered since this replica started." />
-        <Counter label="Failed" value={status?.failed ?? 0} tone="danger" hint="Rejected permanently (e.g. invalid credentials) — not retried." />
+        <Counter
+          label="Failed"
+          value={status?.failed ?? 0}
+          tone="danger"
+          hint={`Rejected permanently (e.g. invalid credentials) — not retried. ${formatNumber(status?.discarded_batches ?? 0)} batches discarded${
+            streams.includes('audit') || streams.includes('security') ? '; kept in dead-letter.jsonl in the spool directory' : ''
+          }.`}
+        />
         <Counter label="Dropped" value={status?.dropped ?? 0} tone="danger" hint="Discarded because the spool was full." />
         <Counter label="Queued" value={status?.queued ?? 0} tone="warning" hint="Waiting in memory for the next batch." />
         <Tooltip content={`${formatNumber(status?.spool_records ?? 0)} records waiting on disk for redelivery`}>

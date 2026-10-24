@@ -1,7 +1,8 @@
 //go:build live
 
 // Live conformance against Microsoft Entra ID's public endpoints (no tenant or credentials needed):
-//   go -C control-plane test -tags live -run Live ./internal/...
+//
+//	go -C control-plane test -tags live -run Live ./internal/...
 package oidc
 
 import (

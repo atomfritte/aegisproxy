@@ -1478,6 +1478,8 @@ export interface ExportSinkStatus {
   sent: number;
   failed: number;
   dropped: number;
+  /** Batches the destination rejected permanently (4xx); audit/security sinks keep them in dead-letter.jsonl. */
+  discarded_batches?: number;
   last_success_at?: string;
   last_error?: string;
   last_error_at?: string;
