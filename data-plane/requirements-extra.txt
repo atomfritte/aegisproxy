@@ -1,2 +1,10 @@
-# Optional engines installed into the data-plane image (binary wheels only).
-yara-x==1.22.0
+# Optional engines installed into the data-plane image (binary wheels only), pinned by hash
+# (pip --require-hashes). The hashes cover the CPython abi3 wheels of PyPI: Linux x86_64/aarch64
+# (manylinux_2_28), macOS and Windows. Update the hashes together with the version (PyPI "Download
+# files" or uv pip compile --generate-hashes --universal).
+yara-x==1.22.0 \
+    --hash=sha256:a9a9a4b213b980d6b05231ea5b835c03d40e304d99ed05d18ac5e7a801de3c81 \
+    --hash=sha256:066e86533b7143ee96bb80e36b683eb25dad8bc4c064603802d3a8cbbd97f03e \
+    --hash=sha256:eb6d4812e73614643f3c10a2592692b544ca7db43eacb2c8c649a1c9658382c3 \
+    --hash=sha256:1472591e7ec4a07be0e63383235fc2e8908b6d7d510b98d210068ffde30bbe10 \
+    --hash=sha256:a0e889ad5377634d1ce759c8823fe1784519733de44da683da02eb0a8771b1a9

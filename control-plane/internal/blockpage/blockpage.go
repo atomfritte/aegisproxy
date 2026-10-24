@@ -111,7 +111,7 @@ var builtin = map[string]strs{
 		"dur_permanent":   "Permanent",
 		"support":         "Need help?",
 		"ca_heading":      "Trust the enterprise root CA",
-		"ca_intro":        "Install the root certificate to avoid TLS errors on this server:",
+		"ca_intro":        "Install the root certificate to avoid TLS errors on this server. Compare the installer's SHA-256 with the value shown in the AegisProxy console (TLS & CA) before running it:",
 		"ca_pem":          "Download CA (PEM)",
 		"ca_der":          "Download CA (DER)",
 		"cli_blocked":     "ACCESS BLOCKED",
@@ -120,6 +120,7 @@ var builtin = map[string]strs{
 		"cli_cli":         "From this server (replace the reason)",
 		"cli_threat":      "Blocked by threat protection — self-service is not available. Contact the security team with the trace ID.",
 		"cli_ca":          "INSTALL THE ROOT CA",
+		"cli_ca_verify":   "Compare the installer's SHA-256 with the AegisProxy console (TLS & CA) before running it.",
 		"powered":         "Protected by AegisProxy",
 	},
 	"de": {
@@ -153,7 +154,7 @@ var builtin = map[string]strs{
 		"dur_permanent":   "Dauerhaft",
 		"support":         "Hilfe benötigt?",
 		"ca_heading":      "Unternehmens-Root-CA vertrauen",
-		"ca_intro":        "Installieren Sie das Root-Zertifikat, um TLS-Fehler auf diesem Server zu vermeiden:",
+		"ca_intro":        "Installieren Sie das Root-Zertifikat, um TLS-Fehler auf diesem Server zu vermeiden. Vergleichen Sie vor dem Ausführen den SHA-256 des Installers mit dem Wert in der AegisProxy-Konsole (TLS & CA):",
 		"ca_pem":          "CA herunterladen (PEM)",
 		"ca_der":          "CA herunterladen (DER)",
 		"cli_blocked":     "ZUGRIFF BLOCKIERT",
@@ -162,6 +163,7 @@ var builtin = map[string]strs{
 		"cli_cli":         "Direkt von diesem Server (Begründung ersetzen)",
 		"cli_threat":      "Durch Threat Protection blockiert — keine Self-Service-Freigabe möglich. Bitte das Security-Team mit der Trace-ID kontaktieren.",
 		"cli_ca":          "ROOT-CA INSTALLIEREN",
+		"cli_ca_verify":   "SHA-256 des Installers vor dem Ausführen mit der AegisProxy-Konsole (TLS & CA) vergleichen.",
 		"powered":         "Geschützt durch AegisProxy",
 	},
 }
@@ -237,8 +239,12 @@ const pageTmpl = `<!DOCTYPE html>
 {{if .Links}}<nav class="links">{{range .Links}}<a href="{{.URL}}" rel="noopener noreferrer">{{.Label}}</a>{{end}}</nav>{{end}}
 </main>
 {{if .ShowCA}}<section class="card ca"><h2>{{.T.ca_heading}}</h2><p class="muted">{{.T.ca_intro}}</p>
-<pre>curl -fsSL %%AEGIS:public_url%%/api/public/ca/install-linux.sh | sudo bash
-iwr -UseBasicParsing %%AEGIS:public_url%%/api/public/ca/install-windows.ps1 | iex</pre>
+<pre>curl -fsSLo aegis-ca-install.sh %%AEGIS:public_url%%/api/public/ca/install-linux.sh
+sha256sum aegis-ca-install.sh
+sudo bash aegis-ca-install.sh</pre>
+<pre>iwr -UseBasicParsing %%AEGIS:public_url%%/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
+Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
+powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1</pre>
 <p class="small"><a href="%%AEGIS:public_url%%/api/public/ca/aegis-ca.crt">{{.T.ca_pem}}</a> · <a href="%%AEGIS:public_url%%/api/public/ca/aegis-ca.der">{{.T.ca_der}}</a></p></section>{{end}}
 <footer>{{range .Footer}}<p>{{.}}</p>{{end}}<p class="powered">{{.T.powered}}</p></footer>
 </div>
@@ -437,8 +443,8 @@ func renderCLI(t models.BlockPageTemplate, tr strs, threat bool) string {
 	}
 	if t.ShowCASection {
 		b.WriteString(thin)
-		fmt.Fprintf(&b, " %s\n    Linux:   curl -fsSL %s/api/public/ca/install-linux.sh | sudo bash\n    Windows: iwr -UseBasicParsing %s/api/public/ca/install-windows.ps1 | iex\n",
-			tr["cli_ca"], ph("public_url"), ph("public_url"))
+		fmt.Fprintf(&b, " %s\n  %s\n    Linux:   curl -fsSLo aegis-ca-install.sh %s/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh\n             sudo bash aegis-ca-install.sh\n    Windows: iwr -UseBasicParsing %s/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1\n             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n             powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n",
+			tr["cli_ca"], tr["cli_ca_verify"], ph("public_url"), ph("public_url"))
 	}
 	if f := strings.TrimSpace(expandText(t.CLIFooter, companyName(t))); f != "" {
 		b.WriteString(thin)

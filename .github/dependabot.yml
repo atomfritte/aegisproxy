@@ -6,6 +6,9 @@ updates:
   # Node.js build images stay on an LTS line (even major versions); odd majors are short-lived, so the
   # move to the next LTS is done deliberately instead of by Dependabot.
   - { package-ecosystem: docker, directory: /, schedule: { interval: weekly }, ignore: [{ dependency-name: node, update-types: ["version-update:semver-major"] }] }
+  - { package-ecosystem: docker, directory: /control-plane, schedule: { interval: weekly } }
   - { package-ecosystem: docker, directory: /data-plane, schedule: { interval: weekly } }
   - { package-ecosystem: docker, directory: /frontend, schedule: { interval: weekly }, ignore: [{ dependency-name: node, update-types: ["version-update:semver-major"] }] }
+  # Digest-pinned third-party images of the compose files (ClamAV, PostgreSQL, HAProxy).
+  - { package-ecosystem: docker-compose, directories: ["/", "/deploy/compose/ha"], schedule: { interval: weekly } }
   - { package-ecosystem: github-actions, directory: /, schedule: { interval: weekly } }

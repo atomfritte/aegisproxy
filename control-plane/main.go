@@ -57,7 +57,7 @@ func main() {
 			}
 			return
 		case "-h", "--help", "help":
-			fmt.Println("usage: aegis-control-plane [service | healthcheck [healthz|readyz] | version | gen-ca <certs-dir> | gen-csr <certs-dir> <subject> | import-ca <certs-dir> <cert.pem> [chain.pem]]\n\nConfiguration is read from AEGIS_* environment variables (see docs/configuration.md).")
+			fmt.Println("usage: aegis-control-plane [service | healthcheck [healthz|readyz] | version | gen-ca <certs-dir> [public-cert-dir] | gen-csr <certs-dir> <subject> | import-ca <certs-dir> <cert.pem> [chain.pem]]\n\nConfiguration is read from AEGIS_* environment variables (see docs/configuration.md).")
 			return
 		}
 	}
@@ -78,9 +78,11 @@ func main() {
 
 // genCA pre-provisions the enterprise root CA (needed for clustered / Kubernetes deployments where
 // the certificate is distributed as a secret instead of being generated on first start).
+// With a second directory it also writes the public certificate files there (no key), for components
+// that only publish the CA, such as the control-plane in docker compose.
 func genCA(args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: aegis-control-plane gen-ca <certs-dir>")
+	if len(args) != 1 && len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: aegis-control-plane gen-ca <certs-dir> [public-cert-dir]")
 		return 2
 	}
 	m, err := ca.NewCAManager(args[0])
@@ -90,6 +92,13 @@ func genCA(args []string) int {
 	}
 	fmt.Printf("Root CA ready in %s\n  subject:     %s\n  not after:   %s\n  fingerprint: %s\n", args[0], m.Subject, m.NotAfter.Format(time.RFC3339), m.Fingerprint)
 	fmt.Println("Files: mitmproxy-ca.pem (KEY + cert, keep secret!), mitmproxy-ca-cert.pem, aegis-enterprise-ca.crt, aegis-enterprise-ca.der")
+	if len(args) == 2 {
+		if err := m.WritePublic(args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		fmt.Printf("Public certificate (no key) in %s\n", args[1])
+	}
 	return 0
 }
 

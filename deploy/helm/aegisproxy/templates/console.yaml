@@ -63,6 +63,20 @@ spec:
   selector: {{- include "aegis.selector" $sel | nindent 4 }}
   ports:
     - { name: http, port: 8080, targetPort: http, protocol: TCP }
+---
+# Headless Service: its DNS name resolves to the console pod IPs, which the control-plane trusts as
+# reverse proxies for X-Forwarded-For (AEGIS_TRUSTED_PROXY_HOSTS).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-console-headless
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  clusterIP: None
+  selector: {{- include "aegis.selector" $sel | nindent 4 }}
+  ports:
+    - { name: http, port: 8080, targetPort: http, protocol: TCP }
 {{- if $c.podDisruptionBudget.enabled }}
 ---
 apiVersion: policy/v1

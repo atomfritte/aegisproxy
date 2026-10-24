@@ -14,6 +14,8 @@ dashboardUrl: ""
 # host:port servers use as their HTTP(S) proxy, shown in onboarding snippets (AEGIS_PROXY_ADDRESS).
 # Defaults to the host of publicUrl with port 8080; set it to the data-plane LoadBalancer address.
 proxyAddress: ""
+# Cluster DNS domain (used for the console's headless Service name).
+clusterDomain: cluster.local
 
 secrets:
   # Use an existing Secret with keys: jwt-secret, dataplane-key, encryption-key, [encryption-key-previous],
@@ -67,10 +69,17 @@ controlPlane:
   image:
     repository: aegisproxy/control-plane   # all-in-one image (API + bundled console)
     tag: ""                                 # defaults to Chart.appVersion
+    digest: ""                              # optional sha256:... pin (appended to the tag)
     pullPolicy: IfNotPresent
   replicas: 2
-  # CIDRs of the ingress controller / load balancers whose X-Forwarded-For is trusted.
-  trustedProxies: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  # Reverse proxies whose X-Forwarded-For header is trusted (client IPs for rate limits, CIDR-bound
+  # service accounts and the audit trail). Empty = the TCP peer is the client. Set it to the pod CIDR of
+  # your ingress controller (or the addresses of an external load balancer); never to whole private
+  # ranges, because every client inside them could then choose its own address.
+  trustedProxies: ""
+  # DNS names whose current addresses are trusted as proxies (comma-separated). The chart's own console
+  # (console.enabled, same-origin /api proxy) is added automatically via its headless Service.
+  trustedProxyHosts: ""
   internalDomains: ""          # AEGIS_INTERNAL_DOMAINS (empty = built-in defaults)
   corsOrigins: ""              # origins of a console hosted on another origin
   cookieSameSite: strict
@@ -112,6 +121,7 @@ console:
   image:
     repository: aegisproxy/console
     tag: ""
+    digest: ""
     pullPolicy: IfNotPresent
   replicas: 2
   # Empty: nginx proxies /api/ to the control-plane service (same origin, no CORS needed).
@@ -141,6 +151,7 @@ dataPlane:
   image:
     repository: aegisproxy/data-plane
     tag: ""
+    digest: ""
     pullPolicy: IfNotPresent
   replicas: 3
   # Local access log of each worker (AEGIS_ACCESS_LOG): "" = off, stdout (collected by the cluster's
@@ -183,8 +194,22 @@ clamav:
   image:
     repository: clamav/clamav
     tag: "1.5"
+    # Pinned by digest (the tag is kept for readability); clear it to follow the tag.
+    digest: sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e
     pullPolicy: IfNotPresent
   replicas: 2
+  # The image's clamav user (uid 100, gid 101); fsGroup makes the signature volume writable for it.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    runAsGroup: 101
+    fsGroup: 101
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: ["ALL"] }
   persistence:
     enabled: true
     size: 2Gi
@@ -220,6 +245,25 @@ networkPolicy:
     - 192.168.0.0/16
     - 100.64.0.0/10
     - 169.254.0.0/16
+  # IPv6 egress (dual-stack clusters): ::/0 minus dataPlaneEgressDenyIPv6. false = no IPv6 egress at all.
+  dataPlaneEgressIPv6: true
+  # Add the cluster's pod/service/VPC IPv6 ranges when they are global unicast (e.g. EKS IPv6).
+  dataPlaneEgressDenyIPv6:
+    - ::1/128          # loopback
+    - 64:ff9b::/96     # NAT64 well-known prefix (reaches IPv4 destinations, incl. private ranges)
+    - 64:ff9b:1::/48   # local-use NAT64
+    - 100::/64         # discard-only
+    - 2001:db8::/32    # documentation
+    - 2002::/16        # 6to4 (embeds IPv4 addresses)
+    - fc00::/7         # unique local addresses (typical pod/service/VPC ranges, fd00:ec2::254 metadata)
+    - fec0::/10        # deprecated site-local
+    - fe80::/10        # link-local
+    - ff00::/8         # multicast
+  # ClamAV egress: DNS and HTTPS (freshclam signature updates from database.clamav.net) to public
+  # addresses only (the deny lists above apply). Extra egress rules, e.g. for a private mirror:
+  #   - to: [{ ipBlock: { cidr: 10.20.30.40/32 } }]
+  #     ports: [{ port: 443, protocol: TCP }]
+  clamavExtraEgress: []
   # CloudNativePG instances (storage.postgres.cnpg.enabled): PostgreSQL only from the control-plane and
   # the other instances, the instance manager (8000) only from the operator namespace.
   cnpgOperatorNamespace: cnpg-system

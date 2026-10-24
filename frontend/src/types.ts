@@ -1403,6 +1403,11 @@ export interface CAInfo {
   linux_script: string;
   windows_script?: string;
   public_url?: string;
+  /** SHA-256 of the installers as served, and copy-paste commands that verify it before running them. */
+  linux_script_sha256?: string;
+  windows_script_sha256?: string;
+  linux_command?: string;
+  windows_command?: string;
 }
 
 // ---------------------------------------------------------------------------

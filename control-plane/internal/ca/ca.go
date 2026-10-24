@@ -138,6 +138,19 @@ func (m *CAManager) ensureCA() error {
 	return nil
 }
 
+// WritePublic writes the public certificate files (never the key) into dir, replacing older copies.
+func (m *CAManager) WritePublic(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, data := range map[string][]byte{"mitmproxy-ca-cert.pem": m.CertPEM, "aegis-enterprise-ca.crt": m.CertPEM, "aegis-enterprise-ca.der": m.CertDER} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			return fmt.Errorf("write CA certificate: %w", err)
+		}
+	}
+	return nil
+}
+
 func (m *CAManager) populateMetadata(cert *x509.Certificate) {
 	m.Subject = cert.Subject.String()
 	m.Issuer = cert.Issuer.String()

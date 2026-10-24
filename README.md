@@ -120,8 +120,12 @@ $ curl -x http://proxy.corp.example:8080 http://example.com/
       -d '{"block_token":"v1.eyJpcCI6…", "requester": "root@unregistered-172.24.0.1", "reason": "ENTER_REASON_HERE", "requested_scope": "prefix_with_objects", "duration": "1h"}'
 --------------------------------------------------------------------------------
  INSTALL THE ROOT CA
-    Linux:   curl -fsSL http://localhost:8081/api/public/ca/install-linux.sh | sudo bash
-    Windows: iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 | iex
+  Compare the installer's SHA-256 with the AegisProxy console (TLS & CA) before running it.
+    Linux:   curl -fsSLo aegis-ca-install.sh http://localhost:8081/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
+             sudo bash aegis-ca-install.sh
+    Windows: iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
+             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
+             powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1
 ================================================================================
 ```
 
@@ -201,7 +205,7 @@ Browsers get the branded HTML block page with a request form instead.
 Try AegisProxy on one host with Docker Compose (Docker with the Compose plugin and `openssl`):
 
 ```bash
-cp .env.example .env
+install -m 600 .env.example .env          # holds every secret: owner read/write only
 ./scripts/gen-secrets.sh >> .env          # JWT, data-plane and encryption keys
 docker compose up -d --build
 docker run --rm -v aegisproxy_aegis-data:/data alpine cat /data/secrets/initial-admin-password
@@ -223,8 +227,8 @@ Then, in the console:
 3. **Policy sets → New policy set** for the group, add an *Allow* rule such as `example.com` with path `/**`,
    and **Publish**. Workers pick it up within seconds.
 4. On the server: `export https_proxy=http://<host>:8080 http_proxy=http://<host>:8080` and trust the
-   enterprise CA with `curl -fsSL http://<host>:8081/api/public/ca/install-linux.sh | sudo bash`
-   (Windows: `install-windows.ps1`).
+   enterprise CA with the installer command from **TLS & CA** (Windows: the PowerShell one next to it).
+   It downloads the installer, checks its SHA-256 and only then runs it; never pipe it into a shell.
 5. Watch the result in **Live traffic**; blocked requests can be requested and approved from there.
 
 Want to look around first? Start on a fresh volume with `AEGIS_DEMO_MODE=true` for sample data (public demo

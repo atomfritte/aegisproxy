@@ -49,6 +49,7 @@ type Server struct {
 	metrics      *Metrics
 	loginLimiter *auth.LoginLimiter
 	publicLimit  *rateLimiter
+	proxyHosts   *proxyHostSet
 	caLimit      *rateLimiter
 
 	sseMu      sync.Mutex
@@ -102,6 +103,9 @@ func NewServer(d Deps) *Server {
 		caLimit:      newRateLimiter(120, time.Minute),
 		dataPlanes:   make(map[string]*DataPlaneStatus),
 		ssePerUser:   make(map[string]int),
+	}
+	if d.Config != nil {
+		s.proxyHosts = newProxyHostSet(d.Config.TrustedProxyHosts, s.log)
 	}
 	s.routes()
 	s.handler = s.middleware(http.HandlerFunc(s.serveMux))

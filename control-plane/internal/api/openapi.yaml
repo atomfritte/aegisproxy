@@ -498,7 +498,9 @@ paths:
         Bash script that downloads the CA from `AEGIS_PUBLIC_URL`, verifies its pinned SHA-256
         fingerprint and installs it into the Debian/Ubuntu/Alpine, RHEL/Fedora or SLES trust store, and
         sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `NODE_EXTRA_CA_CERTS`.
-        Usage: `curl -fsSL <public URL>/api/public/ca/install-linux.sh | sudo bash`. Rate limited (120/min per IP).
+        Never pipe it into a shell: use `linux_command` from `/api/public/ca/info` (shown in the console),
+        which downloads the script, checks it against `linux_script_sha256` and only then runs it with sudo.
+        Plain-http deployments get an additional warning in the script. Rate limited (120/min per IP).
       security: []
       responses:
         '200':
@@ -518,7 +520,9 @@ paths:
         PowerShell script (run elevated) that verifies the pinned fingerprint, imports the CA into
         `Cert:\LocalMachine\Root`, writes a PEM copy for Node.js and optionally (`$env:AEGIS_PROXY`)
         configures the WinHTTP and machine-wide proxy. Served as `text/plain` (`Content-Disposition:
-        inline; filename="install-windows.ps1"`). Rate limited (120/min per IP).
+        inline; filename="install-windows.ps1"`). Never pipe it into `iex`: use `windows_command` from
+        `/api/public/ca/info`, which checks the download against `windows_script_sha256` before running it.
+        Rate limited (120/min per IP).
       security: []
       responses:
         '200':
@@ -5849,7 +5853,7 @@ components:
               type: boolean
     CAInfo:
       type: object
-      required: [subject, issuer, serial, not_before, not_after, fingerprint, pem_content, public_url, download_crt, download_pem, download_der, linux_script, windows_script]
+      required: [subject, issuer, serial, not_before, not_after, fingerprint, pem_content, public_url, download_crt, download_pem, download_der, linux_script, windows_script, linux_script_sha256, windows_script_sha256, linux_command, windows_command]
       properties:
         subject:
           type: string
@@ -5881,6 +5885,18 @@ components:
           type: string
         windows_script:
           type: string
+        linux_script_sha256:
+          type: string
+          description: SHA-256 (hex) of the Linux installer as served by this deployment.
+        windows_script_sha256:
+          type: string
+          description: SHA-256 (hex) of the Windows installer as served by this deployment.
+        linux_command:
+          type: string
+          description: Copy-paste command that downloads the Linux installer, verifies `linux_script_sha256` (`sha256sum -c`) and only then runs it with sudo.
+        windows_command:
+          type: string
+          description: Copy-paste command for an elevated PowerShell that downloads the Windows installer to `%TEMP%`, verifies `windows_script_sha256` (`Get-FileHash`) and only then runs it.
     PublicAccessRequestInput:
       type: object
       required: [reason]

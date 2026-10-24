@@ -25,10 +25,15 @@ managers, verification). Bulk registration: **Servers → Import** (CSV from you
 machines that already send traffic appear under **Servers → Discovered**. Details:
 [policy-management.md](policy-management.md#fleet-management).
 
+Never pipe a downloaded installer into a shell. **TLS & CA** in the console (and `linux_command` /
+`windows_command` of `GET /api/public/ca/info`) shows one-liners that download the installer, check it
+against the SHA-256 of the script this deployment serves and only then run it. Manually:
+
 Linux:
 
 ```bash
-curl -fsSL https://aegis.corp.example/api/public/ca/install-linux.sh | sudo bash
+curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh
+echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
 cat <<'EOF' | sudo tee /etc/profile.d/aegis-proxy.sh
 export http_proxy=http://svc-web-01:<token>@aegis-proxy.corp.example:8080
 export https_proxy=$http_proxy HTTP_PROXY=$http_proxy HTTPS_PROXY=$http_proxy
@@ -40,10 +45,15 @@ Windows (elevated PowerShell):
 
 ```powershell
 $env:AEGIS_PROXY = "aegis-proxy.corp.example:8080"
-iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 | iex
+$f = Join-Path $env:TEMP 'aegis-ca-install.ps1'
+iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 -OutFile $f
+if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch' }
+powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
-Both installers pin the CA by its SHA-256 fingerprint (shown in the console under **SSL/TLS & Root CA**).
+Both installers pin the CA by its SHA-256 fingerprint (shown in the console under **TLS & CA**). Copy the
+commands from the console over https: with a plain-http `AEGIS_PUBLIC_URL` the script hash is the only
+protection against a script altered in transit (the Linux installer prints a warning in that case).
 For larger fleets distribute the CA and proxy settings with configuration management (Ansible, GPO, Intune,
 cloud-init).
 

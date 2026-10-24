@@ -1,4 +1,5 @@
 // Root CA helpers shared by the TLS & CA page and the public block portal.
+import type { CAInfo } from '../../../types';
 
 /** "CN=AegisProxy Root,O=Corp" → { CN: 'AegisProxy Root', O: 'Corp' } (first value wins). */
 export function parseDN(dn: string): Record<string, string> {
@@ -17,11 +18,25 @@ export function commonName(dn: string): string {
   return parseDN(dn).CN || dn || '—';
 }
 
-/** Fingerprint-pinned one-line installers served by the control plane. */
-export function installCommands(base: string) {
+type InstallInfo = Pick<CAInfo, 'linux_command' | 'windows_command'> | null | undefined;
+
+/**
+ * Fingerprint-pinned installers served by the control plane. A downloaded script is never piped into a
+ * shell: the control plane's commands check the script against its SHA-256 before running it; without
+ * them (older control plane) the steps download, show the hash for a manual comparison and run.
+ */
+export function installCommands(base: string, ca?: InstallInfo) {
   return {
-    linux: `curl -fsSL ${base}/api/public/ca/install-linux.sh | sudo bash`,
-    windows: `powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing ${base}/api/public/ca/install-windows.ps1 | iex"`,
+    linux:
+      ca?.linux_command ||
+      `curl -fsSLo aegis-ca-install.sh ${base}/api/public/ca/install-linux.sh
+sha256sum aegis-ca-install.sh   # compare with the console (TLS & CA)
+sudo bash aegis-ca-install.sh`,
+    windows:
+      ca?.windows_command ||
+      `iwr -UseBasicParsing ${base}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
+Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256   # compare with the console (TLS & CA)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1`,
   };
 }
 
@@ -36,7 +51,7 @@ export const TRUST_OS: Array<{ id: TrustOs; label: string }> = [
 ];
 
 /** Manual trust-store import guides per platform. */
-export function trustSnippet(os: TrustOs, base: string): string {
+export function trustSnippet(os: TrustOs, base: string, ca?: InstallInfo): string {
   switch (os) {
     case 'ubuntu':
       return `# Ubuntu / Debian / Proxmox — system-wide CA import
@@ -44,8 +59,9 @@ sudo curl -fsSL ${base}/api/public/ca/aegis-ca.crt \\
   -o /usr/local/share/ca-certificates/aegis-enterprise-ca.crt
 sudo update-ca-certificates
 
-# Or run the automated installer (fingerprint-pinned; also configures Git, pip, Node and curl):
-curl -fsSL ${base}/api/public/ca/install-linux.sh | sudo bash`;
+# Or run the automated installer (fingerprint-pinned, checked against its SHA-256 before it runs;
+# also configures Git, pip, Node and curl):
+${installCommands(base, ca).linux}`;
     case 'rhel':
       return `# RHEL 8/9, Rocky Linux, AlmaLinux, Fedora, Oracle Linux
 sudo curl -fsSL ${base}/api/public/ca/aegis-ca.crt \\
@@ -56,8 +72,9 @@ sudo update-ca-trust extract
 openssl verify /etc/pki/ca-trust/source/anchors/aegis-enterprise-ca.crt`;
     case 'windows':
       return `# Windows Server 2019 / 2022 / 2025 — automated installer
-# (run as Administrator; pinned to the CA fingerprint, imports into LocalMachine\\Root)
-powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing ${base}/api/public/ca/install-windows.ps1 | iex"
+# (run as Administrator; checked against its SHA-256 before it runs, pinned to the CA fingerprint,
+# imports into LocalMachine\\Root)
+${installCommands(base, ca).windows}
 
 # Or manually (Administrator PowerShell)
 Invoke-WebRequest -UseBasicParsing -Uri "${base}/api/public/ca/aegis-ca.der" -OutFile "C:\\Windows\\Temp\\aegis-ca.der"

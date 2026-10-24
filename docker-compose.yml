@@ -1,6 +1,6 @@
 # AegisProxy — single-host deployment (Docker Compose)
 #
-#   cp .env.example .env && ./scripts/gen-secrets.sh >> .env   # once
+#   install -m 600 .env.example .env && ./scripts/gen-secrets.sh >> .env   # once (.env holds secrets: mode 600)
 #   docker compose up -d --build
 #
 # Console/API: http://127.0.0.1:8081 (publish via a TLS reverse proxy, see docs/deployment/docker-compose.md)
@@ -19,13 +19,14 @@ x-hardening: &hardening
     options: { max-size: "20m", max-file: "5" }
 
 services:
-  # One-shot: provisions the enterprise root CA into the shared (read-only for everybody else) volume.
+  # One-shot: provisions the enterprise root CA. aegis-ca (key + certificate) is mounted read-only into
+  # the data-plane only; the control-plane gets aegis-ca-public with the certificate alone.
   ca-init:
     <<: *hardening
     image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
     build: { context: ., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
-    command: ["gen-ca", "/certs"]
-    volumes: ["aegis-ca:/certs"]
+    command: ["gen-ca", "/certs", "/public"]
+    volumes: ["aegis-ca:/certs", "aegis-ca-public:/public"]
     restart: "no"
 
   control-plane:
@@ -48,7 +49,7 @@ services:
       AEGIS_LOG_FORMAT: json
     volumes:
       - aegis-data:/data
-      - aegis-ca:/certs:ro
+      - aegis-ca-public:/certs:ro   # public CA certificate only, never the key
     ports:
       - "${AEGIS_CONSOLE_BIND:-127.0.0.1:8081}:8081"
 
@@ -74,7 +75,7 @@ services:
       - "${AEGIS_PROXY_BIND:-0.0.0.0:8080}:8080"
 
   clamav:
-    image: clamav/clamav:1.5
+    image: clamav/clamav:1.5@sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e   # pinned by digest (tag kept for readability)
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
     volumes:
@@ -88,4 +89,5 @@ services:
 volumes:
   aegis-data:
   aegis-ca:
+  aegis-ca-public:
   clamav-db:

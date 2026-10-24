@@ -2,7 +2,7 @@
 # the cluster mode). Production HA spreads these components over several hosts or uses Kubernetes
 # (deploy/helm) with a replicated PostgreSQL (Patroni, CloudNativePG or a managed service).
 #
-#   cd deploy/compose/ha && cp ../../../.env.example .env && ../../../scripts/gen-secrets.sh >> .env
+#   cd deploy/compose/ha && install -m 600 ../../../.env.example .env && ../../../scripts/gen-secrets.sh >> .env
 #   docker compose up -d --build
 #
 #   Console via load balancer:      http://127.0.0.1:8081   (bundled console, 2 control-plane replicas)
@@ -27,7 +27,10 @@ x-cp-env: &cp-env
   AEGIS_ENCRYPTION_KEY_PREVIOUS: ${AEGIS_ENCRYPTION_KEY_PREVIOUS:-}  # only during a key rotation
   AEGIS_DATAPLANE_KEY: ${AEGIS_DATAPLANE_KEY:?run scripts/gen-secrets.sh}
   AEGIS_BOOTSTRAP_ADMIN_PASSWORD: ${AEGIS_BOOTSTRAP_ADMIN_PASSWORD:-}
-  AEGIS_TRUSTED_PROXIES: 172.16.0.0/12
+  # Only the load balancer and the console container may set X-Forwarded-For (their current addresses
+  # are resolved via Docker DNS). Never trust a whole range: any container in it could pick its own IP.
+  AEGIS_TRUSTED_PROXIES: ""
+  AEGIS_TRUSTED_PROXY_HOSTS: lb,console
   AEGIS_DEMO_MODE: ${AEGIS_DEMO_MODE:-false}
 
 x-dp-env: &dp-env
@@ -39,7 +42,7 @@ x-dp-env: &dp-env
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb   # pinned by digest
     restart: unless-stopped
     environment:
       POSTGRES_USER: aegis
@@ -52,12 +55,14 @@ services:
       timeout: 3s
       retries: 20
 
+  # aegis-ca (key + certificate) is mounted into the data-planes only; the control-planes get
+  # aegis-ca-public with the certificate alone.
   ca-init:
     <<: *hardening
     image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
     build: { context: ../../.., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
-    command: ["gen-ca", "/certs"]
-    volumes: ["aegis-ca:/certs"]
+    command: ["gen-ca", "/certs", "/public"]
+    volumes: ["aegis-ca:/certs", "aegis-ca-public:/public"]
     restart: "no"
 
   control-plane-1: &cp
@@ -67,14 +72,14 @@ services:
       ca-init: { condition: service_completed_successfully }
       postgres: { condition: service_healthy }
     environment: *cp-env
-    volumes: ["aegis-ca:/certs:ro"]
+    volumes: ["aegis-ca-public:/certs:ro"]
     tmpfs: ["/data:size=64m,uid=65532,gid=65532,mode=0700"]
 
   control-plane-2:
     <<: *cp
 
   lb:
-    image: haproxy:3.2-alpine
+    image: haproxy:3.2-alpine@sha256:dfba86f031bd4c9039f10f8cc5de75991d1b6766d5460f0335b980408503baad   # pinned by digest
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
     depends_on: [control-plane-1, control-plane-2]
@@ -113,7 +118,7 @@ services:
     ports: ["127.0.0.1:8082:8080"]
 
   clamav:
-    image: clamav/clamav:1.5
+    image: clamav/clamav:1.5@sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e   # pinned by digest (tag kept for readability)
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
     volumes: ["clamav-db:/var/lib/clamav"]
@@ -121,4 +126,5 @@ services:
 volumes:
   pg-data:
   aegis-ca:
+  aegis-ca-public:
   clamav-db:

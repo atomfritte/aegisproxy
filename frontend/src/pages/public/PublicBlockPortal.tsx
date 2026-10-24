@@ -585,7 +585,7 @@ export const PublicBlockPortal: React.FC<Props> = ({ meta, prefill = null, onSwi
                     </button>
                   ))}
                 </div>
-                <CodeBlock className="mt-3" title={TRUST_OS.find((t) => t.id === os)?.label} code={trustSnippet(os, base)} wrap maxHeight={300} />
+                <CodeBlock className="mt-3" title={TRUST_OS.find((t) => t.id === os)?.label} code={trustSnippet(os, base, ca)} wrap maxHeight={300} />
               </div>
             </Card>
 

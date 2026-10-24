@@ -114,7 +114,9 @@ sudo ./deploy/systemd/install-linux.sh --component data-plane \
 What the installer does (idempotent - a re-run upgrades and keeps secrets, CA, state and env files):
 
 1. Checks root, systemd ≥ 248, distribution family (Debian/Ubuntu vs. RHEL/Rocky).
-2. Creates the system users `aegis` (control-plane) and `aegis-dp` (data-plane) with `nologin` shells.
+2. Creates the system users `aegis` (control-plane) and `aegis-dp` (data-plane) with `nologin` shells. An
+   existing account of that name must be a system account (UID up to `SYS_UID_MAX`, not root) with a
+   `nologin`/`false` shell; otherwise the installer stops (`--force-accounts` uses it anyway).
 3. Creates `/etc/aegis` (0755), `/etc/aegis/secrets` (0700) and generates missing secrets with
    `openssl rand -hex 32` (`jwt.key`, `dataplane.key`, optionally `metrics-token`), root:root 0600. Imports
    `--dataplane-key-file`, `--jwt-secret-file`, `--database-url-file`, `--bootstrap-admin-password-file`,
@@ -346,12 +348,14 @@ networks. Load balancers in front of workers must not SNAT client traffic unless
 ## 10. Rolling out the CA and proxy settings to client servers
 
 Verify the CA fingerprint printed by the installer (also `https://aegis.corp.example/api/public/ca/info`)
-through a second channel.
+through a second channel. Never pipe the installers into a shell: the console (**TLS & CA**) shows
+one-liners that check the downloaded script against its SHA-256 before running it.
 
 **Linux servers**
 
 ```bash
-curl -fsSL https://aegis.corp.example/api/public/ca/install-linux.sh | sudo bash
+curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh
+echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
 ```
 
 The script pins the CA fingerprint (it requires `curl` and `openssl`), installs the CA into the system trust
@@ -379,9 +383,9 @@ echo 'proxy=http://aegis-proxy.corp.example:8080' | sudo tee -a /etc/dnf/dnf.con
 Java needs the CA in its `cacerts` (`keytool -importcert -cacerts -alias aegis -file aegis-enterprise-ca.crt`).
 The worker also serves the CA and installers via the magic host: `curl -x http://proxy:8080 http://aegis.ca/`.
 
-**Windows servers**: GPO (Trusted Root CA + `netsh winhttp set proxy`) or
-`$env:AEGIS_PROXY='aegis-proxy.corp.example:8080'; iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 | iex`
-- see [`windows.md`](windows.md#10-rolling-out-the-ca-and-proxy-settings-to-client-servers).
+**Windows servers**: GPO (Trusted Root CA + `netsh winhttp set proxy`) or the verified PowerShell
+one-liner from the console (set `$env:AEGIS_PROXY='aegis-proxy.corp.example:8080'` first to also configure
+the proxy) - see [`windows.md`](windows.md#10-rolling-out-the-ca-and-proxy-settings-to-client-servers).
 
 ---
 
