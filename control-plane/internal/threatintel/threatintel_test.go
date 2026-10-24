@@ -94,7 +94,7 @@ func TestSnapshotMatching(t *testing.T) {
 }
 
 func TestValidateFeedURL(t *testing.T) {
-	for _, bad := range []string{"http://x.example/list", "https://127.0.0.1/x", "https://169.254.169.254/latest", "https://user:pw@x.example/", "https://intranet.local/x"} {
+	for _, bad := range []string{"http://x.example/list", "https://127.0.0.1/x", "https://169.254.169.254/latest", "https://168.63.129.16/machine", "https://[fd00:ec2::254]/latest", "https://100.100.100.200/latest", "https://user:pw@x.example/", "https://intranet.local/x"} {
 		if ValidateFeedURL(bad) == nil {
 			t.Errorf("accepted %q", bad)
 		}

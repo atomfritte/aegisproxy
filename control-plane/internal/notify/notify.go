@@ -22,7 +22,8 @@ import (
 func isDisallowedIP(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified() || netip.MustParsePrefix("100.64.0.0/10").Contains(addr)
+		addr.IsMulticast() || addr.IsUnspecified() || netip.MustParsePrefix("100.64.0.0/10").Contains(addr) ||
+		netguard.CloudMetadata(addr)
 }
 
 func ValidateWebhookURL(rawURL string) error {

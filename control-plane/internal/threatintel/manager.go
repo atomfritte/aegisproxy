@@ -182,7 +182,7 @@ func feedRedirect(req *http.Request, via []*http.Request) error {
 func isInternal(a netip.Addr) bool {
 	a = a.Unmap()
 	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
-		a.IsMulticast() || a.IsUnspecified() || netip.MustParsePrefix("100.64.0.0/10").Contains(a)
+		a.IsMulticast() || a.IsUnspecified() || netip.MustParsePrefix("100.64.0.0/10").Contains(a) || netguard.CloudMetadata(a)
 }
 
 // ValidateFeedURL checks an admin-supplied feed URL (https only, no internal hosts).

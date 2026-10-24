@@ -39,3 +39,15 @@ func TestDeliveryErrorsHideWebhookURL(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateWebhookURLRefusesMetadataEndpoints(t *testing.T) {
+	for _, u := range []string{"https://169.254.169.254/x", "https://168.63.129.16/x", "https://[fd00:ec2::254]/x",
+		"https://100.100.100.200/x", "https://127.0.0.1/x", "https://10.0.0.5/x", "http://hooks.example.net/x"} {
+		if ValidateWebhookURL(u) == nil {
+			t.Errorf("%s accepted", u)
+		}
+	}
+	if err := ValidateWebhookURL("https://hooks.example.net/services/x"); err != nil {
+		t.Error(err)
+	}
+}

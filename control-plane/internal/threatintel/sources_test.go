@@ -104,7 +104,7 @@ func TestTAXIIAndMISPSources(t *testing.T) {
 		t.Errorf("MISP query: %v", mispBody)
 	}
 	// Production validation refuses loopback, link-local and plain http.
-	for _, u := range []string{"http://misp.corp.example", "https://127.0.0.1/misp", "https://169.254.169.254/x"} {
+	for _, u := range []string{"http://misp.corp.example", "https://127.0.0.1/misp", "https://169.254.169.254/x", "https://168.63.129.16/x", "https://[fd00:ec2::254]/x", "https://100.100.100.200/x"} {
 		if ValidateSourceURL(u, false) == nil {
 			t.Errorf("%s accepted", u)
 		}

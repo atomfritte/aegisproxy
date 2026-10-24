@@ -129,8 +129,8 @@ func ValidateSourceURL(raw string, allowLoopback bool) error {
 	if a, err := netip.ParseAddr(host); err == nil {
 		a = a.Unmap()
 		loop = a.IsLoopback()
-		if a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast() {
-			return errors.New("source URL must not point to link-local or unspecified addresses")
+		if a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast() || netguard.CloudMetadata(a) {
+			return errors.New("source URL must not point to link-local, cloud metadata or unspecified addresses")
 		}
 	}
 	if loop && !allowLoopback {
@@ -158,7 +158,7 @@ func sourceClient(caPEM, proxy string, allowLoopback bool) (*http.Client, error)
 	}
 	blocked := func(a netip.Addr) bool {
 		a = a.Unmap()
-		return (a.IsLoopback() && !allowLoopback) || a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast()
+		return (a.IsLoopback() && !allowLoopback) || a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast() || netguard.CloudMetadata(a)
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: func(network, address string, _ syscall.RawConn) error {
 		host, _, err := net.SplitHostPort(address)
