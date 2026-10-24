@@ -138,29 +138,43 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
+	src := s.throttleSource(r)
 	// The lockout key is the canonical username (at most 64 ASCII characters): oversized or exotic
 	// input can neither grow the limiter without bound nor dodge the lockout with an alias.
 	acctKey := "u:" + strings.ToLower(strings.TrimSpace(body.Username))
 	if len(acctKey) > 70 || strings.IndexFunc(acctKey, func(r rune) bool { return r > 0x7e || r < 0x21 }) >= 0 {
 		acctKey = "u:invalid"
 	}
-	ipKey := "ip:" + ip
-	if wait := s.loginLimiter.Check(acctKey, ipKey); wait > 0 {
+	keys := src.keys("")
+	reset := []string{acctKey}
+	if s.store.IsBreakGlassUsername(body.Username) {
+		// Emergency access must survive an attacker who knows the name: failures lock the account only
+		// for their own source, and account-wide only for a short, bounded time under a sustained flood.
+		perSource := acctKey + "@" + src.label
+		keys = append(keys, auth.Key{Name: perSource}, auth.Key{Name: acctKey, Factor: breakGlassFactor, MaxLock: breakGlassMaxLock})
+		reset = append(reset, perSource)
+	} else {
+		keys = append(keys, auth.Key{Name: acctKey})
+	}
+	// The attempt is reserved before the password check, so parallel bursts count toward the lockout.
+	attempt, wait := s.loginLimiter.Begin(keys...)
+	if wait > 0 {
 		secs := int(math.Ceil(wait.Seconds()))
 		w.Header().Set("Retry-After", fmt.Sprint(secs))
 		s.metrics.Inc("aegis_login_total", "result", "throttled")
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("Too many failed sign-in attempts. Try again in %d seconds.", secs))
 		return
 	}
+	defer attempt.Release() // no-op once resolved; never leaks a reservation
 	user, err := s.store.AuthenticateLocal(body.Username, body.Password)
 	if err != nil {
-		s.loginLimiter.Fail(acctKey, ipKey)
+		attempt.Fail()
 		s.metrics.Inc("aegis_login_total", "result", "failure")
-		s.log.Warn("login failed", "username", truncateForLog(body.Username), "client_ip", ip)
+		s.log.Warn("login failed", "username", truncateForLog(body.Username), "client_ip", ip, "throttle_source", src.label)
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	s.loginLimiter.Success(acctKey)
+	attempt.Success(reset...)
 	token, claims, err := s.authMgr.IssueToken(user)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "token signing error")

@@ -124,17 +124,27 @@ func TestBlockToken(t *testing.T) {
 
 func TestLoginLimiterLocksOut(t *testing.T) {
 	l := NewLoginLimiter()
+	keys := []Key{{Name: "u:bob"}, {Name: "ip:1.2.3.4", Factor: FactorSource}}
 	for i := 0; i < 5; i++ {
-		if l.Check("u:bob") > 0 {
+		a, wait := l.Begin(keys...)
+		if wait > 0 {
 			t.Fatalf("locked too early at attempt %d", i)
 		}
-		l.Fail("u:bob", "ip:1.2.3.4")
+		a.Fail()
 	}
 	if l.Check("u:bob") <= 0 {
 		t.Fatal("expected lockout after 5 failures")
 	}
-	l.Success("u:bob")
-	if l.Check("u:bob") > 0 {
+	if _, wait := l.Begin(keys...); wait <= 0 {
+		t.Fatal("a locked account must refuse new attempts")
+	}
+	l.entries["u:bob"].lockedUntil = time.Time{} // lockout expired
+	a, wait := l.Begin(keys...)
+	if wait > 0 {
+		t.Fatal("after the lockout one attempt may probe again")
+	}
+	a.Success("u:bob")
+	if l.Check("u:bob") > 0 || l.entries["u:bob"] != nil {
 		t.Fatal("success should reset account lockout")
 	}
 }

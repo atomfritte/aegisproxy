@@ -358,7 +358,8 @@ curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install
 echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
 ```
 
-The script pins the CA fingerprint (it requires `curl` and `openssl`), installs the CA into the system trust
+The script pins the CA fingerprint (it requires `curl` and `openssl`), refuses a download that holds more than
+one certificate, installs only the verified certificate into the system trust
 store (Debian/Ubuntu, RHEL/Rocky/Fedora, SLES) and exports `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and
 `NODE_EXTRA_CA_CERTS` in `/etc/profile.d/aegis-proxy-ca.sh`. It does not configure proxy settings:
 

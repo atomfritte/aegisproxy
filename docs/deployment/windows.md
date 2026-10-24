@@ -516,7 +516,8 @@ Always verify the CA fingerprint printed by the installer (also visible in the c
   Python `requests` (`REQUESTS_CA_BUNDLE` or `pip install pip-system-certs`), `git config --system http.sslBackend schannel`.
 
 **One-shot installer** (non-domain servers, automation): the control-plane serves a fingerprint-pinned script
-that imports the CA into `LocalMachine\Root`, writes a PEM copy to `C:\Program Files\AegisProxy\ca-trust\`
+that adds only the pinned certificate to `LocalMachine\Root` (the download must be exactly that DER certificate;
+a PKCS#7/PFX bundle or trailing data is refused), writes a PEM copy to `C:\Program Files\AegisProxy\ca-trust\`
 (owner Administrators, ACL reset to SYSTEM/Administrators full and Users read, verified before writing - the
 file is trusted machine-wide via `NODE_EXTRA_CA_CERTS`), configures Node.js/Git and - with `$env:AEGIS_PROXY` -
 the WinHTTP and machine-wide proxy:

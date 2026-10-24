@@ -111,18 +111,20 @@ func (s *Server) scimAuthed(h scimHandler) http.HandlerFunc {
 			return
 		}
 		// Guessing tokens is throttled per source address like password sign-ins (the IdP's own
-		// requests always succeed, so a legitimate client is never locked out).
-		ipKey := "scim-ip:" + ip
-		if wait := s.loginLimiter.Check(ipKey); wait > 0 {
+		// requests always succeed, so a legitimate client is never locked out). The attempt is reserved
+		// before the token check, so parallel bursts count toward the lockout.
+		attempt, wait := s.loginLimiter.Begin(s.throttleSource(r).keys("scim-")...)
+		if wait > 0 {
 			w.Header().Set("Retry-After", fmt.Sprint(int(math.Ceil(wait.Seconds()))))
 			writeSCIMError(w, scim.Errf(http.StatusTooManyRequests, "", "too many failed SCIM authentications from this address"))
 			return
 		}
+		defer attempt.Release()
 		actor, err := s.store.AuthenticateSCIM(raw, ip)
 		if err != nil {
 			s.metrics.Inc("aegis_scim_auth_failures_total")
 			if !errors.Is(err, store.ErrSCIMDisabled) {
-				s.loginLimiter.Fail("", ipKey)
+				attempt.Fail()
 			}
 			if errors.Is(err, store.ErrSCIMDisabled) {
 				writeSCIMError(w, scim.Errf(http.StatusForbidden, "", "SCIM provisioning is disabled in AegisProxy"))
@@ -133,6 +135,7 @@ func (s *Server) scimAuthed(h scimHandler) http.HandlerFunc {
 			writeSCIMError(w, scim.Errf(http.StatusUnauthorized, "", "%s", err.Error()))
 			return
 		}
+		attempt.Success() // releases the reservation before the (possibly slow) provisioning request runs
 		h(w, r, actor)
 	}
 }

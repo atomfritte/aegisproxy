@@ -57,7 +57,7 @@ allowlist on every request; their actions are audited as `sa:<name>`.
 |---|---|---|
 | GET | `/api/public/meta` | product, version, demo mode, public URL, `local_login_enabled`, `sso {enabled, provider, label, login_url, local_login_enabled}` |
 | GET | `/api/public/request-options[?bt=<block token>]` | what the self-service form may offer for the requesting server: `{verified, server_hostname, url, verdict, request_form, allowed_scopes, allowed_durations, company_name, support, default_locale}`; without a token the TCP source address identifies the server; 400 for an invalid or expired token |
-| GET | `/api/public/ca/info` | CA subject, validity, SHA-256 fingerprint, PEM |
+| GET | `/api/public/ca/info` | CA subject, validity, SHA-256 fingerprint, PEM, SHA-256 of the download files (`pem_sha256`, `der_sha256`), installer hashes |
 | GET | `/api/public/ca/aegis-ca.crt` · `.pem` · `.der` | CA certificate |
 | GET | `/api/public/ca/install-linux.sh` | fingerprint-pinned Linux trust installer |
 | GET | `/api/public/ca/install-windows.ps1` | fingerprint-pinned Windows trust installer (optional proxy setup via `$env:AEGIS_PROXY`) |
