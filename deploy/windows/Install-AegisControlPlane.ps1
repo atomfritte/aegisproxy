@@ -12,7 +12,9 @@
 
     What the script does (idempotent - a re-run upgrades the binary and keeps all secrets/state):
       * copies the binary (and optionally the built web console) to -InstallDir
-      * creates <DataRoot>\data, \certs, \secrets, \logs with restrictive ACLs
+      * creates <DataRoot>\data, \certs, \secrets, \logs with restrictive ACLs; existing directories are taken
+        over (owner Administrators, foreign ACEs removed) and the result is verified. Files that existed
+        before are only kept on an upgrade of an intact installation or with -AdoptExistingSecrets
       * generates missing secrets (32 random bytes, hex) into <DataRoot>\secrets and passes them to the
         service exclusively as AEGIS_*_FILE paths (the service environment in the registry is readable
         by local users, secret values never go there)
@@ -24,7 +26,8 @@
         restricts its privileges, configures recovery (restart on failure) and the service environment
       * registers the Application event log source "AegisControlPlane" (fatal start/termination errors -
         under the SCM there is no console)
-      * opens the listener port in Windows Firewall, registers a daily log rotation task
+      * opens the listener port in Windows Firewall, registers a daily log rotation task that runs as the
+        service's virtual account
       * starts the service and waits for /healthz
 
     Data layout:
@@ -69,10 +72,22 @@
 
 .PARAMETER ImportSecretsDir
     Cluster nodes 2..n: directory containing jwt.key, dataplane.key and encryption.key of the first node. All
-    control-plane replicas must use identical secrets.
+    control-plane replicas must use identical secrets. An SMB path (UNC or mapped drive) must use an encrypted
+    connection (New-SmbMapping -RequirePrivacy $true or a share with EncryptData), see -AllowUnencryptedImport.
 
 .PARAMETER CaSourceDir
-    Cluster nodes 2..n: certs directory of the first node (the CA must be identical cluster-wide).
+    Cluster nodes 2..n: certs directory of the first node (the CA must be identical cluster-wide). Contains the
+    CA private key: the same SMB encryption requirement applies.
+
+.PARAMETER AllowUnencryptedImport
+    Accept -ImportSecretsDir / -CaSourceDir on an SMB connection that is not encrypted (secrets and the CA key
+    then cross the network in clear text).
+
+.PARAMETER AdoptExistingSecrets
+    Keep secrets, CA, state and program files that existed before this run although no intact installation
+    vouches for them (first installation: no service registered, or directories whose owner/ACL differ from
+    what this script sets). Use it after restoring a backup on a new host, when reinstalling after -Uninstall,
+    or after an interrupted first run - not for files of unknown origin, a local user may have planted them.
 
 .PARAMETER Force
     Allow replacing an existing, different CA or secrets with -CaSourceDir / -ImportSecretsDir.
@@ -87,11 +102,13 @@
         -TlsCertFile C:\pki\aegis.crt.pem -TlsKeyFile C:\pki\aegis.key.pem
 
 .EXAMPLE
-    # Cluster node 2 (PostgreSQL storage, secrets + CA from node 1)
+    # Cluster node 2 (PostgreSQL storage, secrets + CA from node 1 over an encrypted SMB connection)
+    New-SmbMapping -RemotePath '\\node1\c$' -RequirePrivacy $true | Out-Null
     $dsn = Read-Host 'PostgreSQL DSN'
     .\Install-AegisControlPlane.ps1 -PublicUrl https://aegis.corp.example -Storage postgres -DatabaseUrl $dsn `
         -ImportSecretsDir \\node1\c$\ProgramData\AegisProxy\secrets -CaSourceDir \\node1\c$\ProgramData\AegisProxy\certs `
         -TrustedProxies 10.10.0.10/32,10.10.0.11/32
+    Remove-SmbMapping -RemotePath '\\node1\c$' -Force
 
 .EXAMPLE
     .\Install-AegisControlPlane.ps1 -Uninstall
@@ -160,6 +177,12 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [string]$CaSourceDir,
 
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowUnencryptedImport,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AdoptExistingSecrets,
+
     # Creates secrets\metrics.token and protects /metrics with it (AEGIS_METRICS_TOKEN_FILE).
     [Parameter(ParameterSetName = 'Install')]
     [switch]$GenerateMetricsToken,
@@ -223,6 +246,7 @@ $CertsDir   = Join-Path $DataRoot 'certs'
 $SecretsDir = Join-Path $DataRoot 'secrets'
 $LogsDir    = Join-Path $DataRoot 'logs'
 $LogFile    = Join-Path $LogsDir 'control-plane.log'
+$caKey      = Join-Path $CertsDir 'mitmproxy-ca.pem'
 $ServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 # Same registration as Go's eventlog.InstallAsEventCreate (service_windows.go logs under this source).
 $EventLogKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\$ServiceName"
@@ -334,6 +358,158 @@ function Show-LogTail {
     catch { Write-Verbose "No matching SCM events: $_" }
 }
 
+function Get-ServiceSid([string]$Name) {
+    # SID of NT SERVICE\<Name>, computed (it must be known before the service exists): S-1-5-80 and the SHA-1 of
+    # the upper-case name in UTF-16LE as five little-endian DWORDs.
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($Name.ToUpperInvariant())) } finally { $sha.Dispose() }
+    return 'S-1-5-80-' + ((0..4 | ForEach-Object { [System.BitConverter]::ToUInt32($hash, 4 * $_) }) -join '-')
+}
+
+function ConvertTo-FileRight([int]$Rights) {
+    # FileSystemRights of an ACE as unsigned mask of specific rights (generic rights mapped like NTFS does).
+    $mask = [int64]$Rights -band 4294967295
+    if ($mask -band 268435456)  { $mask = $mask -bor 2032127 }   # GENERIC_ALL     -> FullControl
+    if ($mask -band 1073741824) { $mask = $mask -bor 1179926 }   # GENERIC_WRITE   -> FILE_GENERIC_WRITE
+    if ($mask -band 2147483648) { $mask = $mask -bor 1179785 }   # GENERIC_READ    -> FILE_GENERIC_READ
+    if ($mask -band 536870912)  { $mask = $mask -bor 1179808 }   # GENERIC_EXECUTE -> FILE_GENERIC_EXECUTE
+    return ($mask -band 2032127)
+}
+
+function Get-AclProblem {
+    # Deviations of Path from the expected ACL: a directory must be owned by Administrators or SYSTEM, and every
+    # allow ACE (explicit or inherited) must belong to a principal of -Allowed (SID -> F|M|RX|R) and stay within
+    # that principal's rights.
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][hashtable]$Allowed)
+    try { $acl = Get-Acl -LiteralPath $Path }
+    catch { return @("${Path}: ACL not readable ($($_.Exception.Message))") }
+    $problems = @()
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+    $ownerSid = if ($owner) { "$($owner.Value)" } else { 'none' }
+    if ((Test-Path -LiteralPath $Path -PathType Container) -and @('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) {
+        $problems += "${Path}: owner $ownerSid is not Administrators/SYSTEM"
+    }
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        if ("$($rule.AccessControlType)" -ne 'Allow') { continue }
+        $sid = "$($rule.IdentityReference.Value)"
+        if (-not $Allowed.ContainsKey($sid)) { $problems += "${Path}: access for $sid is not expected"; continue }
+        if ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band -bnot $AclRights[$Allowed[$sid]]) {
+            $problems += "${Path}: $sid has more than $($Allowed[$sid]) access"
+        }
+    }
+    return $problems
+}
+
+function Protect-Directory {
+    # Takes over a directory that may have existed before the installation: Administrators become owner of Root
+    # and of everything in -Children, Root gets a protected ACL with -Grant (explicit ACEs of principals that are
+    # not -Allowed are removed) and the children are reset to inherit from Root only.
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$Grant,
+        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @())
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', $SidAdmins, '/Q') | Out-Null
+    Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/Q')) | Out-Null
+    $foreign = @((Get-Acl -LiteralPath $Root).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+            ForEach-Object { "$($_.IdentityReference.Value)" } | Where-Object { -not $Allowed.ContainsKey($_) } | Sort-Object -Unique)
+    foreach ($sid in $foreign) { Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/Q') | Out-Null }
+    foreach ($child in $Children) {
+        if (-not (Test-Path -LiteralPath $child)) { continue }
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', $SidAdmins, '/T', '/C', '/Q') | Out-Null
+        Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/C', '/Q') | Out-Null
+    }
+}
+
+function Test-ReparsePoint([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return [bool]($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
+}
+
+function Find-ReparsePoint([string[]]$Path) {
+    # Junctions and symbolic links at or below Path, found without following them (icacls /T, robocopy and
+    # Remove-Item -Recurse of Windows PowerShell 5.1 act on their targets). Unreadable directories throw.
+    $found = @()
+    $pending = New-Object System.Collections.Stack
+    foreach ($p in $Path) { if (Test-Path -LiteralPath $p) { $pending.Push((Get-Item -LiteralPath $p -Force)) } }
+    while ($pending.Count) {
+        $item = $pending.Pop()
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $found += $item.FullName }
+        elseif ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { $pending.Push($child) } }
+    }
+    return $found
+}
+
+function Remove-DirectoryTree([string]$Path) {
+    # Deletes Path without following links: junctions and symbolic links below it are removed as links and their
+    # targets stay untouched (Remove-Item -Recurse of Windows PowerShell 5.1 deletes the targets' content).
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) {
+            if ($child.PSIsContainer) { Remove-DirectoryTree $child.FullName; continue }
+            if ($child.IsReadOnly) { $child.IsReadOnly = $false }
+            [System.IO.File]::Delete($child.FullName)
+        }
+    }
+    if ($item.PSIsContainer) { [System.IO.Directory]::Delete($item.FullName, $false) } else { [System.IO.File]::Delete($item.FullName) }
+}
+
+function Assert-EncryptedSmbSource {
+    # Secrets read from an SMB share cross the network in clear text unless the connection is encrypted (share or
+    # server with SMB encryption, or a mapping created with New-SmbMapping -RequirePrivacy $true).
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnencrypted)
+    $remote = $Path
+    if ($Path -match '^(?<drive>[A-Za-z]:)') {
+        $mapping = @(Get-SmbMapping -LocalPath $Matches['drive'] -ErrorAction SilentlyContinue)
+        if (-not $mapping.Count) { return }
+        $remote = "$($mapping[0].RemotePath)".TrimEnd('\') + $Path.Substring(2)
+    }
+    $remote = $remote -replace '^\\\\[?.]\\UNC\\', '\\'
+    if ($remote -notmatch '^\\\\(?<server>[^\\?.][^\\]*)\\(?<share>[^\\]+)') { return }
+    $server = $Matches['server']; $share = $Matches['share']
+    $null = Test-Path -LiteralPath $remote   # opens the SMB session if there is none yet
+    $connections = @(Get-SmbConnection -ServerName $server -ErrorAction SilentlyContinue | Where-Object { $_.ShareName -eq $share })
+    if ($connections.Count -and -not @($connections | Where-Object { -not $_.Encrypted }).Count) {
+        Write-Ok "${Name}: the SMB connection to \\$server\$share is encrypted."
+        return
+    }
+    $message = "$Name reads secrets from \\$server\$share over an SMB connection that is not encrypted. Map the share with " +
+        "New-SmbMapping -RemotePath '\\$server\$share' -RequirePrivacy `$true (or enable encryption on the share: Set-SmbShare -EncryptData `$true), " +
+        'or copy the files over another protected channel.'
+    if (-not $AllowUnencrypted) { throw "$message -AllowUnencryptedImport accepts the risk." }
+    Write-Note "$message Continuing because of -AllowUnencryptedImport."
+}
+
+function Get-ExistingFile([string[]]$Path) {
+    # Files below Path (reparse points are refused before, so the recursion stays inside Path).
+    foreach ($p in $Path) {
+        if (Test-Path -LiteralPath $p) { Get-ChildItem -LiteralPath $p -Recurse -Force -File | ForEach-Object { $_.FullName } }
+    }
+}
+
+function Get-InstallationAclProblem([switch]$IncludeLogs) {
+    # Deviations of the program and data directories (and the secrets, CA key, binary) from the ACLs this script sets.
+    $checks = [ordered]@{}
+    $checks[$InstallDir] = $AclProgram
+    $checks[$ExePath]    = $AclProgram
+    $checks[$DataRoot]   = $AclAdmins
+    $checks[$DataDir]    = $AclAdmins + @{ $ServiceSid = 'M' }
+    $checks[$CertsDir]   = $AclAdmins + @{ $ServiceSid = 'RX' }
+    $checks[$caKey]      = $AclAdmins
+    $checks[$SecretsDir] = $AclAdmins + @{ $ServiceSid = 'R' }
+    if (Test-Path -LiteralPath $SecretsDir) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $SecretsDir -Force -File)) { $checks[$file.FullName] = $checks[$SecretsDir] }
+    }
+    if ($IncludeLogs) { $checks[$LogsDir] = $AclAdmins + @{ $ServiceSid = 'M' } }
+    $problems = @()
+    foreach ($path in $checks.Keys) { if (Test-Path -LiteralPath $path) { $problems += @(Get-AclProblem -Path $path -Allowed $checks[$path]) } }
+    return $problems
+}
+
+# Expected ACLs (SID -> maximum rights) and the FileSystemRights masks of the icacls grants F, M, RX and R.
+$ServiceSid = Get-ServiceSid $ServiceName
+$AclRights  = @{ F = 2032127; M = 1245631; RX = 1179817; R = 1179785 }
+$AclAdmins  = @{ 'S-1-5-18' = 'F'; 'S-1-5-32-544' = 'F' }
+$AclProgram = $AclAdmins + @{ 'S-1-5-32-545' = 'RX'; $ServiceSid = 'RX' }
+
 # =====================================================================================================
 # Uninstall
 # =====================================================================================================
@@ -360,10 +536,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Uninstall') {
             Unregister-ScheduledTask -Confirm:$false
     }
     if ((Test-Path -LiteralPath $ExePath) -and $PSCmdlet.ShouldProcess($InstallDir, 'Remove program files')) {
-        Remove-Item -LiteralPath $InstallDir -Recurse -Force
+        Remove-DirectoryTree $InstallDir
     }
     Write-Ok 'AegisProxy control-plane uninstalled.'
     Write-Note "Data, secrets and the enterprise root CA were KEPT in $DataRoot (state, audit.jsonl, certs, secrets)."
+    Write-Note 'A later installation on this host keeps them only with -AdoptExistingSecrets (without a service they are treated as pre-existing files).'
     Write-Note "Back them up before purging; to remove everything: Remove-Item -LiteralPath '$DataRoot' -Recurse -Force"
     Write-Note "If a data-plane is installed on this host, it still uses its own copy of the CA and key."
     return
@@ -401,6 +578,8 @@ if ($PublicUrl -notmatch '^https://') {
     Write-Note 'AEGIS_PUBLIC_URL is http:// - session cookies are not Secure. Use https:// in production.'
 }
 if ([bool]$TlsCertFile -ne [bool]$TlsKeyFile) { throw '-TlsCertFile and -TlsKeyFile must be given together.' }
+if ($ImportSecretsDir) { Assert-EncryptedSmbSource -Name '-ImportSecretsDir' -Path $ImportSecretsDir -AllowUnencrypted:$AllowUnencryptedImport }
+if ($CaSourceDir) { Assert-EncryptedSmbSource -Name '-CaSourceDir' -Path $CaSourceDir -AllowUnencrypted:$AllowUnencryptedImport }
 if ($Storage -eq 'postgres' -and -not $DatabaseUrl -and -not (Test-Path -LiteralPath (Join-Path $SecretsDir 'database-url'))) {
     throw '-Storage postgres requires -DatabaseUrl on the first installation.'
 }
@@ -451,24 +630,48 @@ if ($UiDir) {
     }
 }
 
+# --- pre-existing directories ------------------------------------------------------------------------
+# ProgramData (and the volume root for a custom path) lets every user create directories, so the directories
+# may exist before the first installation - created by a local user with a known jwt.key/encryption.key, a CA
+# whose key they hold or a state file with their admin account. Such content is only kept on an upgrade of an
+# intact installation (service registered, directories owned by Administrators with the ACLs set below) or
+# with -AdoptExistingSecrets. Links are refused: ACL changes and deletions would act on their targets.
+try {
+    $links = @(Find-ReparsePoint @($InstallDir, $DataDir, $CertsDir, $SecretsDir, $LogsDir))
+    if (Test-ReparsePoint $DataRoot) { $links += $DataRoot }
+    $trustIssues = @()
+    if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { $trustIssues += "service $ServiceName is not installed (first installation)" }
+    else { $trustIssues += @(Get-InstallationAclProblem) }
+    $preExisting = @()
+    if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $DataDir, $CertsDir, $SecretsDir)) }
+}
+catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
+if ($links.Count) { throw "Junctions/symbolic links are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
+if ($preExisting.Count -and -not $AdoptExistingSecrets) {
+    throw ("Refusing to adopt {0} file(s) that existed before this installation ({1}):`n  {2}`nA local user may have planted them (known keys, CA or admin account). Delete them, or - if they are yours (restored backup, reinstallation after -Uninstall, interrupted first run) - re-run with -AdoptExistingSecrets; the script then takes ownership and resets their ACLs." -f
+        $preExisting.Count, ($trustIssues -join '; '), (($preExisting | Select-Object -First 10) -join "`n  "))
+}
+if ($preExisting.Count) { Write-Note "-AdoptExistingSecrets: keeping $($preExisting.Count) pre-existing file(s) ($($trustIssues -join '; '))." }
+
 # --- stop running instance before touching files -----------------------------------------------------
 if ($PSCmdlet.ShouldProcess($ServiceName, 'Stop service for upgrade')) { Stop-AegisService }
 
 # --- directories + base ACL --------------------------------------------------------------------------
-if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories and restrict ACL to SYSTEM/Administrators')) {
+if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and restrict ACL to SYSTEM/Administrators')) {
     foreach ($dir in @($InstallDir, $DataRoot, $DataDir, $CertsDir, $SecretsDir, $LogsDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
-    # A custom -InstallDir outside %ProgramFiles% inherits "create files/folders" for users from the volume
-    # root; the binary and the log rotation script (runs as SYSTEM) must not be replaceable by them.
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($InstallDir, '/inheritance:r', '/grant:r',
-        "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX", '/Q') | Out-Null
-    # ProgramData lets every user create files below it - remove inheritance on the data root first.
-    Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($DataRoot, '/inheritance:r', '/grant:r',
-        "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", '/Q') | Out-Null
+    # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
+    # protected roots. A custom -InstallDir outside %ProgramFiles% inherits "create files/folders" for users from
+    # the volume root; the binary and the log rotation script must not be replaceable by them.
+    Protect-Directory -Root $InstallDir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed $AclProgram `
+        -Children @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object { $_.FullName })
+    # Only the directories of this script are reset below the data root (a data-plane on this host keeps its subtree).
+    Protect-Directory -Root $DataRoot -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F") -Allowed $AclAdmins `
+        -Children @($DataDir, $CertsDir, $SecretsDir, $LogsDir)
     Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/inheritance:r', '/grant:r',
         "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", '/Q') | Out-Null
-    Write-Ok "Directories ready under $DataRoot"
+    Write-Ok "Directories ready under $DataRoot (owner Administrators, foreign ACEs removed)"
 }
 
 # --- program files -----------------------------------------------------------------------------------
@@ -477,7 +680,7 @@ if ($newBinary -and $PSCmdlet.ShouldProcess($ExePath, 'Install binary')) {
     Write-Ok "Installed $ExePath"
 }
 if ($UiDir -and $PSCmdlet.ShouldProcess($UiTarget, 'Install web console')) {
-    $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @($UiDir, $UiTarget, '/MIR', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
+    $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @($UiDir, $UiTarget, '/MIR', '/XJ', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
     Write-Ok "Web console copied to $UiTarget"
 }
 
@@ -547,7 +750,6 @@ if ($PSCmdlet.ShouldProcess($SecretsDir, 'Import/generate secrets')) {
 $tlsEnabled = (Test-Path -LiteralPath $tlsCertTarget) -and (Test-Path -LiteralPath $tlsKeyTarget)
 
 # --- enterprise root CA ------------------------------------------------------------------------------
-$caKey = Join-Path $CertsDir 'mitmproxy-ca.pem'
 if ($PSCmdlet.ShouldProcess($CertsDir, 'Provision enterprise root CA')) {
     if ($CaSourceDir) {
         $srcInfo = Get-CaInfo $CaSourceDir
@@ -621,7 +823,12 @@ if ($PSCmdlet.ShouldProcess($DataRoot, "Grant $ServiceAccount access")) {
         # re-assert after the certs grant: no inherited ACE may reach the CA key
         Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($caKey, '/inheritance:r', '/grant:r', "${SidSystem}:F", "${SidAdmins}:F", '/Q') | Out-Null
     }
-    Write-Ok 'ACLs: program files = read, data/logs = modify, certs = read, secrets = read (no inheritance), CA key = admins only.'
+    # Read the result back: only SYSTEM, Administrators, the service (and users: read program files) may have access.
+    $aclProblems = @(Get-InstallationAclProblem -IncludeLogs)
+    if ($aclProblems.Count) {
+        throw ("ACL verification failed - the service was not started:`n  {0}" -f ($aclProblems -join "`n  "))
+    }
+    Write-Ok 'ACLs verified: program files = read, data/logs = modify, certs = read, secrets = read (no inheritance), CA key = admins only.'
 }
 
 # --- service environment (REG_MULTI_SZ "Environment") ------------------------------------------------
@@ -707,14 +914,18 @@ Get-ChildItem -LiteralPath $item.DirectoryName -Filter ('{0}-*.zip' -f $item.Bas
     Remove-Item -Force
 '@
     [System.IO.File]::WriteAllText($rotationScript, $rotationBody, (New-Object System.Text.UTF8Encoding($true)))
+    $rotationProblems = @(Get-AclProblem -Path $rotationScript -Allowed $AclProgram)
+    if ($rotationProblems.Count) { throw ("ACL verification failed for the log rotation script:`n  {0}" -f ($rotationProblems -join "`n  ")) }
     $taskArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -LogFile "{1}" -RetentionDays {2}' -f $rotationScript, $LogFile, $LogRetentionDays
     $action    = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $taskArgs
     $trigger   = New-ScheduledTaskTrigger -Daily -At '03:15'
-    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    # Least privilege: the task runs as the service's virtual account, which may modify the log directory anyway
+    # (as SYSTEM it would act on files and links the service controls). The script itself stays admin-only.
+    $principal = New-ScheduledTaskPrincipal -UserId $ServiceAccount -LogonType ServiceAccount -RunLevel Limited
     $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
     Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Description 'Rotates the AegisProxy control-plane log file.' -Force | Out-Null
-    Write-Ok "Log rotation task registered ($TaskPath$TaskName, daily 03:15, keep $LogRetentionDays days)."
+    Write-Ok "Log rotation task registered ($TaskPath$TaskName, daily 03:15 as $ServiceAccount, keep $LogRetentionDays days)."
 }
 
 # --- start + health ----------------------------------------------------------------------------------

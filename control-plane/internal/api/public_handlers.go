@@ -253,12 +253,26 @@ try {
     Import-Certificate -FilePath $tmp -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
     Write-Host "[+] Installed into Cert:\LocalMachine\Root ($($cert.Subject))"
 
-    # PEM copy for runtimes with their own trust store (Node.js, Python certifi, Java keytool import)
-    $dir = Join-Path $env:ProgramData 'AegisProxy'
+    # PEM copy for runtimes with their own trust store (Node.js, Python certifi, Java keytool import). The file is
+    # trusted machine-wide (NODE_EXTRA_CA_CERTS), so it lives in a directory below Program Files that only
+    # SYSTEM/Administrators can change (users read it); an existing directory is taken over and checked first.
+    $dir = Join-Path $env:ProgramFiles 'AegisProxy\ca-trust'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    icacls.exe $dir /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls /setowner failed for $dir" }
+    icacls.exe $dir /reset /T /C /Q | Out-Null
+    icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed for $dir" }
+    $acl = Get-Acl -LiteralPath $dir
+    $admins = @('S-1-5-18', 'S-1-5-32-544')
+    $writers = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+        "$($_.AccessControlType)" -eq 'Allow' -and $admins -notcontains $_.IdentityReference.Value -and ([int]$_.FileSystemRights -band 0x500D0156) })
+    if ($admins -notcontains $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -or $writers.Count) {
+        throw "SECURITY ERROR: $dir is not restricted to administrators (owner or write access of another account)"
+    }
     $pem = "-----BEGIN CERTIFICATE-----`+"`"+`n" + [Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks') + "`+"`"+`n-----END CERTIFICATE-----`+"`"+`n"
     $pemPath = Join-Path $dir 'aegis-enterprise-ca.pem'
-    Set-Content -Path $pemPath -Value $pem -Encoding ascii
+    Set-Content -LiteralPath $pemPath -Value $pem -Encoding ascii
     [Environment]::SetEnvironmentVariable('NODE_EXTRA_CA_CERTS', $pemPath, 'Machine')
     if (Get-Command git -ErrorAction SilentlyContinue) { git config --system http.sslBackend schannel }
     Write-Host "[+] NODE_EXTRA_CA_CERTS=$pemPath; Git uses the Windows certificate store (schannel)."

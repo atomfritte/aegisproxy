@@ -95,7 +95,7 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 | Shell | Windows PowerShell 5.1 or PowerShell 7, elevated ("Run as administrator") |
 | Control-plane binary | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane.exe .` |
 | Web console | `npm --prefix frontend ci` and `npm --prefix frontend run build` → `frontend\dist` |
-| Python (workers) | **python.org CPython 3.12+ (64-bit), installed "for all users"**. Silent: `python-3.12.x-amd64.exe /quiet InstallAllUsers=1 Include_launcher=1 InstallLauncherAllUsers=1 PrependPath=0` |
+| Python (workers) | **python.org CPython 3.12+ (64-bit), installed "for all users" into `C:\Program Files\Python312`** (the default of `InstallAllUsers=1`). Silent: `python-3.12.x-amd64.exe /quiet InstallAllUsers=1 Include_launcher=1 InstallLauncherAllUsers=1 PrependPath=0`. Chocolatey: `choco install python312 --params "/InstallDir:'C:\Program Files\Python312'"` (its default `C:\Python312` lets users create files there) |
 | WinSW (workers) | `WinSW-x64.exe` from a 2.x release on <https://github.com/winsw/winsw/releases> (MIT). It is never downloaded by the scripts; the data-plane script verifies it against `-WinSWSha256` (default: WinSW 2.12.0 x64, `05B82D46…3A0DA`) and aborts on a mismatch before changing anything |
 | ClamAV (workers) | ClamAV for Windows MSI (x64) from <https://www.clamav.net/downloads> |
 | TLS | server certificate from your PKI for the console/API host name (PEM for native TLS, certificate store for IIS) |
@@ -105,7 +105,10 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 > necessarily contain every standard-library module the addon imports (`http.server`, `hmac`, `gzip`, ...).
 > The data-plane script creates a virtual environment from the python.org interpreter and installs
 > `mitmproxy==12.3.0` with pip. The Microsoft Store Python and per-user installations (`C:\Users\...`) are
-> rejected because the service account cannot read them.
+> rejected because the service account cannot read them. An interpreter whose directory, `Lib`, `DLLs` or
+> `Lib\site-packages` non-administrators (Users, Authenticated Users, Everyone, INTERACTIVE, ...) can write to or
+> create files in is rejected as well - code planted there (`python3XX.dll`, `Lib\sitecustomize.py`, a `.pth`
+> file) would run in the service. `-AllowWritablePython` overrides this check (not recommended).
 
 Copy a deployment package to the target host, for example:
 
@@ -143,9 +146,22 @@ What the script does (idempotent - re-running it upgrades the binary and keeps s
 
 1. Copies the binary to `C:\Program Files\AegisProxy\control-plane\` and the console to `...\ui\`. The program
    directory gets its own ACL (SYSTEM/Administrators full control, Users and the service read/execute), also for a
-   custom `-InstallDir` outside `Program Files` - the log rotation script there runs as SYSTEM.
+   custom `-InstallDir` outside `Program Files` - the log rotation script there must not be replaceable.
 2. Creates `C:\ProgramData\AegisProxy\{data,certs,secrets,logs}`, removes the inherited ProgramData ACL
-   (which lets every user create files) and grants SYSTEM/Administrators full control.
+   (which lets every user create files) and grants SYSTEM/Administrators full control. Directories that already
+   exist are taken over: Administrators become owner (recursively), explicit ACEs of other accounts are removed
+   and the content is reset to inherit the new ACL. After the service grants the script reads every ACL back
+   (owner Administrators/SYSTEM; only SYSTEM, Administrators, the service and - for program files - Users
+   read) and stops before starting the service if anything else is found. Junctions/symbolic links inside these
+   directories are refused.
+   **Pre-existing files.** Because every user may create `C:\ProgramData\AegisProxy` before the first
+   installation, files found there (and in the program directory) are only kept on an upgrade of an intact
+   installation - service registered, directories owned by Administrators with exactly these ACLs. Otherwise the
+   script refuses to adopt them (a planted `jwt.key`, CA or state file would give their author a known key or an
+   admin account) and lists them. Pass `-AdoptExistingSecrets` when they are yours: restore of a backup on a new
+   host, reinstallation after `-Uninstall` (which keeps the data), an interrupted first run, or an installation
+   from a Windows client edition, where the creating administrator (not the Administrators group) owns the
+   directories.
 3. Generates missing secrets (32 random bytes, hex) in `secrets\` and passes them **only as file paths**
    (`AEGIS_JWT_SECRET_FILE`, `AEGIS_DATAPLANE_KEY_FILE`, `AEGIS_DATABASE_URL_FILE`, ...). The per-service
    environment lives in the registry (`HKLM\SYSTEM\CurrentControlSet\Services\AegisControlPlane\Environment`),
@@ -164,7 +180,10 @@ What the script does (idempotent - re-running it upgrades the binary and keeps s
 7. Creates the firewall rule `AegisProxy-ControlPlane-In` (Domain profile by default; restrict
    `-FirewallRemoteAddress` to admin networks, workers and load balancers).
 8. Registers the scheduled task `\AegisProxy\AegisProxy Control-Plane Log Rotation` (daily copy/truncate of
-   `control-plane.log`, zipped, `-LogRetentionDays`).
+   `control-plane.log`, zipped, `-LogRetentionDays`). It runs as `NT SERVICE\AegisControlPlane`, not as SYSTEM:
+   the service can modify the log directory, so a privileged task working there could be redirected by links the
+   service planted. The script itself (`Invoke-AegisLogRotation.ps1` in the program directory) is read-only for
+   that account.
 9. Starts the service, waits for `/healthz`, and prints the CA fingerprint, the data-plane key path and the
    admin password location.
 
@@ -179,8 +198,10 @@ Important parameters:
 | `-TlsCertFile` / `-TlsKeyFile` | – | native HTTPS (PEM, unencrypted key) |
 | `-TrustedProxies` / `-CorsOrigins` | – | `AEGIS_TRUSTED_PROXIES` / `AEGIS_CORS_ORIGINS` |
 | `-ExtraEnvironment` | – | further non-secret variables, e.g. `@{ AEGIS_INTERNAL_DOMAINS = '.corp.example,.local' }` |
-| `-ImportSecretsDir` / `-CaSourceDir` | – | join an existing cluster (identical secrets and CA) |
-| `-Uninstall` | – | removes service, firewall rule, task and binaries; **keeps** `C:\ProgramData\AegisProxy` |
+| `-ImportSecretsDir` / `-CaSourceDir` | – | join an existing cluster (identical secrets and CA); SMB sources must be encrypted (section 9) |
+| `-AllowUnencryptedImport` | – | accept `-ImportSecretsDir` / `-CaSourceDir` over an unencrypted SMB connection |
+| `-AdoptExistingSecrets` | – | keep secrets, CA, state and program files that existed before a first installation (see step 2) |
+| `-Uninstall` | – | removes service, firewall rule, task and binaries (links inside are removed as links, never followed); **keeps** `C:\ProgramData\AegisProxy` |
 
 Parameters that are not passed on a re-run keep their previous values (storage mode, port, trusted proxies,
 CORS origins, extra variables). `-PublicUrl` must always be given.
@@ -274,23 +295,33 @@ cd C:\Install\AegisProxy\deploy\windows
 ```
 
 On a separate host, copy `dataplane.key` and `mitmproxy-ca.pem` from the control-plane over an
-administrative channel (e.g. SMB to `C$` with SMB encryption, or your secret store), run the script, then
-delete the copies - the script stages its own copies with tight ACLs.
+administrative channel (SMB with encryption - `New-SmbMapping -RemotePath '\\cp1\c$' -RequirePrivacy $true` - or
+your secret store), run the script, then delete the copies - the script stages its own copies with tight ACLs.
+When `-DataPlaneKeyFile` / `-CaFile` point to an SMB path (UNC or mapped drive), the script checks
+`Get-SmbConnection` and refuses an unencrypted connection unless `-AllowUnencryptedImport` is given. Without
+`-CaFile`, the CA of a control-plane on the same host is used only if the `AegisControlPlane` service is installed
+and `C:\ProgramData\AegisProxy\certs\mitmproxy-ca.pem` is restricted to SYSTEM/Administrators.
 
 The script:
 
-1. Verifies WinSW against `-WinSWSha256`, resolves Python (`py -3.12`, then 3.13/3.14, or `-PythonExe`), creates
+1. Verifies WinSW against `-WinSWSha256`, resolves Python (`py -3.12`, then 3.13/3.14, or `-PythonExe`) and refuses
+   an interpreter that non-administrators can modify (section 2), creates
    `C:\Program Files\AegisProxy\data-plane\venv` (the program directory gets its own ACL: SYSTEM/Administrators
    full control, Users and the service read/execute) and installs `mitmproxy==12.3.0`, `yara-x==1.22.0` and the
    security overrides of `data-plane\requirements-security.txt`, then verifies that `http.server`, `hmac`,
-   `gzip`, `ssl` and the addon import correctly.
+   `gzip`, `ssl` and the addon import correctly. Existing program and data directories are taken over like on the
+   control-plane (owner Administrators, foreign ACEs removed, links refused, ACLs verified after the
+   installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
+   `confdir\config.yaml` (mitmdump options and scripts), a prepared venv or .NET extraction cache - are refused
+   unless `-AdoptExistingSecrets` is given. Logs are kept either way.
 2. Copies `aegis_addon.py` and `aegis_dp\` to `...\data-plane\app` (byte-compiled; the program directory is
    read-only for the service).
 3. Stages the key (`C:\ProgramData\AegisProxy\data-plane\secrets\dataplane.key`, read-only for the service) and
    the CA (`...\confdir\mitmproxy-ca.pem`; mitmproxy needs a writable confdir for its dhparam file).
-4. Renders `aegis-dataplane.xml` from the template, copies WinSW to `aegis-dataplane.exe`, installs the
-   service `AegisDataPlane`, and switches its logon account to **`NT SERVICE\AegisDataPlane`** before the first
-   start. The mitmdump arguments are identical to `data-plane/entrypoint.sh`
+4. Renders `aegis-dataplane.xml` from the template, copies WinSW into the admin-only program directory and
+   verifies the SHA-256 of that copy (the file the SCM runs; `-WinSWExe` may have changed after the early check),
+   installs it as `aegis-dataplane.exe` and the service `AegisDataPlane`, and switches its logon account to
+   **`NT SERVICE\AegisDataPlane`** before the first start. The mitmdump arguments are identical to `data-plane/entrypoint.sh`
    (`connection_strategy=lazy`, `rawtcp=false`, `onboarding=false`, `block_global=false`, `ssl_insecure=false`,
    `tls_version_server_min=TLS1_2`, `body_size_limit=1g`).
 5. Opens the proxy port for `-AllowedRemoteAddress` only (Domain profile), and the ops port only if
@@ -308,8 +339,10 @@ Further parameters: `-ListenPort` (8080), `-ListenHost` (0.0.0.0), `-OpsAddr` (1
 `-FailMode` (closed), `-WorkerId`, `-PublicUrl`/`-DashboardUrl` (block-page fallbacks), `-ExtraEnvironment`,
 `-PipArgs`/`-RequirementsFile` (offline, hash-pinned installation from an internal wheel share - recommended
 for production; see below), `-WinSWSha256` (hash of a different WinSW build), `-NoYara` (do not install
-the YARA-X engine, which is otherwise installed as `yara-x==1.22.0` binary wheel), `-RecreateVenv`, `-Uninstall` (removes service, rules, program files and the staged key/CA
-copies; keeps logs). `-ExtraEnvironment` refuses the variables the template or a dedicated parameter sets
+the YARA-X engine, which is otherwise installed as `yara-x==1.22.0` binary wheel), `-RecreateVenv`,
+`-AllowWritablePython`, `-AllowUnencryptedImport`, `-AdoptExistingSecrets` (see above), `-Uninstall` (removes
+service, rules, program files and the staged key/CA copies - links inside are removed as links, their targets are
+never touched; keeps logs). `-ExtraEnvironment` refuses the variables the template or a dedicated parameter sets
 (`CONTROL_PLANE_URL`, `AEGIS_DATAPLANE_KEY[_FILE]`, `AEGIS_OPS_ADDR`, `AEGIS_FAIL_MODE`, ...).
 
 **Hash-pinned installation.** `-RequirementsFile` takes a complete lock file with hashes for every package,
@@ -323,8 +356,9 @@ uv pip compile --python-version 3.12 --python-platform x86_64-pc-windows-msvc --
 ```
 
 The script installs it with `--require-hashes --no-deps`, aborts if a package is below the baseline of
-`requirements-security.txt`, and aborts if `pip check` reports anything other than these deliberate overrides
-(an incomplete lock file).
+`requirements-security.txt` (compared by the venv's Python with `packaging`, PEP 440: `1.2.1rc1` is below
+`1.2.1`, an unparseable version fails the check), and aborts if `pip check` reports anything other than these
+deliberate overrides (an incomplete lock file).
 
 Manage the worker with `Get-Service AegisDataPlane | Restart-Service` or
 `& 'C:\Program Files\AegisProxy\data-plane\aegis-dataplane.exe' status`. Logs (rolled by size, 20 MB × 10):
@@ -363,7 +397,9 @@ application pool with *No Managed Code*, mirrors `dist`, writes `config.js`
 (`window.__AEGIS_CONFIG__ = { apiBaseUrl: "..." }`, `Cache-Control: no-store`), deploys `web.config`
 (CSP, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, COOP, HSTS,
 `/assets/*` cached one year as immutable, SPA fallback that excludes `/assets`, `/config.js`, `/api`), binds HTTPS
-with SNI and restricts the site directory to the pool identity.
+with SNI and restricts the site directory to the pool identity. An existing site directory is taken over before
+the first file is copied (owner Administrators, foreign ACEs removed, junctions refused); the ACL is verified
+before the site is started.
 
 Cookies: `AEGIS_COOKIE_SAMESITE=strict` works for `console.corp.example` + `api.corp.example` (same site).
 Use `none` only for different registrable domains (requires HTTPS).
@@ -416,13 +452,19 @@ Limitations and recommendations:
 * **All control-plane nodes need identical** `jwt.key`, `dataplane.key` and CA. The state lives in PostgreSQL;
   `DATA_DIR` only holds caches. Install node 1 with `-Storage postgres -DatabaseUrl ...`, then nodes 2..n:
   ```powershell
+  New-SmbMapping -RemotePath '\\node1\c$' -RequirePrivacy $true | Out-Null   # SMB 3 encryption for this session
   $dsn = Read-Host 'PostgreSQL DSN'     # postgres://aegis:...@pg.corp.example:5432/aegis?sslmode=verify-full
   .\Install-AegisControlPlane.ps1 -PublicUrl https://aegis.corp.example -Storage postgres -DatabaseUrl $dsn `
       -ImportSecretsDir \\node1\c$\ProgramData\AegisProxy\secrets `
       -CaSourceDir \\node1\c$\ProgramData\AegisProxy\certs `
       -TrustedProxies 10.10.0.10/32,10.10.0.11/32
+  Remove-SmbMapping -RemotePath '\\node1\c$' -Force
   ```
-  (`$dsn` ends up in `secrets\database-url`, readable only by the service and administrators.)
+  (`$dsn` ends up in `secrets\database-url`, readable only by the service and administrators.) The secrets and
+  the CA private key cross the network: for UNC paths and mapped drives the script checks `Get-SmbConnection` and
+  stops unless the connection is encrypted (`-RequirePrivacy $true` as above, or a share with
+  `Set-SmbShare -EncryptData $true`). `-AllowUnencryptedImport` overrides the check; copying over another
+  protected channel to a local directory works as well.
 * **Control-plane load balancer:** round robin, no stickiness needed (sessions are signed JWTs, live updates are
   distributed through PostgreSQL `LISTEN/NOTIFY`), health check `GET /readyz` (includes database
   reachability), `X-Forwarded-For` + `AEGIS_TRUSTED_PROXIES`, idle timeout ≥ 1 h for the SSE stream
@@ -458,8 +500,10 @@ Always verify the CA fingerprint printed by the installer (also visible in the c
   Python `requests` (`REQUESTS_CA_BUNDLE` or `pip install pip-system-certs`), `git config --system http.sslBackend schannel`.
 
 **One-shot installer** (non-domain servers, automation): the control-plane serves a fingerprint-pinned script
-that imports the CA into `LocalMachine\Root`, writes a PEM copy, configures Node.js/Git and - with
-`$env:AEGIS_PROXY` - the WinHTTP and machine-wide proxy:
+that imports the CA into `LocalMachine\Root`, writes a PEM copy to `C:\Program Files\AegisProxy\ca-trust\`
+(owner Administrators, ACL reset to SYSTEM/Administrators full and Users read, verified before writing - the
+file is trusted machine-wide via `NODE_EXTRA_CA_CERTS`), configures Node.js/Git and - with `$env:AEGIS_PROXY` -
+the WinHTTP and machine-wide proxy:
 
 ```powershell
 $env:AEGIS_PROXY = 'aegis-proxy.corp.example:8080'
@@ -514,8 +558,10 @@ Back up before every upgrade (section 12).
 Backups contain the CA private key and all secrets: encrypt them and restrict access like the originals.
 
 Restore (file mode): stop the service, restore `data\`, `certs\` and `secrets\`, re-run the installer (it
-re-applies ACLs and the environment), verify `/healthz` and the CA fingerprint. Restore (cluster):
-`pg_restore -c -d aegis aegis-....dump`, restore `secrets\` and `certs\` on every node, start the nodes.
+re-applies ACLs and the environment), verify `/healthz` and the CA fingerprint. On a new host (no service yet) or
+after `-Uninstall`, the installer treats the restored files as pre-existing: pass `-AdoptExistingSecrets`.
+Restore (cluster): `pg_restore -c -d aegis aegis-....dump`, restore `secrets\` and `certs\` on every node, start the
+nodes.
 
 ---
 
@@ -551,7 +597,7 @@ is open; ID 2: the service dispatcher failed). The installer registers the sourc
 
 | Log | Rotation on Windows |
 |---|---|
-| `logs\control-plane.log` (`AEGIS_LOG_FILE`) | daily copy/truncate task registered by the installer (`-LogRetentionDays`) |
+| `logs\control-plane.log` (`AEGIS_LOG_FILE`) | daily copy/truncate task registered by the installer (`-LogRetentionDays`), runs as `NT SERVICE\AegisControlPlane` |
 | `data\audit.jsonl` | by the control-plane at `AEGIS_AUDIT_ROTATE_MB` (default 256 MB) into `audit.jsonl-YYYYMMDDhhmmss`, older generations gzip-compressed, never deleted (retention is your decision; export and verification include all generations) |
 | worker access log (`AEGIS_ACCESS_LOG=<file>`) | by the worker at `AEGIS_ACCESS_LOG_ROTATE_MB` (Windows default 100 MB) into `access.log.1 … .N` (`AEGIS_ACCESS_LOG_KEEP`, default 10) |
 | WinSW / mitmdump output | `roll-by-size` in the WinSW definition (20 MB × 10) |
@@ -576,6 +622,10 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | Console blank / CSP or CORS errors in the browser console | `config.js` points to another origin without matching CSP/CORS | Re-run the IIS script with `-ApiBaseUrl`; set `-CorsOrigins` on the control-plane |
 | IIS returns 500.19 | URL Rewrite (or ARR for the `/api` rule) missing | Install the module(s) |
 | A new CA appeared after a restore | `certs\mitmproxy-ca-cert.pem` was missing, the control-plane generated a new CA | Restore the original `certs\` and restart; re-stage the CA on the workers |
+| Installer: `Refusing to adopt N file(s) that existed before this installation` | first installation (no service) or directories with an unexpected owner/ACL contain files | Check the listed files. Delete them if you do not know where they come from; re-run with `-AdoptExistingSecrets` for a restore, a reinstallation after `-Uninstall` or an interrupted first run |
+| Installer: `ACL verification failed` | an ACE or owner could not be changed (e.g. an inheritance-blocking policy, a tool that re-adds ACEs) | Fix the listed paths (`icacls <path>`), re-run; the service is not started until the check passes |
+| Installer: `Python at ... can be modified by non-administrators` | interpreter outside `Program Files` (e.g. `C:\Python312`) | Reinstall python.org Python for all users into `C:\Program Files\Python312` |
+| Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
 
 Run the control-plane in the foreground with its service environment (stop the service first):
 
@@ -594,8 +644,10 @@ Remove-Item Env:AEGIS_LOG_FILE
 - [ ] `AEGIS_PUBLIC_URL` uses `https://`; TLS certificate from the internal PKI; HSTS active.
 - [ ] Bootstrap password changed; `initial-admin-password` / `bootstrap-admin-password` files deleted;
       personal accounts with least-privilege roles; `AEGIS_DEMO_MODE=false`.
-- [ ] `C:\ProgramData\AegisProxy` ACL: no inherited `Users` access; `secrets\` and `mitmproxy-ca.pem`
-      admin/service only (`icacls` output reviewed).
+- [ ] `C:\ProgramData\AegisProxy` ACL: owner Administrators, no inherited `Users` access; `secrets\` and
+      `mitmproxy-ca.pem` admin/service only (verified by the installers; `icacls` output reviewed).
+- [ ] Never used `-AdoptExistingSecrets` for files of unknown origin; Python installed in `Program Files` (no
+      `-AllowWritablePython`); secrets copied between hosts only over encrypted SMB or another protected channel.
 - [ ] No secret values in the registry environment (only `*_FILE` paths).
 - [ ] Services run as virtual accounts (`NT SERVICE\AegisControlPlane`, `NT SERVICE\AegisDataPlane`), never as
       LocalSystem.
@@ -617,10 +669,12 @@ Remove-Item Env:AEGIS_LOG_FILE
 
 The CI job `windows` (`.github/workflows/ci.yml`) runs on every push on Windows Server 2022 and 2025:
 
-1. the installer unit tests (Pester, 183 tests against an in-memory Windows model; nothing on the runner changes);
+1. the installer unit tests (Pester, 226 tests against an in-memory Windows model with owners, ACL
+   inheritance, links and SMB connections; nothing on the runner changes);
 2. the control-plane Go test suite and the data-plane unit tests on Windows CPython 3.12;
-3. installs Python for all users and WinSW 2.12.0 (pinned SHA-256), then both services, and checks the event log
-   source and the `service` ImagePath;
+3. installs Python for all users into `C:\Program Files\Python312` and WinSW 2.12.0 (pinned SHA-256), then both
+   services, checks the event log source and the `service` ImagePath, and runs the log rotation task once as
+   `NT SERVICE\AegisControlPlane` (result 0, archive created);
 4. rolls out the enterprise CA with `install-windows.ps1`, registers the runner as a server, publishes a policy
    set and checks an allowed HTTPS request (200), a denied one (403), the worker heartbeat and the recorded flow;
 5. grows the audit trail past the (CI) rotation size of 1 MB, checks the rotated and compressed generations and

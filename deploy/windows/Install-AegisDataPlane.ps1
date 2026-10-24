@@ -9,16 +9,20 @@
     mitmdump is not aware of the Service Control Manager, so it runs under WinSW (https://github.com/winsw/winsw,
     MIT). The PyInstaller-bundled mitmproxy Windows binaries are NOT used: they do not necessarily ship all
     standard-library modules the addon imports (http.server, hmac, gzip, ...). Instead the script creates a
-    virtual environment from a python.org CPython >= 3.12 installed "for all users" and installs
-    mitmproxy==12.3.0 into it.
+    virtual environment from a python.org CPython >= 3.12 installed "for all users" into a directory that only
+    administrators can modify (%ProgramFiles%) and installs mitmproxy==12.3.0 into it.
 
     Steps (idempotent; a re-run upgrades addon/venv/WinSW configuration and keeps the staged secrets):
-      * resolves Python (py -3.12 / -3.13 / -3.14 or -PythonExe), creates <InstallDir>\venv, pip install
+      * resolves Python (py -3.12 / -3.13 / -3.14 or -PythonExe), refuses an interpreter that non-administrators
+        can modify, creates <InstallDir>\venv, pip install
+      * takes over existing directories (owner Administrators, foreign ACEs removed); files that existed before
+        are only kept on an upgrade of an intact installation or with -AdoptExistingSecrets
       * copies data-plane\aegis_addon.py + aegis_dp\ to <InstallDir>\app (byte-compiled)
       * stages the data-plane key and the CA (mitmproxy-ca.pem = key + cert) into <DataRoot> with ACLs that
-        only SYSTEM, Administrators and the service account can read
-      * renders aegis-dataplane.xml (template next to this script) for WinSW, installs the service
-        "AegisDataPlane", switches it to the virtual account NT SERVICE\AegisDataPlane (or LocalService)
+        only SYSTEM, Administrators and the service account can read (verified after the installation)
+      * copies WinSW into the admin-only program directory and verifies the SHA-256 of that copy, renders
+        aegis-dataplane.xml (template next to this script), installs the service "AegisDataPlane" and
+        switches it to the virtual account NT SERVICE\AegisDataPlane (or LocalService)
       * opens the proxy port in Windows Firewall for the allowed server subnets only
       * starts the service and waits for http://<OpsAddr>/readyz (= first policy bundle loaded)
 
@@ -34,6 +38,11 @@
     Explicit python.exe (python.org CPython >= 3.12, installed for all users). Default: detected with the
     Python launcher (py -3.12, then -3.13, -3.14).
 
+.PARAMETER AllowWritablePython
+    Accept a base interpreter whose directory, Lib, DLLs or site-packages non-administrators (Users,
+    Authenticated Users, Everyone, INTERACTIVE, ...) can modify or create files in, e.g. C:\Python312 below a
+    volume root that lets users create files. Code planted there runs in the service. Not recommended.
+
 .PARAMETER SourceDir
     The repository's data-plane folder (contains aegis_addon.py and aegis_dp\). Default: ..\..\data-plane.
 
@@ -42,11 +51,23 @@
 
 .PARAMETER DataPlaneKeyFile
     File containing the data-plane key (control-plane: <DataRoot>\secrets\dataplane.key). Copied, never referenced.
+    An SMB path (UNC or mapped drive) must use an encrypted connection, see -AllowUnencryptedImport.
 
 .PARAMETER CaFile
     mitmproxy-ca.pem (CA private key + certificate) from the control-plane certs directory. Default when the
-    control-plane runs on the same host: %ProgramData%\AegisProxy\certs\mitmproxy-ca.pem. On a re-run without
-    -CaFile the already staged CA is kept.
+    control-plane service is installed on the same host: %ProgramData%\AegisProxy\certs\mitmproxy-ca.pem (only
+    if that file is restricted to SYSTEM/Administrators). On a re-run without -CaFile the already staged CA is
+    kept. Same SMB encryption requirement as -DataPlaneKeyFile.
+
+.PARAMETER AllowUnencryptedImport
+    Accept -DataPlaneKeyFile / -CaFile on an SMB connection that is not encrypted (the key and the CA private key
+    then cross the network in clear text).
+
+.PARAMETER AdoptExistingSecrets
+    Keep a staged CA, control-plane CA bundle, confdir files and program files (venv, addon) that existed before
+    this run although no intact installation vouches for them (no AegisDataPlane service, or directories whose
+    owner/ACL differ from what this script sets). Not for files of unknown origin: a local user may have planted
+    them (a confdir\config.yaml, for example, configures mitmdump).
 
 .PARAMETER ClamdAddress
     AEGIS_CLAMD_ADDRESS, e.g. tcp://127.0.0.1:3310 (ClamAV for Windows). Empty string disables antivirus.
@@ -56,8 +77,9 @@
     Path to a verified WinSW-x64.exe (2.x). It is NOT downloaded automatically.
 
 .PARAMETER WinSWSha256
-    Expected SHA-256 of -WinSWExe. Default: WinSW-x64.exe of WinSW 2.12.0. The installation stops on a mismatch;
-    pass the hash of your verified copy when you deploy another 2.x release.
+    Expected SHA-256 of -WinSWExe. Default: WinSW-x64.exe of WinSW 2.12.0. Checked before any change and again
+    on the copy in the program directory that is installed as the service; the installation stops on a
+    mismatch. Pass the hash of your verified copy when you deploy another 2.x release.
 
 .PARAMETER AllowedRemoteAddress
     Remote addresses allowed to use the proxy port (Windows Firewall), e.g. 10.20.0.0/16,10.30.0.0/16.
@@ -96,6 +118,15 @@
 param(
     [Parameter(ParameterSetName = 'Install')]
     [string]$PythonExe,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowWritablePython,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowUnencryptedImport,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AdoptExistingSecrets,
 
     [string]$InstallDir = (Join-Path $env:ProgramFiles 'AegisProxy\data-plane'),
 
@@ -362,6 +393,199 @@ function Show-Diagnostic {
     Write-Note 'CA file without private key, or Python packages missing in the venv.'
 }
 
+function Get-ServiceSid([string]$Name) {
+    # SID of NT SERVICE\<Name>, computed (it must be known before the service exists): S-1-5-80 and the SHA-1 of
+    # the upper-case name in UTF-16LE as five little-endian DWORDs.
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($Name.ToUpperInvariant())) } finally { $sha.Dispose() }
+    return 'S-1-5-80-' + ((0..4 | ForEach-Object { [System.BitConverter]::ToUInt32($hash, 4 * $_) }) -join '-')
+}
+
+function ConvertTo-FileRight([int]$Rights) {
+    # FileSystemRights of an ACE as unsigned mask of specific rights (generic rights mapped like NTFS does).
+    $mask = [int64]$Rights -band 4294967295
+    if ($mask -band 268435456)  { $mask = $mask -bor 2032127 }   # GENERIC_ALL     -> FullControl
+    if ($mask -band 1073741824) { $mask = $mask -bor 1179926 }   # GENERIC_WRITE   -> FILE_GENERIC_WRITE
+    if ($mask -band 2147483648) { $mask = $mask -bor 1179785 }   # GENERIC_READ    -> FILE_GENERIC_READ
+    if ($mask -band 536870912)  { $mask = $mask -bor 1179808 }   # GENERIC_EXECUTE -> FILE_GENERIC_EXECUTE
+    return ($mask -band 2032127)
+}
+
+function Get-AclProblem {
+    # Deviations of Path from the expected ACL: a directory must be owned by Administrators or SYSTEM, and every
+    # allow ACE (explicit or inherited) must belong to a principal of -Allowed (SID -> F|M|RX|R) and stay within
+    # that principal's rights.
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][hashtable]$Allowed)
+    try { $acl = Get-Acl -LiteralPath $Path }
+    catch { return @("${Path}: ACL not readable ($($_.Exception.Message))") }
+    $problems = @()
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+    $ownerSid = if ($owner) { "$($owner.Value)" } else { 'none' }
+    if ((Test-Path -LiteralPath $Path -PathType Container) -and @('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) {
+        $problems += "${Path}: owner $ownerSid is not Administrators/SYSTEM"
+    }
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        if ("$($rule.AccessControlType)" -ne 'Allow') { continue }
+        $sid = "$($rule.IdentityReference.Value)"
+        if (-not $Allowed.ContainsKey($sid)) { $problems += "${Path}: access for $sid is not expected"; continue }
+        if ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band -bnot $AclRights[$Allowed[$sid]]) {
+            $problems += "${Path}: $sid has more than $($Allowed[$sid]) access"
+        }
+    }
+    return $problems
+}
+
+function Get-NonAdminWritable([string[]]$Path) {
+    # Paths that broad non-administrative groups (Everyone, Authenticated Users, Users, INTERACTIVE, Guests,
+    # Anonymous, Domain Users/Guests) may write, create files or folders in, delete, re-ACL or take over
+    # (852038 = WriteData/CreateFiles, AppendData/CreateDirectories, DeleteSubdirectoriesAndFiles, Delete,
+    # ChangePermissions, TakeOwnership).
+    $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
+        'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests' }
+    $found = @()
+    foreach ($p in $Path) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        try { $rules = @((Get-Acl -LiteralPath $p).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) }
+        catch { $found += "$p (ACL not readable)"; continue }
+        $groups = @($rules | Where-Object {
+                "$($_.AccessControlType)" -eq 'Allow' -and "$($_.IdentityReference.Value)" -match '^(S-1-1-0|S-1-5-(4|7|11|32-545|32-546)|S-1-5-21-[0-9-]+-51[34])$' -and
+                ((ConvertTo-FileRight ([int]$_.FileSystemRights)) -band 852038) } |
+                ForEach-Object { $sid = "$($_.IdentityReference.Value)"; if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid } } | Sort-Object -Unique)
+        if ($groups.Count) { $found += '{0} ({1})' -f $p, ($groups -join ', ') }
+    }
+    return $found
+}
+
+function Protect-Directory {
+    # Takes over a directory that may have existed before the installation: Administrators become owner of Root
+    # and of everything in -Children, Root gets a protected ACL with -Grant (explicit ACEs of principals that are
+    # not -Allowed are removed) and the children are reset to inherit from Root only.
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$Grant,
+        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @())
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', $SidAdmins, '/Q')
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/Q'))
+    $foreign = @((Get-Acl -LiteralPath $Root).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+            ForEach-Object { "$($_.IdentityReference.Value)" } | Where-Object { -not $Allowed.ContainsKey($_) } | Sort-Object -Unique)
+    foreach ($sid in $foreign) { $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/Q') }
+    foreach ($child in $Children) {
+        if (-not (Test-Path -LiteralPath $child)) { continue }
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', $SidAdmins, '/T', '/C', '/Q')
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/C', '/Q')
+    }
+}
+
+function Find-ReparsePoint([string[]]$Path) {
+    # Junctions and symbolic links at or below Path, found without following them (icacls /T, robocopy and
+    # Remove-Item -Recurse of Windows PowerShell 5.1 act on their targets). Unreadable directories throw.
+    $found = @()
+    $pending = New-Object System.Collections.Stack
+    foreach ($p in $Path) { if (Test-Path -LiteralPath $p) { $pending.Push((Get-Item -LiteralPath $p -Force)) } }
+    while ($pending.Count) {
+        $item = $pending.Pop()
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $found += $item.FullName }
+        elseif ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { $pending.Push($child) } }
+    }
+    return $found
+}
+
+function Remove-DirectoryTree([string]$Path) {
+    # Deletes Path without following links: junctions and symbolic links below it are removed as links and their
+    # targets stay untouched (Remove-Item -Recurse of Windows PowerShell 5.1 deletes the targets' content).
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) {
+            if ($child.PSIsContainer) { Remove-DirectoryTree $child.FullName; continue }
+            if ($child.IsReadOnly) { $child.IsReadOnly = $false }
+            [System.IO.File]::Delete($child.FullName)
+        }
+    }
+    if ($item.PSIsContainer) { [System.IO.Directory]::Delete($item.FullName, $false) } else { [System.IO.File]::Delete($item.FullName) }
+}
+
+function Assert-EncryptedSmbSource {
+    # Secrets read from an SMB share cross the network in clear text unless the connection is encrypted (share or
+    # server with SMB encryption, or a mapping created with New-SmbMapping -RequirePrivacy $true).
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnencrypted)
+    $remote = $Path
+    if ($Path -match '^(?<drive>[A-Za-z]:)') {
+        $mapping = @(Get-SmbMapping -LocalPath $Matches['drive'] -ErrorAction SilentlyContinue)
+        if (-not $mapping.Count) { return }
+        $remote = "$($mapping[0].RemotePath)".TrimEnd('\') + $Path.Substring(2)
+    }
+    $remote = $remote -replace '^\\\\[?.]\\UNC\\', '\\'
+    if ($remote -notmatch '^\\\\(?<server>[^\\?.][^\\]*)\\(?<share>[^\\]+)') { return }
+    $server = $Matches['server']; $share = $Matches['share']
+    $null = Test-Path -LiteralPath $remote   # opens the SMB session if there is none yet
+    $connections = @(Get-SmbConnection -ServerName $server -ErrorAction SilentlyContinue | Where-Object { $_.ShareName -eq $share })
+    if ($connections.Count -and -not @($connections | Where-Object { -not $_.Encrypted }).Count) {
+        Write-Ok "${Name}: the SMB connection to \\$server\$share is encrypted."
+        return
+    }
+    $message = "$Name reads secrets from \\$server\$share over an SMB connection that is not encrypted. Map the share with " +
+        "New-SmbMapping -RemotePath '\\$server\$share' -RequirePrivacy `$true (or enable encryption on the share: Set-SmbShare -EncryptData `$true), " +
+        'or copy the files over another protected channel.'
+    if (-not $AllowUnencrypted) { throw "$message -AllowUnencryptedImport accepts the risk." }
+    Write-Note "$message Continuing because of -AllowUnencryptedImport."
+}
+
+function Get-ExistingFile([string[]]$Path) {
+    # Files below Path (reparse points are refused before, so the recursion stays inside Path).
+    foreach ($p in $Path) {
+        if (Test-Path -LiteralPath $p) { Get-ChildItem -LiteralPath $p -Recurse -Force -File | ForEach-Object { $_.FullName } }
+    }
+}
+
+function Get-InstallationAclProblem {
+    # Deviations of the program and data directories (and the staged key/CA, wrapper, venv interpreter) from the
+    # ACLs this script sets for the given service principal(s).
+    param([Parameter(Mandatory = $true)][string[]]$Principal, [switch]$IncludeLogs)
+    $program = $AclAdmins + @{ 'S-1-5-32-545' = 'RX' }
+    $modify = $AclAdmins.Clone(); $read = $AclAdmins.Clone()
+    foreach ($sid in $Principal) { $program[$sid] = 'RX'; $modify[$sid] = 'M'; $read[$sid] = 'R' }
+    $checks = [ordered]@{}
+    foreach ($path in @($InstallDir, $WrapperExe, $VenvPython)) { $checks[$path] = $program }
+    $checks[$DataRoot] = $AclAdmins
+    foreach ($path in @($ConfDir, $StagedCa, $RuntimeDir)) { $checks[$path] = $modify }
+    $checks[$SecretsDir] = $read
+    if (Test-Path -LiteralPath $SecretsDir) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $SecretsDir -Force -File)) { $checks[$file.FullName] = $read }
+    }
+    if ($IncludeLogs) { $checks[$LogsDir] = $modify }
+    $problems = @()
+    foreach ($path in $checks.Keys) { if (Test-Path -LiteralPath $path) { $problems += @(Get-AclProblem -Path $path -Allowed $checks[$path]) } }
+    return $problems
+}
+
+# Expected ACLs (SID -> maximum rights) and the FileSystemRights masks of the icacls grants F, M, RX and R.
+$AclSid     = if ($ServiceAccount -eq 'LocalService') { $SidLocalService.TrimStart('*') } else { Get-ServiceSid $ServiceName }
+$AclRights  = @{ F = 2032127; M = 1245631; RX = 1179817; R = 1179785 }
+$AclAdmins  = @{ 'S-1-5-18' = 'F'; 'S-1-5-32-544' = 'F' }
+$AclProgram = $AclAdmins + @{ 'S-1-5-32-545' = 'RX'; $AclSid = 'RX' }
+
+# Security baseline check, run by the venv's Python: PEP 440 comparison with packaging (pip's vendored copy if
+# packaging itself is not installed), e.g. 1.2.1rc1 < 1.2.1 < 1.2.1.post1; an invalid version fails the check.
+$BaselineCheck = @(
+    'import re, sys, importlib.metadata as m'
+    'try:'
+    '    from packaging.version import Version'
+    'except ImportError:'
+    '    from pip._vendor.packaging.version import Version'
+    'low = []'
+    'for line in open(sys.argv[1], encoding=''utf-8''):'
+    '    hit = re.match(r''\s*([A-Za-z0-9._-]+)==([^\s;#]+)'', line)'
+    '    if not hit:'
+    '        continue'
+    '    try:'
+    '        have = m.version(hit.group(1))'
+    '    except m.PackageNotFoundError:'
+    '        continue'
+    '    if Version(have) < Version(hit.group(2)):'
+    '        low.append(hit.group(1) + '' '' + have + '' < '' + hit.group(2))'
+    'print(''; ''.join(low))'
+    'sys.exit(1 if low else 0)'
+) -join "`n"
+
 # =====================================================================================================
 # Uninstall
 # =====================================================================================================
@@ -375,13 +599,12 @@ if ($Uninstall) {   # parameter set 'Uninstall'
             Get-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         }
     }
+    # Links below these directories are removed as links; their targets are never touched.
     if ($PSCmdlet.ShouldProcess("$ConfDir, $SecretsDir", 'Delete staged CA private key and data-plane key copies')) {
-        foreach ($dir in @($ConfDir, $SecretsDir, $RuntimeDir)) {
-            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
-        }
+        foreach ($dir in @($ConfDir, $SecretsDir, $RuntimeDir)) { Remove-DirectoryTree $dir }
     }
     if ((Test-Path -LiteralPath $InstallDir) -and $PSCmdlet.ShouldProcess($InstallDir, 'Remove program files (venv, addon, WinSW)')) {
-        Remove-Item -LiteralPath $InstallDir -Recurse -Force
+        Remove-DirectoryTree $InstallDir
     }
     Write-Ok 'AegisProxy data-plane uninstalled.'
     Write-Note "Logs were kept in $LogsDir. The staged CA key / data-plane key copies were deleted; the originals remain on the control-plane."
@@ -411,6 +634,7 @@ $winswHash = (Get-FileHash -LiteralPath $WinSWExe -Algorithm SHA256).Hash
 if ("$($winswInfo.ProductName) $($winswInfo.FileDescription) $($winswInfo.OriginalFilename) $($winswInfo.InternalName)" -notmatch 'WinSW|Windows Service Wrapper') {
     Write-Note "$WinSWExe does not identify itself as WinSW - make sure this is the correct file."
 }
+# Early check (nothing is changed on a mismatch); the copy that becomes the service binary is verified again.
 if ($winswHash -ne $WinSWSha256) {
     throw "SHA-256 of $WinSWExe is $winswHash, expected $($WinSWSha256.ToUpperInvariant()) (WinSW 2.12.0 x64 unless -WinSWSha256 is given). Use a verified WinSW copy or pass the hash of your verified release with -WinSWSha256."
 }
@@ -425,17 +649,26 @@ foreach ($required in @('aegis_addon.py', 'aegis_dp\addon.py', 'aegis_dp\__init_
 }
 
 # Data-plane key
+Assert-EncryptedSmbSource -Name '-DataPlaneKeyFile' -Path $DataPlaneKeyFile -AllowUnencrypted:$AllowUnencryptedImport
 $keyValue = Read-SecretFile $DataPlaneKeyFile
 if (-not $keyValue) { throw "Data-plane key file '$DataPlaneKeyFile' not found or empty." }
 if ($keyValue.Length -lt 32 -or $keyValue -match '\s') { throw "The data-plane key in '$DataPlaneKeyFile' must be a single token of at least 32 characters." }
 
 # CA (key + certificate)
 if (-not $CaFile -and -not (Test-Path -LiteralPath $StagedCa)) {
+    # Only the CA of an installed control-plane, whose installer restricts it to SYSTEM/Administrators.
     $sameHostCa = Join-Path $env:ProgramData 'AegisProxy\certs\mitmproxy-ca.pem'
-    if (Test-Path -LiteralPath $sameHostCa) { $CaFile = $sameHostCa; Write-Step "Using the control-plane CA on this host: $CaFile" }
+    if ((Test-Path -LiteralPath $sameHostCa) -and (Get-Service -Name 'AegisControlPlane' -ErrorAction SilentlyContinue)) {
+        $sameHostProblems = @(Get-AclProblem -Path $sameHostCa -Allowed $AclAdmins)
+        if ($sameHostProblems.Count) {
+            throw "The control-plane CA on this host is not restricted to SYSTEM/Administrators ($($sameHostProblems -join '; ')). Re-run Install-AegisControlPlane.ps1 or pass -CaFile."
+        }
+        $CaFile = $sameHostCa; Write-Step "Using the control-plane CA on this host: $CaFile"
+    }
     else { throw '-CaFile is required: path to mitmproxy-ca.pem (CA private key + certificate) from the control-plane certs directory.' }
 }
 if ($CaFile) {
+    Assert-EncryptedSmbSource -Name '-CaFile' -Path $CaFile -AllowUnencrypted:$AllowUnencryptedImport
     $CaFile = (Resolve-Path -LiteralPath $CaFile).ProviderPath
     $caText = [System.IO.File]::ReadAllText($CaFile)
     if ($caText -notmatch '-----BEGIN (RSA |EC )?PRIVATE KEY-----' -or $caText -notmatch '-----BEGIN CERTIFICATE-----') {
@@ -481,22 +714,57 @@ if ($pythonBase -like '*\WindowsApps\*') { throw 'The Microsoft Store Python can
 if ($pythonBase -like (Join-Path $env:SystemDrive 'Users\*')) {
     throw "Python at $pythonBase is a per-user installation; the service account cannot read it. Reinstall python.org Python with 'Install for all users' (InstallAllUsers=1)."
 }
+# The venv runs the base interpreter, its DLLs and its standard library: whoever can plant files there
+# (python3XX.dll, Lib\sitecustomize.py, site-packages\*.pth) runs code in the service.
+$pyHome = Split-Path -Parent $pythonBase
+$pyTree = @($pyHome, $pythonBase, (Join-Path $pyHome 'Lib'), (Join-Path $pyHome 'DLLs'), (Join-Path $pyHome 'Lib\site-packages')) +
+    @(Get-ChildItem -LiteralPath $pyHome -Filter '*.dll' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+$pyWritable = @(Get-NonAdminWritable $pyTree)
+if ($pyWritable.Count) {
+    $pyMessage = "Python at $pythonBase can be modified by non-administrators: $($pyWritable -join '; '). Install python.org Python for all users into %ProgramFiles% (C:\Program Files\Python312, InstallAllUsers=1), whose ACL only lets administrators write"
+    if (-not $AllowWritablePython) { throw "$pyMessage, or pass -AllowWritablePython to accept the risk." }
+    Write-Note "$pyMessage. Continuing because of -AllowWritablePython."
+}
 Write-Step "Python $pyVersion at $pythonBase"
+
+# Pre-existing directories: ProgramData (and the volume root for a custom path) lets every user create
+# directories, so they may exist before the first installation, with a staged CA or control-plane CA bundle, a
+# confdir\config.yaml (mitmdump options and scripts) or a prepared venv. Such content is only kept on an
+# upgrade of an intact installation (service registered, directories owned by Administrators with the ACLs set
+# below) or with -AdoptExistingSecrets. Links are refused: ACL changes and deletions would act on their targets.
+try {
+    $links = @(Find-ReparsePoint @($InstallDir, $DataRoot))
+    $trustIssues = @()
+    if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { $trustIssues += "service $ServiceName is not installed (first installation)" }
+    else { $trustIssues += @(Get-InstallationAclProblem -Principal @((Get-ServiceSid $ServiceName), $SidLocalService.TrimStart('*'))) }
+    $preExisting = @()
+    if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir)) }
+}
+catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
+if ($links.Count) { throw "Junctions/symbolic links are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
+if ($preExisting.Count -and -not $AdoptExistingSecrets) {
+    throw ("Refusing to adopt {0} file(s) that existed before this installation ({1}):`n  {2}`nA local user may have planted them. Delete them, or - if they are yours (interrupted first run, files you verified) - re-run with -AdoptExistingSecrets; the script then takes ownership and resets their ACLs." -f
+        $preExisting.Count, ($trustIssues -join '; '), (($preExisting | Select-Object -First 10) -join "`n  "))
+}
+if ($preExisting.Count) { Write-Note "-AdoptExistingSecrets: keeping $($preExisting.Count) pre-existing file(s) ($($trustIssues -join '; '))." }
 
 # =====================================================================================================
 # Install / upgrade - changes
 # =====================================================================================================
 if ($PSCmdlet.ShouldProcess($ServiceName, 'Stop service for upgrade')) { Stop-DataPlaneService }
 
-if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories and restrict ACL to SYSTEM/Administrators')) {
+if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and restrict ACL to SYSTEM/Administrators')) {
     foreach ($dir in @($InstallDir, $AppDir, $DataRoot, $ConfDir, $SecretsDir, $LogsDir, $RuntimeDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
-    # Program files (venv, addon, WinSW): users read/execute only, also for a custom -InstallDir outside
-    # %ProgramFiles% that would inherit "create files/folders" for users (DLL / module planting).
-    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($InstallDir, '/inheritance:r', '/grant:r', "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX", '/Q')
-    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($DataRoot, '/inheritance:r', '/grant:r', "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", '/Q')
-    Write-Ok "Directories ready under $DataRoot"
+    # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
+    # protected roots. Program files (venv, addon, WinSW): users read/execute only, also for a custom -InstallDir
+    # outside %ProgramFiles% that would inherit "create files/folders" for users (DLL / module planting).
+    Protect-Directory -Root $InstallDir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed $AclProgram `
+        -Children @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object { $_.FullName })
+    Protect-Directory -Root $DataRoot -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F") -Allowed $AclAdmins `
+        -Children @(Get-ChildItem -LiteralPath $DataRoot -Force | ForEach-Object { $_.FullName })
+    Write-Ok "Directories ready under $DataRoot (owner Administrators, foreign ACEs removed)"
 }
 
 # --- Python virtual environment ----------------------------------------------------------------------
@@ -510,7 +778,7 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
             $recreate = $true
         }
     }
-    if ($recreate -and (Test-Path -LiteralPath $VenvDir)) { Remove-Item -LiteralPath $VenvDir -Recurse -Force }
+    if ($recreate) { Remove-DirectoryTree $VenvDir }
     if (-not (Test-Path -LiteralPath $VenvPython)) {
         Write-Step "Creating virtual environment $VenvDir"
         Invoke-NativeLive -FilePath $pythonBase -ArgumentList @('-m', 'venv', $VenvDir)
@@ -539,23 +807,22 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
         Invoke-NativeLive -FilePath $VenvPython -ArgumentList $secArgs
     }
     elseif (Test-Path -LiteralPath $securityReq) {
-        # Hash-pinned mode: an unhashed install on top would bypass --require-hashes, so only verify the pins.
-        foreach ($line in (Get-Content -LiteralPath $securityReq)) {
-            if ($line -notmatch '^\s*(?<name>[A-Za-z0-9._-]+)==(?<version>[0-9]+(\.[0-9]+)+)') { continue }
-            $pkg = $Matches['name']; $minimum = [version]$Matches['version']; $have = $null
-            $probe = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))', $pkg) -SuccessCodes @(0, 1)
-            if ($probe.ExitCode -eq 0 -and [version]::TryParse((($probe.Output -join '').Trim()), [ref]$have) -and $have -lt $minimum) {
-                throw "$RequirementsFile installs $pkg $have; the security baseline requires >= $minimum (data-plane\requirements-security.txt). Pin it with its hash in the requirements file."
-            }
+        # Hash-pinned mode: an unhashed install on top would bypass --require-hashes, so only verify the pins. The
+        # venv's Python compares the versions (PEP 440: pre-releases sort before the release, invalid versions fail).
+        $baseline = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', $BaselineCheck, $securityReq) -SuccessCodes @(0, 1)
+        if ($baseline.ExitCode -ne 0) {
+            throw ("{0} does not meet the security baseline of data-plane\requirements-security.txt: {1}. Pin the fixed versions with their hashes in the requirements file." -f
+                $RequirementsFile, (@($baseline.Output | Where-Object { "$_".Trim() }) -join ' '))
         }
-        # Every dependency must be in the lock file; the only tolerated conflicts are the baseline overrides.
+        # Every dependency must be in the lock file; the only tolerated conflicts are the baseline overrides
+        # (names compared PEP 503-normalized).
         $overrides = @(foreach ($line in (Get-Content -LiteralPath $securityReq)) {
-                if ($line -match '^\s*(?<name>[A-Za-z0-9._-]+)==') { $Matches['name'].ToLowerInvariant().Replace('_', '-') }
+                if ($line -match '^\s*(?<name>[A-Za-z0-9._-]+)==') { ($Matches['name'] -replace '[-_.]+', '-').ToLowerInvariant() }
             })
         $pipCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'check') -SuccessCodes @(0, 1)
         $broken = @($pipCheck.Output | Where-Object {
                 $_.Trim() -and $_ -notmatch '^No broken' -and
-                -not ($_ -match 'but you have (?<pkg>\S+) ' -and $overrides -contains $Matches['pkg'].ToLowerInvariant().Replace('_', '-'))
+                -not ($_ -match 'but you have (?<pkg>\S+) ' -and $overrides -contains ($Matches['pkg'] -replace '[-_.]+', '-').ToLowerInvariant())
             })
         if ($broken.Count) {
             throw ("The hash-pinned requirements file is incomplete or inconsistent ({0}), pip check reports:`n  {1}" -f $RequirementsFile, ($broken -join "`n  "))
@@ -575,7 +842,7 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
 # --- addon -------------------------------------------------------------------------------------------
 if ($PSCmdlet.ShouldProcess($AppDir, 'Install AegisProxy addon')) {
     $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @((Join-Path $SourceDir 'aegis_dp'), (Join-Path $AppDir 'aegis_dp'),
-        '/MIR', '/XD', '__pycache__', 'tests', '/XF', '*.pyc', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
+        '/MIR', '/XJ', '/XD', '__pycache__', 'tests', '/XF', '*.pyc', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
     Copy-Item -LiteralPath (Join-Path $SourceDir 'aegis_addon.py') -Destination (Join-Path $AppDir 'aegis_addon.py') -Force
     $null = Invoke-Native -FilePath $VenvPython -ArgumentList @('-m', 'compileall', '-q', $AppDir)
     # Import test (does not instantiate the addon, so no configuration is needed).
@@ -633,8 +900,18 @@ if ($rendered -match '@@[A-Z_]+@@') { throw "Unreplaced placeholder in the WinSW
 try { [void][xml]$rendered } catch { throw "Rendered WinSW configuration is not well-formed XML: $($_.Exception.Message)" }
 
 if ($PSCmdlet.ShouldProcess($WrapperXml, 'Write WinSW configuration and (re)install the service')) {
+    # -WinSWExe may have changed since the early check (it usually lives in a directory other users can write):
+    # verify the copy inside the admin-only program directory, which is what the SCM will run.
+    $stagedWrapper = "$WrapperExe.new"
+    Copy-Item -LiteralPath $WinSWExe -Destination $stagedWrapper -Force
+    $copiedHash = (Get-FileHash -LiteralPath $stagedWrapper -Algorithm SHA256).Hash
+    if ($copiedHash -ne $WinSWSha256) {
+        Remove-Item -LiteralPath $stagedWrapper -Force
+        throw "SHA-256 of the copied wrapper is $copiedHash, expected $($WinSWSha256.ToUpperInvariant()): $WinSWExe changed after it was verified. Keep the verified WinSW copy in a directory only administrators can write."
+    }
     Remove-DataPlaneService      # WinSW applies service-level settings at install time -> reinstall on every run
-    Copy-Item -LiteralPath $WinSWExe -Destination $WrapperExe -Force
+    if (Test-Path -LiteralPath $WrapperExe) { Remove-Item -LiteralPath $WrapperExe -Force }
+    Move-Item -LiteralPath $stagedWrapper -Destination $WrapperExe
     Write-TextNoBom -Path $WrapperXml -Value $rendered
     $null = Invoke-Native -FilePath $WrapperExe -ArgumentList @('install')
     if (-not (Wait-ServiceState -Name $ServiceName -State 'Stopped' -TimeoutSeconds 30)) { throw "WinSW did not register the service $ServiceName." }
@@ -656,7 +933,12 @@ if ($PSCmdlet.ShouldProcess($DataRoot, "Grant $LogonAccount access")) {
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/inheritance:r', '/grant:r', "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${AclPrincipal}:(OI)(CI)R", '/Q')
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($LogsDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/Q')
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($RuntimeDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/Q')
-    Write-Ok 'ACLs: program files = read, confdir/logs = modify, secrets = read (no inheritance); everything else SYSTEM/Administrators only.'
+    # Read the result back: only SYSTEM, Administrators, the service (and users: read program files) may have access.
+    $aclProblems = @(Get-InstallationAclProblem -Principal @($AclSid) -IncludeLogs)
+    if ($aclProblems.Count) {
+        throw ("ACL verification failed - the service was not started:`n  {0}" -f ($aclProblems -join "`n  "))
+    }
+    Write-Ok 'ACLs verified: program files = read, confdir/logs = modify, secrets = read (no inheritance); everything else SYSTEM/Administrators only.'
 }
 
 # --- firewall ----------------------------------------------------------------------------------------

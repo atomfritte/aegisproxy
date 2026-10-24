@@ -115,13 +115,15 @@ jobs:
         with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
       - name: Go tests on Windows (file sharing semantics, paths, service code)
         run: go -C control-plane test -count=1 -timeout 30m ./...
-      - name: Python for all users (services cannot use per-user installations)
+      # The installer refuses interpreters that non-administrators can modify (C:\Python312 inherits "create
+      # files" for users from C:\), so Python goes to Program Files like a python.org all-users installation.
+      - name: Python for all users in Program Files (services cannot use per-user installations)
         run: |
-          choco install python312 -y --no-progress --params '"/InstallDir:C:\Python312"'
-          & C:\Python312\python.exe --version
+          choco install python312 -y --no-progress --params "/InstallDir:'C:\Program Files\Python312'"
+          & 'C:\Program Files\Python312\python.exe' --version
       - name: data-plane unit tests on Windows CPython
         run: |
-          & C:\Python312\python.exe -m venv "$env:RUNNER_TEMP\dp-venv"
+          & 'C:\Program Files\Python312\python.exe' -m venv "$env:RUNNER_TEMP\dp-venv"
           $py = "$env:RUNNER_TEMP\dp-venv\Scripts\python.exe"
           & $py -m pip install --disable-pip-version-check mitmproxy==12.3.0
           & $py -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r data-plane/requirements-extra.txt
@@ -150,11 +152,26 @@ jobs:
           $src = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\AegisControlPlane'
           if ($src.EventMessageFile -notlike '*\System32\EventCreate.exe' -or $src.TypesSupported -ne 7) { throw 'event log source AegisControlPlane not registered' }
           if (-not [System.Diagnostics.EventLog]::SourceExists('AegisControlPlane')) { throw 'event log source AegisControlPlane unknown to the event log' }
+      - name: log rotation task runs as the service account
+        run: |
+          $name = 'AegisProxy Control-Plane Log Rotation'
+          $task = Get-ScheduledTask -TaskPath '\AegisProxy\' -TaskName $name
+          if ($task.Principal.UserId -notlike '*AegisControlPlane') { throw "unexpected task principal: $($task.Principal.UserId)" }
+          $since = (Get-Date).AddSeconds(-2)
+          Start-ScheduledTask -TaskPath '\AegisProxy\' -TaskName $name
+          do {
+            Start-Sleep -Seconds 2
+            $info = Get-ScheduledTaskInfo -TaskPath '\AegisProxy\' -TaskName $name
+            $state = (Get-ScheduledTask -TaskPath '\AegisProxy\' -TaskName $name).State
+          } while (($state -eq 'Running' -or $info.LastRunTime -lt $since) -and (Get-Date) -lt $since.AddMinutes(2))
+          Write-Host "state=$state last run=$($info.LastRunTime) result=$($info.LastTaskResult)"
+          if ($info.LastTaskResult -ne 0) { throw "log rotation task failed: $($info.LastTaskResult)" }
+          if (-not (Get-ChildItem "$env:ProgramData\AegisProxy\logs" -Filter 'control-plane-*.log.zip')) { throw 'log rotation produced no archive' }
       - name: install the data-plane service
         run: |
           $root = Join-Path $env:ProgramData 'AegisProxy'
           ./deploy/windows/Install-AegisDataPlane.ps1 -ControlPlaneUrl http://127.0.0.1:8081 -DataPlaneKeyFile "$root\secrets\dataplane.key" `
-            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe C:\Python312\python.exe -SkipFirewall
+            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe 'C:\Program Files\Python312\python.exe' -SkipFirewall
           Get-Service AegisDataPlane | Format-List Name, Status, StartType
       - name: end to end through the Windows services
         run: |

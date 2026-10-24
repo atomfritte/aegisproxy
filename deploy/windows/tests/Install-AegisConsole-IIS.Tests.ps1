@@ -214,4 +214,50 @@ Describe 'Install-AegisConsole-IIS.ps1' {
             Test-Path -LiteralPath $Site | Should -BeFalse
         }
     }
+
+    Context 'site directory that existed before' {
+        BeforeEach {
+            # Created by a non-administrator (the volume root lets users create folders), who granted users modify on
+            # the directory and full control on a subfolder.
+            New-Item -ItemType Directory -Path (Join-Path $Site 'assets') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path (Join-Path $Site 'assets') 'index-abc123.js') -Value 'planted'
+            $FakeWin.Acl[(Get-FakeFullPath $Site)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-32-545' = '(OI)(CI)M' } }
+            $FakeWin.Acl[(Get-FakeFullPath (Join-Path $Site 'assets'))] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-1-0' = '(OI)(CI)F' } }
+            Set-FakeOwner -Path $Site -Sid 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        }
+
+        It 'takes ownership and removes the planted ACEs before deploying, then verifies the ACL' {
+            $run = Invoke-Installer -Path $Installer -Parameters $Base
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'ACL verified'
+            $assets = Join-Path $Site 'assets'
+            foreach ($path in @($Site, $assets, (Join-Path $assets 'index-abc123.js'), (Join-Path $Site 'index.html'))) {
+                (Get-Acl -LiteralPath $path).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $path
+                Get-PrincipalList $path | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'IIS AppPool\AegisConsole') -Because $path
+                Test-FakeWritable -Path $path -Principals @('*S-1-5-32-545', '*S-1-1-0') | Should -BeFalse -Because $path
+            }
+            [System.IO.File]::ReadAllText((Join-Path $assets 'index-abc123.js')).Trim() | Should -Be 'console.log(1)'
+            # The ACL is in place before robocopy writes the first file.
+            $order = @($FakeWin.Calls | Where-Object { $_.Command -in @('icacls.exe', 'robocopy.exe') } | ForEach-Object Command)
+            $order[0] | Should -Be 'icacls.exe'
+            $order[-1] | Should -Be 'robocopy.exe'
+        }
+
+        It 'does not start the site when the resulting ACL cannot be verified' {
+            $FakeWin.IcaclsIgnore = @('/remove')
+            { & $Installer @Base } | Should -Throw '*ACL verification failed*: access for S-1-5-32-545 is not expected*'
+            $FakeWin.Iis.Sites['AegisConsole'].State | Should -Be 'Stopped'
+        }
+
+        It 'refuses a junction in the site directory and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
+            New-Item -ItemType SymbolicLink -Path (Join-Path $Site 'static') -Target $target | Out-Null
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed in the site directory*static*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
+        }
+    }
 }

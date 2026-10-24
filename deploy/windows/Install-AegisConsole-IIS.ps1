@@ -14,7 +14,9 @@
     * binds HTTPS (SNI) with a certificate from Cert:\LocalMachine\My (by thumbprint)
 
     The site directory is readable only by SYSTEM, Administrators and the application pool identity; anonymous
-    requests are served with the pool identity (no IUSR access needed).
+    requests are served with the pool identity (no IUSR access needed). An existing site directory is taken over
+    before the files are deployed (owner Administrators, foreign ACEs removed, junctions refused) and the result
+    is verified.
 
     If the console is served by the control-plane itself (AEGIS_UI_DIR) you do not need IIS at all.
 
@@ -96,6 +98,80 @@ function Invoke-Native {
     return $output
 }
 
+function Get-AppPoolSid([string]$Name) {
+    # SID of IIS AppPool\<Name>, computed (no lookup needed): S-1-5-82 and the SHA-1 of the lower-case pool name in
+    # UTF-16LE as five little-endian DWORDs.
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($Name.ToLowerInvariant())) } finally { $sha.Dispose() }
+    return 'S-1-5-82-' + ((0..4 | ForEach-Object { [System.BitConverter]::ToUInt32($hash, 4 * $_) }) -join '-')
+}
+
+function ConvertTo-FileRight([int]$Rights) {
+    # FileSystemRights of an ACE as unsigned mask of specific rights (generic rights mapped like NTFS does).
+    $mask = [int64]$Rights -band 4294967295
+    if ($mask -band 268435456)  { $mask = $mask -bor 2032127 }   # GENERIC_ALL     -> FullControl
+    if ($mask -band 1073741824) { $mask = $mask -bor 1179926 }   # GENERIC_WRITE   -> FILE_GENERIC_WRITE
+    if ($mask -band 2147483648) { $mask = $mask -bor 1179785 }   # GENERIC_READ    -> FILE_GENERIC_READ
+    if ($mask -band 536870912)  { $mask = $mask -bor 1179808 }   # GENERIC_EXECUTE -> FILE_GENERIC_EXECUTE
+    return ($mask -band 2032127)
+}
+
+function Get-AclProblem {
+    # Deviations of Path from the expected ACL: a directory must be owned by Administrators or SYSTEM, and every
+    # allow ACE (explicit or inherited) must belong to a principal of -Allowed (SID -> F|RX) and stay within
+    # that principal's rights.
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][hashtable]$Allowed)
+    try { $acl = Get-Acl -LiteralPath $Path }
+    catch { return @("${Path}: ACL not readable ($($_.Exception.Message))") }
+    $problems = @()
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+    $ownerSid = if ($owner) { "$($owner.Value)" } else { 'none' }
+    if ((Test-Path -LiteralPath $Path -PathType Container) -and @('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) {
+        $problems += "${Path}: owner $ownerSid is not Administrators/SYSTEM"
+    }
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        if ("$($rule.AccessControlType)" -ne 'Allow') { continue }
+        $sid = "$($rule.IdentityReference.Value)"
+        if (-not $Allowed.ContainsKey($sid)) { $problems += "${Path}: access for $sid is not expected"; continue }
+        if ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band -bnot @{ F = 2032127; RX = 1179817 }[$Allowed[$sid]]) {
+            $problems += "${Path}: $sid has more than $($Allowed[$sid]) access"
+        }
+    }
+    return $problems
+}
+
+function Protect-Directory {
+    # Takes over a directory that may have existed before the installation: Administrators become owner of Root
+    # and of everything in -Children, Root gets a protected ACL with -Grant (explicit ACEs of principals that are
+    # not -Allowed are removed) and the children are reset to inherit from Root only.
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$Grant,
+        [Parameter(Mandatory = $true)][hashtable]$Allowed, [string[]]$Children = @())
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/setowner', '*S-1-5-32-544', '/Q')
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList (@($Root, '/inheritance:r', '/grant:r') + $Grant + @('/Q'))
+    $foreign = @((Get-Acl -LiteralPath $Root).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+            ForEach-Object { "$($_.IdentityReference.Value)" } | Where-Object { -not $Allowed.ContainsKey($_) } | Sort-Object -Unique)
+    foreach ($sid in $foreign) { $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($Root, '/remove', "*$sid", '/Q') }
+    foreach ($child in $Children) {
+        if (-not (Test-Path -LiteralPath $child)) { continue }
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q')
+        $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($child, '/reset', '/T', '/C', '/Q')
+    }
+}
+
+function Find-ReparsePoint([string[]]$Path) {
+    # Junctions and symbolic links at or below Path, found without following them (icacls /T and robocopy /MIR
+    # would act on their targets). Unreadable directories throw.
+    $found = @()
+    $pending = New-Object System.Collections.Stack
+    foreach ($p in $Path) { if (Test-Path -LiteralPath $p) { $pending.Push((Get-Item -LiteralPath $p -Force)) } }
+    while ($pending.Count) {
+        $item = $pending.Pop()
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $found += $item.FullName }
+        elseif ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { $pending.Push($child) } }
+    }
+    return $found
+}
+
 # --- validation --------------------------------------------------------------------------------------
 $CertificateThumbprint = ($CertificateThumbprint -replace '\s', '').ToUpperInvariant()
 $DistDir = [System.IO.Path]::GetFullPath($DistDir)
@@ -103,6 +179,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $DistDir 'index.html'))) {
     throw "$DistDir does not contain index.html. Build the console first: npm --prefix frontend ci; npm --prefix frontend run build"
 }
 if (-not (Test-Path -LiteralPath $WebConfigTemplate)) { throw "web.config template not found: $WebConfigTemplate" }
+$PhysicalPath = [System.IO.Path]::GetFullPath($PhysicalPath)
+# The site directory may exist already (created by anyone who can write to its parent). Links in it are refused:
+# robocopy /MIR and icacls /T would act on their targets.
+$links = @(Find-ReparsePoint @($PhysicalPath))
+if ($links.Count) { throw "Junctions/symbolic links are not allowed in the site directory: $($links -join ', '). Remove them and re-run." }
+$SiteAcl = @{ 'S-1-5-18' = 'F'; 'S-1-5-32-544' = 'F'; (Get-AppPoolSid $AppPoolName) = 'RX' }
 
 $ApiBaseUrl = $ApiBaseUrl.Trim().TrimEnd('/')
 if ($ApiBaseUrl) {
@@ -171,10 +253,14 @@ if ($PSCmdlet.ShouldProcess($AppPoolName, 'Create/update application pool')) {
 }
 
 # --- content -----------------------------------------------------------------------------------------
-if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Deploy console files, web.config and config.js')) {
+if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Take ownership, restrict ACL and deploy console files, web.config and config.js')) {
     if (-not (Test-Path -LiteralPath $PhysicalPath)) { New-Item -ItemType Directory -Path $PhysicalPath -Force | Out-Null }
+    # Before anything is written: Administrators take ownership, only SYSTEM/Administrators (full) and the pool
+    # identity (read) keep access, and existing content is reset to inherit that (planted ACEs are removed).
+    Protect-Directory -Root $PhysicalPath -Grant @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "IIS AppPool\${AppPoolName}:(OI)(CI)RX") -Allowed $SiteAcl `
+        -Children @(Get-ChildItem -LiteralPath $PhysicalPath -Force | ForEach-Object { $_.FullName })
     # /MIR removes stale hashed assets of previous builds; web.config/config.js are written afterwards.
-    $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @($DistDir, $PhysicalPath, '/MIR', '/XF', 'web.config',
+    $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @($DistDir, $PhysicalPath, '/MIR', '/XJ', '/XF', 'web.config',
         '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
 
     $webConfig = [System.IO.File]::ReadAllText($WebConfigTemplate)
@@ -223,11 +309,13 @@ if ($PSCmdlet.ShouldProcess($SiteName, 'Create/update site and HTTPS binding')) 
     Write-Ok ("Binding https://{0}:{1} (SNI) with certificate {2}{3}." -f $HostName, $HttpsPort, $CertificateThumbprint, $(if ($AddHttpBinding) { ', http:80 redirects to https' } else { '' }))
 }
 
-# --- ACL: site directory readable only by the pool identity ------------------------------------------
-if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Restrict ACL')) {
-    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($PhysicalPath, '/inheritance:r', '/grant:r',
-        '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "IIS AppPool\${AppPoolName}:(OI)(CI)RX", '/Q')
-    Write-Ok "ACL: SYSTEM/Administrators full, IIS AppPool\$AppPoolName read."
+# --- ACL: site directory readable only by the pool identity (set before the deployment, verified here) ----
+if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Verify ACL')) {
+    $aclProblems = @(foreach ($path in @($PhysicalPath, (Join-Path $PhysicalPath 'index.html'), (Join-Path $PhysicalPath 'web.config'), (Join-Path $PhysicalPath 'config.js'))) {
+            Get-AclProblem -Path $path -Allowed $SiteAcl
+        })
+    if ($aclProblems.Count) { throw ("ACL verification failed - the site was not started:`n  {0}" -f ($aclProblems -join "`n  ")) }
+    Write-Ok "ACL verified: owner Administrators, SYSTEM/Administrators full, IIS AppPool\$AppPoolName read."
 }
 
 if ($PSCmdlet.ShouldProcess($SiteName, 'Start site')) {
@@ -249,3 +337,5 @@ else {
     Write-Host 'API           : same origin - serve the control-plane under this host name or enable the ARR /api rule in web.config.'
 }
 Write-Host 'Upgrade       : rebuild the console and re-run this script (assets are mirrored, config.js regenerated).'
+# robocopy's success codes 1-7 must not become the script's exit code.
+exit 0
