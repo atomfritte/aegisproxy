@@ -1172,6 +1172,7 @@ export interface UserInput {
 // ---------------------------------------------------------------------------
 
 export type ThreatMode = 'off' | 'monitor' | 'block';
+export type TelemetryQueryRedaction = 'none' | 'sensitive' | 'all';
 
 export interface SecurityPolicy {
   threat_intel_mode: ThreatMode;
@@ -1196,6 +1197,8 @@ export interface SecurityPolicy {
   max_upload_bytes: number;
   /** 0 disables burst detection */
   blocked_burst_threshold: number;
+  /** Query strings of recorded URLs: sensitive (default) masks credential-like parameters, all drops the query, none keeps it. */
+  telemetry_query_redaction?: TelemetryQueryRedaction;
   /** ICAP (RFC 3507): icap://host:1344/service or icaps://…; "" = off. RESPMOD scans downloads. */
   icap_respmod_url: string;
   /** REQMOD inspects uploads (DLP engines). */
@@ -1337,6 +1340,15 @@ export interface DataPlaneStatus {
   /** disabled | respmod=ok,reqmod=down | … | '' (old worker) */
   icap_status?: string;
   healthy: boolean;
+  /** Seconds since the worker loaded a policy bundle (at its last heartbeat); -1 = not reported (older worker). */
+  policy_age_seconds?: number;
+  /** The worker's AEGIS_POLICY_MAX_AGE in seconds; 0 = no limit, -1 = not reported. */
+  policy_max_age_seconds?: number;
+  /** Flow records waiting for delivery to the control plane (memory queue + spool). */
+  flow_backlog?: number;
+  /** Flow records the worker lost since it started, by reason (overflow | spool_full | rejected | spool_corrupt). */
+  flows_dropped?: Record<string, number>;
+  flows_dropped_total?: number;
 }
 
 /** YARA rule set (GET /api/security/yara). */

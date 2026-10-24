@@ -870,6 +870,11 @@ type SecurityPolicy struct {
 	YARAMode     string `json:"yara_mode"` // off | monitor | block
 	YARAMaxBytes int64  `json:"yara_max_bytes"`
 
+	// Query strings in recorded URLs (traffic telemetry, access log, block pages, exports): none | sensitive
+	// (values of credential-like parameters redacted; the default, also for states written before the setting
+	// existed) | all (query dropped). Policy evaluation always uses the full URL.
+	TelemetryQueryRedaction string `json:"telemetry_query_redaction"`
+
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 	UpdatedBy string     `json:"updated_by,omitempty"`
 }

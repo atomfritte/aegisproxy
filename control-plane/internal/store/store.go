@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aegisproxy/control-plane/internal/auth"
@@ -83,6 +84,8 @@ type StateSnapshot struct {
 	BlockPages     []models.BlockPageTemplate `json:"block_pages"`
 	// RuleStats holds hit counters per rule ID (file storage; the cluster keeps them in a table).
 	RuleStats map[string]RuleStat `json:"rule_stats,omitempty"`
+	// FlowJournalSeq is the last flow journal segment this state includes (file storage; flowjournal.go).
+	FlowJournalSeq uint64 `json:"flow_journal_seq,omitempty"`
 	// ExportSinks configures log forwarding (secrets persisted, never returned by the API).
 	ExportSinks []models.ExportSink `json:"export_sinks"`
 	// ServiceAccounts are API identities for automation (key digests only).
@@ -151,6 +154,14 @@ type Store struct {
 	flowCursor   int64
 	eventCursor  time.Time
 	seenFlows    seenSet
+
+	// Data-plane telemetry (flowjournal.go, flows.go): ingestion is serialized, acknowledged after durable storage.
+	ingestMu       sync.Mutex
+	flushMu        sync.Mutex
+	journal        *flowJournal // file storage only
+	flowDuplicates atomic.Int64
+	flowDropsMu    sync.Mutex
+	flowDrops      map[string]int64
 
 	importedTelemetry bool
 	importedFileState bool // the cluster was initialized from a single-node state file
@@ -235,6 +246,9 @@ func NewStore(opts Options) (*Store, error) {
 		return s, nil
 	}
 	if err := s.loadOrSeed(); err != nil {
+		return nil, err
+	}
+	if err := s.openFlowJournal(); err != nil {
 		return nil, err
 	}
 	s.persistWG.Add(3)
@@ -405,6 +419,8 @@ func (s *Store) persist(force bool) {
 	s.pruneRevokedLocked()
 	s.mu.Unlock()
 
+	journalCut := s.rotateFlowJournal() // every journaled flow is in s.state from here on
+
 	s.mu.RLock()
 	data, err := s.marshalStateLocked()
 	s.mu.RUnlock()
@@ -417,7 +433,9 @@ func (s *Store) persist(force bool) {
 		s.mu.Lock()
 		s.dirty = true
 		s.mu.Unlock()
+		return
 	}
+	s.releaseFlowJournal(journalCut)
 }
 
 // writeStateFile writes atomically (temp file + fsync + rename) with 0600 permissions and keeps

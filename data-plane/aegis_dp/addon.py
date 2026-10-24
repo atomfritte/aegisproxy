@@ -12,6 +12,12 @@ Hook pipeline (regular proxy mode, rawtcp disabled):
   responseheaders    streaming / oversize / undecodable / partial-content decisions
   response           SHA-256 IOC check, file-type policy, YARA, ClamAV, ICAP RESPMOD, redirect lineage, telemetry
   tcp_start/udp_start  reject raw relays (only reachable via --tcp-hosts); payload is dropped in tcp_message
+  websocket_*        WebSocket lifetime; messages of a revoked connection are dropped
+
+Long-lived connections (requests in progress, WebSockets, CONNECT and passthrough tunnels, raw relays) are tracked
+(liveconns.py) and evaluated again after every policy or threat-intel update, when a rule/session expires and when the
+policy becomes stale: a connection that is no longer allowed is closed and recorded (CONNECTION_TERMINATED:<reason>).
+With AEGIS_POLICY_MAX_AGE set, a worker whose last successful policy sync is older answers 503 policy_stale.
 
 Every hook fails closed: an exception blocks the request (403, or 503 for infrastructure errors), refuses
 the upstream connection or kills the flow, and is counted in aegis_dp_hook_errors_total{hook}. A flow that
@@ -36,9 +42,9 @@ from typing import Any, Callable, Dict, List, Optional
 from mitmproxy import connection, ctx, http, tcp, tls, udp
 from mitmproxy.proxy import server_hooks
 
-from . import __version__, buffering
+from . import __version__, buffering, liveconns
 from .accesslog import AccessLog
-from .blockpage import is_cli_client, render_branded, render_cli, render_html
+from .blockpage import is_cli_client, render_branded, render_cli, render_html, render_stale
 from .buffering import BLOCK, STREAM, BodyGuard, BufferBudget
 from .clamav import ClamdClient
 from .config import Config
@@ -46,12 +52,14 @@ from .content import detect_file_type, scan_dlp
 from .decoding import UndecodableContent, decodable, decode_body, filter_accept_encoding, parse_codings, transfer_codings
 from .destination import DnsCache, check_binding
 from .ops import Metrics, start_ops_server
-from .controlplane import ControlPlaneClient, sign_block_token
+from .controlplane import DROP_REASONS, ControlPlaneClient, sign_block_token
 from .icap import IcapClient, IcapResult
+from .liveconns import LiveConn
 from .yara_scan import YaraEngine
 from .policy import (
     MALFORMED_PROXY_AUTH, VERDICT_AUTH_FAILED, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_LEARNING, VERDICT_MALWARE,
-    VERDICT_POLICY, VERDICT_THREAT, VERDICT_TLS_BYPASS, EvalResult, Policy, RedirectGrants, is_forbidden_addr,
+    VERDICT_POLICY, VERDICT_QUARANTINED, VERDICT_REDIRECT, VERDICT_THREAT, VERDICT_TLS_BYPASS, EvalResult, Policy,
+    RedirectGrants, is_forbidden_addr,
     is_internal_addr, is_internal_host, normalize_host, parse_ip, printable,
 )
 
@@ -103,6 +111,17 @@ def _peer(conn: Optional[connection.Client]) -> str:
     return ""
 
 
+def _human_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 120:
+        return f"{s}s"
+    if s < 7200:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d"
+
+
 def _bounded_put(d: Dict[Any, Any], key: Any, value: Any, limit: int = MAX_TRACKED_CONNECTIONS) -> None:
     d.pop(key, None)
     while len(d) >= limit:
@@ -145,7 +164,15 @@ class AegisAddon:
         self._yara_rev: Optional[int] = None
         self._icap: Dict[str, IcapClient] = {}
         self.cp = ControlPlaneClient(self.cfg, clamav_status=self._clamav_status, on_flow=self._count_flow,
-                                     status_headers=self._engine_status)
+                                     status_headers=self._engine_status, on_policy=self._policy_updated)
+        self.live = liveconns.Registry()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._revalidating = False
+        self._revalidate_again = False
+        self._expiry_policy = 0
+        self._next_expiry = float("inf")
+        self._was_stale = False
+        self._last_stale_log = 0.0
         self.grants = RedirectGrants()
         self.dns = DnsCache()
         self.conn_auth: Dict[str, str] = {}
@@ -183,19 +210,22 @@ class AegisAddon:
             self.budget.total = min(DEFAULT_BUFFER_BUDGET, limit or DEFAULT_BUFFER_BUDGET)
         log.info("inspection buffer budget %d MiB, %d %% per client (body_size_limit=%s)", self.budget.total >> 20,
                  self.cfg.buffer_client_share, ctx.options.body_size_limit or "unlimited")
+        loop = self._loop = asyncio.get_running_loop()
         self.cp.start()
         if self.cfg.ops_addr and self._ops is None:
             try:
-                self._ops = start_ops_server(self.cfg.ops_addr, self.metrics, self._gauges, lambda: self.cp.policy is not None)
+                self._ops = start_ops_server(self.cfg.ops_addr, self.metrics, self._gauges, self._not_ready)
             except OSError as exc:
                 log.error("could not start ops endpoint on %s: %s", self.cfg.ops_addr, exc)
-        loop = asyncio.get_running_loop()
         self._tasks.append(loop.create_task(self._apply_runtime_options()))
+        self._tasks.append(loop.create_task(self._watch_connections()))
         if self.clamd:
             self._tasks.append(loop.create_task(self._clamd_health()))
         self._tasks.append(loop.create_task(self._icap_health()))
-        log.info("AegisProxy data-plane %s started (worker=%s, control-plane=%s, clamd=%s, fail_mode=%s)",
-                 __version__, self.cfg.worker_id, self.cfg.control_plane_url, self.cfg.clamd_address or "disabled", self.cfg.fail_mode)
+        log.info("AegisProxy data-plane %s started (worker=%s, control-plane=%s, clamd=%s, fail_mode=%s, policy_max_age=%s, "
+                 "flow_spool=%s)", __version__, self.cfg.worker_id, self.cfg.control_plane_url, self.cfg.clamd_address or "disabled",
+                 self.cfg.fail_mode, _human_duration(self.cfg.policy_max_age) if self.cfg.policy_max_age else "unlimited",
+                 self.cfg.flow_spool_dir or "off (memory queue only)")
 
     def done(self) -> None:
         for t in self._tasks:
@@ -205,13 +235,26 @@ class AegisAddon:
             self._ops.shutdown()
         self.access_log.close()
 
+    def _not_ready(self) -> str:
+        if self.cp.policy is None:
+            return "policy not loaded"
+        if self.cp.policy_stale():
+            return f"policy stale (last successful sync {_human_duration(self.cp.policy_age() or 0)} ago, maximum {_human_duration(self.cfg.policy_max_age)})"
+        return ""
+
     def _gauges(self) -> Dict[str, float]:
         d, u, i, c, h = self.cp.threat.stats()
         pol = self.cp.policy
-        return {
+        age = self.cp.policy_age()
+        out = {
             "aegis_dp_policy_loaded": 1.0 if pol else 0.0,
             "aegis_dp_policy_revision": float(pol.revision if pol else 0),
-            "aegis_dp_policy_sync_age_seconds": (time.time() - self.cp.last_sync_ok) if self.cp.last_sync_ok else -1.0,
+            "aegis_dp_policy_sync_age_seconds": age if age is not None else -1.0,
+            "aegis_dp_policy_max_age_seconds": float(self.cfg.policy_max_age),
+            "aegis_dp_policy_stale": 1.0 if self.cp.policy_stale() else 0.0,
+            "aegis_dp_telemetry_upload_failures_total": float(self.cp.upload_failures),
+            "aegis_dp_telemetry_backpressure_total": float(self.cp.backpressure),
+            "aegis_dp_flow_spool_bytes": float(self.cp.spool.bytes if self.cp.spool else 0),
             "aegis_dp_threatintel_indicators": float(d + u + i + c + h),
             "aegis_dp_clamd_available": {True: 1.0, False: 0.0}.get(self.clamd.available if self.clamd else None, -1.0),
             "aegis_dp_telemetry_queue": float(self.cp.queue_len()),
@@ -224,14 +267,23 @@ class AegisAddon:
             "aegis_dp_access_log_dropped_total": float(self.access_log.dropped),
             "aegis_dp_access_log_rotation_failures_total": float(self.access_log.rotation_failures),
         }
+        with self.cp._qlock:
+            dropped = dict(self.cp.dropped)
+        for reason in DROP_REASONS:
+            out[f'aegis_dp_flows_dropped_total{{reason="{reason}"}}'] = float(dropped.get(reason, 0))
+        for kind, n in self.live.kinds().items():
+            out[f'aegis_dp_tracked_connections{{kind="{kind}"}}'] = float(n)
+        return out
 
     def client_disconnected(self, client: connection.Client) -> None:
         self.conn_auth.pop(client.id, None)
         self._bound.pop(client.id, None)
         self._tainted.pop(client.id, None)
+        self.live.drop_client(client.id)
 
     def error(self, flow: http.HTTPFlow) -> None:
         buffering.release(flow)  # aborted, killed or disconnected flows return their buffer share
+        self.live.discard(flow.id)
 
     async def _apply_runtime_options(self) -> None:
         """Mirror policy switches that map to mitmproxy options (runs on the event loop thread)."""
@@ -251,6 +303,166 @@ class AegisAddon:
                 log.warning("clamd at %s is not reachable", self.cfg.clamd_address)
             await asyncio.sleep(30)
 
+    # ------------------------------------------------------------------ long-lived connections
+    def _policy_updated(self) -> None:
+        """Called by the sync thread after a new policy bundle or threat-intel snapshot was loaded."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._schedule_revalidation)
+
+    def _schedule_revalidation(self) -> None:
+        if self._revalidating:
+            self._revalidate_again = True
+            return
+        self._revalidating = True
+        task = asyncio.get_running_loop().create_task(self._revalidation_task())
+        self._tasks = [t for t in self._tasks if not t.done()] + [task]
+
+    async def _revalidation_task(self) -> None:
+        try:
+            while True:
+                self._revalidate_again = False
+                for i, conn in enumerate(self.live.snapshot()):
+                    self._check_conn(conn)
+                    if i % 256 == 255:
+                        await asyncio.sleep(0)  # thousands of connections: let traffic through in between
+                if not self._revalidate_again:
+                    return
+        finally:
+            self._revalidating = False
+
+    def revalidate_now(self) -> int:
+        """Synchronous re-evaluation of every tracked connection; returns how many were closed."""
+        return sum(1 for conn in self.live.snapshot() if self._check_conn(conn))
+
+    async def _watch_connections(self) -> None:
+        """Expiries (rules, passthrough rules, learning sessions) and staleness change the outcome without a new
+        bundle: re-evaluate when one is crossed."""
+        while True:
+            await asyncio.sleep(1)
+            try:
+                policy = self._policy()
+                if policy is None:
+                    continue
+                now = time.time()
+                stale = self.cp.policy_stale()
+                if stale and not self._was_stale:
+                    log.critical("policy is stale: last successful sync %s ago exceeds AEGIS_POLICY_MAX_AGE=%s; failing closed",
+                                 _human_duration(self.cp.policy_age() or 0), _human_duration(self.cfg.policy_max_age))
+                elif self._was_stale and not stale:
+                    log.warning("policy is current again; serving traffic")
+                if id(policy) != self._expiry_policy:
+                    self._expiry_policy, self._next_expiry = id(policy), liveconns.next_expiry(policy, now)
+                if stale != self._was_stale or now >= self._next_expiry:
+                    self._was_stale = stale
+                    self._next_expiry = liveconns.next_expiry(policy, now)
+                    if len(self.live):
+                        self._schedule_revalidation()
+            except Exception:  # noqa: BLE001 - the watcher must survive
+                log.exception("connection watcher failed")
+
+    def _check_state(self) -> tuple:
+        return id(self._policy()), id(self.cp.threat), self.cp.policy_stale()
+
+    def _check_conn(self, conn: LiveConn) -> bool:
+        """Evaluates a tracked connection again; closes it when it is no longer allowed. Returns True if closed."""
+        if conn.terminated:
+            return True
+        if self.live.get(conn.key) is not conn:
+            return False  # ended (or its client connection was closed) meanwhile
+        policy = self._policy()
+        if policy is None:
+            return False
+        state = self._check_state()
+        res: Optional[EvalResult] = None
+        if state[2]:
+            reason = "policy_stale"
+        else:
+            try:
+                reason, res = liveconns.decide(conn, policy, self.cp.threat, self.grants)
+            except Exception:  # noqa: BLE001 - fail closed
+                log.exception("re-evaluation of a %s connection failed; closing it", conn.kind)
+                reason = "internal_error"
+        conn.checked = state
+        if not reason:
+            return False
+        self._terminate(conn, reason, res)
+        return True
+
+    def _check_message(self, key: Any) -> bool:
+        """Message hooks: True when the connection is (now) revoked and the message must not be forwarded."""
+        conn = self.live.get(key)
+        if conn is None:
+            return False
+        if conn.checked != self._check_state():
+            return self._check_conn(conn)
+        return bool(conn.terminated)
+
+    def _track(self, key: Any, kind: str, client: Optional[connection.Client], policy: Policy, res: EvalResult, auth: str,
+               method: str, host: str, port: int, path: str = "/", url: str = "", scheme: str = "", flow: Any = None) -> None:
+        if client is None:
+            return
+        grant = None
+        if res.verdict == VERDICT_REDIRECT:
+            grant = (res.redirect_parent_url, res.matched_rule_id, res.matched_rule_name.removesuffix(" (Object Redirect)"), float("inf"))
+        conn = LiveConn(key=key, kind=kind, client_id=client.id, peer=_peer(client), auth=auth, method=method, host=host, port=port,
+                        path=path, url=url, scheme=scheme, verdict=res.verdict, allowed=res.allowed, server_id=res.server_id,
+                        server_hostname=res.server_hostname, group_ids=list(res.group_ids), grant=grant, flow=flow)
+        conn.checked = (id(policy), id(self.cp.threat), False)
+        self.live.add(conn)
+
+    def _terminate(self, conn: LiveConn, reason: str, res: Optional[EvalResult]) -> None:
+        conn.terminated = reason
+        self.live.discard(conn.key)
+        flow = conn.flow
+        if flow is not None:
+            flow.metadata["aegis_terminated"] = reason
+            try:
+                if flow.killable:
+                    flow.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._close_client(conn.client_id):
+            for other in list(self.live.by_client.get(conn.client_id, ())):
+                stale_conn = self.live.discard(other)
+                if stale_conn is not None:
+                    stale_conn.terminated = reason
+                    if stale_conn.flow is not None:
+                        stale_conn.flow.metadata["aegis_terminated"] = reason
+        self.metrics.inc("aegis_dp_connections_terminated_total", (("kind", conn.kind), ("reason", reason)))
+        text = liveconns.REASON_TEXT.get(reason, reason)
+        log.warning("closed %s connection of %s to %s:%s: %s", conn.kind, conn.peer, printable(conn.host, 255), conn.port, text)
+        verdict = {"quarantined": VERDICT_QUARANTINED, "threat_intel": VERDICT_THREAT}.get(reason, VERDICT_POLICY)
+        rec = {
+            "id": _trace_id(), "server_ip": conn.peer, "server_id": (res.server_id if res else "") or conn.server_id,
+            "server_hostname": (res.server_hostname if res else "") or conn.server_hostname,
+            "group_ids": list(res.group_ids) if res else list(conn.group_ids),
+            "proxy_auth_user": printable(conn.auth.split(":", 1)[0], 255) if conn.auth else "",
+            "method": printable(conn.method, 32), "scheme": conn.scheme, "host": printable(conn.host, 255), "port": conn.port,
+            "path": printable(conn.path.split("?", 1)[0], 2048) or "/", "full_url": printable(conn.url, 4096),
+            "user_agent": f"AegisProxy-{conn.kind}", "verdict": verdict, "block_reason": "connection_terminated",
+            "matched_rule_id": res.matched_rule_id if res else "", "matched_rule_name": f"Connection terminated: {text}",
+            "status_code": 0, "tls_intercepted": conn.kind in ("http", "websocket") and conn.scheme in ("https", "wss"),
+            "latency_ms": max(1, int((time.time() - conn.started) * 1000)), "security_flags": [f"CONNECTION_TERMINATED:{reason}"],
+        }
+        if res is not None and reason == "threat_intel":
+            rec.update(threat_category=res.threat_category, threat_source=res.threat_source, threat_indicator=res.threat_indicator)
+        self.cp.record_flow(rec)
+
+    @staticmethod
+    def _close_client(client_id: str) -> bool:
+        """Closes a client connection with everything it carries (tunnel, WebSocket, HTTP/2 streams); mitmproxy then
+        closes the server side. Must run on the proxy event loop."""
+        try:
+            proxyserver = ctx.master.addons.get("proxyserver")
+            handler = proxyserver.connections.get(client_id) if proxyserver is not None else None
+            if handler is None:
+                return False
+            handler.close_connection(handler.client)
+            return True
+        except Exception:  # noqa: BLE001 - no proxy running (tests) or the connection is already gone
+            return False
+
     # ------------------------------------------------------------------ fail-closed hook guard
     def _hook_failed(self, hook: str, data: Any, exc: BaseException) -> None:
         self.metrics.inc("aegis_dp_hook_errors_total", (("hook", hook),))
@@ -266,7 +478,9 @@ class AegisAddon:
                 pass
 
     def _contain(self, hook: str, data: Any, status: int) -> None:
-        if isinstance(data, http.HTTPFlow):
+        if isinstance(data, http.HTTPFlow) and hook.startswith("websocket"):
+            self._contain_websocket(data)
+        elif isinstance(data, http.HTTPFlow):
             self._deny(data, hook, status, "internal_error",
                        f"Security Guard: policy enforcement failed in the {hook} stage; request blocked (fail-closed)")
         elif isinstance(data, tls.ClientHelloData):
@@ -281,6 +495,17 @@ class AegisAddon:
                 data.messages[-1].content = b""
             if data.killable:
                 data.kill()
+            self._close_client(data.client_conn.id)
+
+    def _contain_websocket(self, flow: http.HTTPFlow) -> None:
+        """A failed WebSocket hook: the message is not forwarded and the connection is closed."""
+        flow.metadata["aegis_terminated"] = "internal_error"
+        if flow.websocket is not None and flow.websocket.messages:
+            flow.websocket.messages[-1].drop()
+        if flow.killable:
+            flow.kill()
+        self.live.discard(flow.id)
+        self._close_client(flow.client_conn.id)
 
     def _deny(self, flow: http.HTTPFlow, hook: str, status: int, reason: str, name: str) -> None:
         """Blocks a flow without relying on the evaluation (which failed or never happened)."""
@@ -327,7 +552,10 @@ class AegisAddon:
                 c = self._icap.get(url)
                 state = {True: "ok", False: "down"}.get(c.available if c else None, "unknown")
                 icap.append(f"{kind}={state}")
-        return {"X-Aegis-YARA": self.yara.heartbeat(), "X-Aegis-ICAP": ",".join(icap) or "disabled"}
+        age = self.cp.policy_age()
+        return {"X-Aegis-YARA": self.yara.heartbeat(), "X-Aegis-ICAP": ",".join(icap) or "disabled",
+                "X-Aegis-Policy-Age": str(int(age)) if age is not None else "", "X-Aegis-Policy-Max-Age": str(int(self.cfg.policy_max_age)),
+                "X-Aegis-Flows-Dropped": self.cp.drop_summary(), "X-Aegis-Flow-Backlog": str(self.cp.queue_len())}
 
     def _yara_sync(self, policy: Policy) -> None:
         if self._yara_rev != policy.revision:
@@ -430,6 +658,42 @@ class AegisAddon:
         flow.metadata["aegis_local"] = True
         return True
 
+    def _stale(self, flow: http.HTTPFlow) -> bool:
+        """AEGIS_POLICY_MAX_AGE exceeded: answers 503 policy_stale (block page / CLI text) and returns True."""
+        if not self.cp.policy_stale():
+            return False
+        age = self.cp.policy_age() or 0.0
+        now = time.time()
+        if now - self._last_stale_log > 60:
+            self._last_stale_log = now
+            log.error("policy stale (last successful sync %s ago, AEGIS_POLICY_MAX_AGE=%s): blocking every request",
+                      _human_duration(age), _human_duration(self.cfg.policy_max_age))
+        req = flow.request
+        trace = _trace_id()
+        url = self.cp.redact(printable(req.pretty_url, 4096))
+        page_ctx = {"age": _human_duration(age), "max_age": _human_duration(self.cfg.policy_max_age), "method": printable(req.method, 32),
+                    "url": url, "trace_id": trace}
+        cli = is_cli_client(req.headers.get("User-Agent", ""), req.headers.get("Accept", ""))
+        body, csp = render_stale(page_ctx, cli)
+        headers = {"X-Aegis-Verdict": VERDICT_POLICY, "X-Aegis-Block-Reason": "policy_stale", "X-Aegis-Trace-ID": trace,
+                   "Retry-After": "30", "Cache-Control": "no-store"}
+        if cli:
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+        else:
+            headers.update({"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp,
+                            "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+        flow.response = http.Response.make(503, body.encode("utf-8", "replace"), headers)
+        flow.metadata["aegis_local"] = flow.metadata["aegis_recorded"] = True
+        self.cp.record_flow({
+            "id": trace, "server_ip": _peer(flow.client_conn), "method": printable(req.method, 32), "scheme": req.scheme,
+            "host": printable(normalize_host(req.host), 255), "port": req.port, "path": printable(req.path.split("?", 1)[0], 2048) or "/",
+            "full_url": url, "user_agent": printable(req.headers.get("User-Agent", ""), 512), "verdict": VERDICT_POLICY,
+            "block_reason": "policy_stale", "status_code": 503, "tls_intercepted": req.scheme == "https",
+            "matched_rule_name": f"Security Guard: policy older than AEGIS_POLICY_MAX_AGE ({_human_duration(age)} > "
+                                 f"{_human_duration(self.cfg.policy_max_age)}); request blocked (fail-closed)",
+        })
+        return True
+
     def _identity(self, flow: http.HTTPFlow) -> str:
         auth = parse_proxy_auth(flow.request.headers.get("Proxy-Authorization"))
         if auth and flow.client_conn:
@@ -459,7 +723,8 @@ class AegisAddon:
         policy = self._policy()
         public, dashboard = self._urls(policy)
         trace = _trace_id()
-        url = printable(flow.request.pretty_url, 4096)  # Host/URL bytes are attacker-controlled
+        # Host/URL bytes are attacker-controlled; the query is redacted per telemetry_query_redaction (page and token)
+        url = self.cp.redact(printable(flow.request.pretty_url, 4096))
         method = printable(flow.request.method, 32)
         token = sign_block_token(self.cfg.dataplane_key, {"ip": peer, "sid": res.server_id, "url": url,
                                                           "m": method, "tid": trace, "v": res.verdict})
@@ -506,6 +771,8 @@ class AegisAddon:
         if policy is None:
             self._unavailable(flow)
             return
+        if self._stale(flow):
+            return
         peer = _peer(flow.client_conn)
         res = policy.evaluate(peer, auth, "CONNECT", host, flow.request.port, "/", "", self.cp.threat, self.grants)
         if not valid_host(host):
@@ -517,6 +784,11 @@ class AegisAddon:
             self._block(flow, res, peer, auth, status=407)
         elif res.verdict in (VERDICT_THREAT, VERDICT_POLICY):
             self._block(flow, res, peer, auth)
+            return
+        if res.allowed and flow.client_conn is not None:
+            # The tunnel lives as long as the client connection: closed when a later policy revokes it.
+            self._track(("connect", flow.client_conn.id), "connect", flow.client_conn, policy, res, auth, "CONNECT", host,
+                        flow.request.port, scheme="tcp")
 
     # ------------------------------------------------------------------ TLS
     @guarded
@@ -524,8 +796,8 @@ class AegisAddon:
         policy = self._policy()
         client = data.context.client
         sni = normalize_host(client.sni or "")
-        if policy is None or not sni or not valid_host(sni):
-            return
+        if policy is None or not sni or not valid_host(sni) or self.cp.policy_stale():
+            return  # intercept: every request is then evaluated (or answered 503 policy_stale)
         target = data.context.server.address
         if not target:
             return
@@ -549,6 +821,8 @@ class AegisAddon:
             if not regular:
                 self._bind(client, str(target[0]), port, sni)
             data.ignore_connection = True
+            # Passthrough bytes never reach a hook again: the tunnel is closed when the passthrough rule is revoked.
+            self._track(("passthrough", client.id), "passthrough", client, policy, res, auth, "CONNECT", sni, port, scheme="https")
             self.cp.record_flow({
                 "id": _trace_id(), "server_ip": peer, "server_id": res.server_id, "server_hostname": res.server_hostname,
                 "group_ids": res.group_ids, "proxy_auth_user": printable(auth.split(":", 1)[0], 255) if auth else "", "method": "CONNECT",
@@ -656,6 +930,8 @@ class AegisAddon:
             if not self._unavailable(flow):
                 flow.metadata["aegis_unenforced"] = True  # AEGIS_FAIL_MODE=open before the first policy sync
             return
+        if self._stale(flow):
+            return
         peer = _peer(flow.client_conn)
         res = policy.evaluate(peer, auth, flow.request.method, host, flow.request.port, flow.request.path,
                               flow.request.pretty_url, self.cp.threat, self.grants)
@@ -674,6 +950,10 @@ class AegisAddon:
         if inspect_on:
             self._prepare_inspection(flow, res)
         meta = flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on}
+        # Until its response is complete (streams, slow transfers, WebSocket upgrades) the request is re-evaluated
+        # on policy changes.
+        self._track(flow.id, "http", flow.client_conn, policy, res, auth, flow.request.method, host, flow.request.port,
+                    flow.request.path, flow.request.pretty_url, flow.request.scheme, flow)
         self._plan_upload(flow, policy, res, meta)
 
     def _plan_upload(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> None:
@@ -1095,6 +1375,7 @@ class AegisAddon:
             await self._respond(flow)
         finally:
             buffering.release(flow)
+            self.live.discard(flow.id)  # a WebSocket is tracked again from websocket_start
 
     async def _respond(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("aegis_local") or flow.metadata.get("aegis_recorded"):
@@ -1318,7 +1599,7 @@ class AegisAddon:
                 # Known false positive (SHA-256 exception maintained by InfoSec): allow, but keep a trail.
                 res.security_flags.append(f"AV_SUPPRESSED:{result.signature}")
                 log.warning("antivirus hit %s on %s suppressed by SHA-256 exception %s", result.signature,
-                            printable(flow.request.pretty_url, 2048), digest)
+                            self.cp.redact(printable(flow.request.pretty_url, 2048)), digest)
                 return None
             if policy.policy_value("av_mode", "block") == "block":
                 res.block(VERDICT_MALWARE, "malware", f"Antivirus: {result.signature}")
@@ -1332,27 +1613,80 @@ class AegisAddon:
                 return VERDICT_POLICY, 503
         return None
 
+    # ------------------------------------------------------------------ WebSocket
+    @guarded
+    def websocket_start(self, flow: http.HTTPFlow) -> None:
+        meta = flow.metadata.get("aegis")
+        policy = self._policy()
+        if not meta or policy is None or flow.metadata.get("aegis_unenforced"):
+            return
+        req = flow.request
+        self._track(flow.id, "websocket", flow.client_conn, policy, meta["res"], meta["auth"], req.method,
+                    normalize_host(req.host if self._regular_like(flow.client_conn) else req.pretty_host), req.port, req.path,
+                    req.pretty_url, "wss" if req.scheme == "https" else "ws", flow)
+
+    @guarded
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        # A message that arrives after the connection was revoked is never forwarded (the policy update may not have
+        # been processed yet: the connection is evaluated again right here).
+        if flow.metadata.get("aegis_terminated") or self._check_message(flow.id):
+            if flow.websocket is not None and flow.websocket.messages:
+                flow.websocket.messages[-1].drop()
+
+    def websocket_end(self, flow: http.HTTPFlow) -> None:
+        self.live.discard(flow.id)
+
     # ------------------------------------------------------------------ non-HTTP
     @guarded
     def tcp_message(self, flow: tcp.TCPFlow) -> None:
         # Defence in depth for raw relays created via --tcp-hosts: never forward payload of a rejected flow
         # (mitmproxy 12 keeps relaying TCP flows even after flow.kill()).
-        if flow.metadata.get("aegis_rejected") and flow.messages:
+        if (flow.metadata.get("aegis_rejected") or flow.metadata.get("aegis_terminated") or self._check_message(flow.id)) and flow.messages:
             flow.messages[-1].content = b""
+
+    @guarded
+    def udp_message(self, flow: udp.UDPFlow) -> None:
+        if (flow.metadata.get("aegis_rejected") or flow.metadata.get("aegis_terminated") or self._check_message(flow.id)) and flow.messages:
+            flow.messages[-1].content = b""
+
+    def tcp_end(self, flow: tcp.TCPFlow) -> None:
+        self.live.discard(flow.id)
+
+    def tcp_error(self, flow: tcp.TCPFlow) -> None:
+        self.live.discard(flow.id)
+
+    def udp_end(self, flow: udp.UDPFlow) -> None:
+        self.live.discard(flow.id)
+
+    def udp_error(self, flow: udp.UDPFlow) -> None:
+        self.live.discard(flow.id)
 
     def _kill_raw(self, flow, proto: str) -> None:
         policy = self._policy()
-        if policy is not None and not policy.policy_value("block_raw_tcp", True):
-            return
         addr = flow.server_conn.address if flow.server_conn and flow.server_conn.address else ("?", 0)
+        verdict, reason, name = VERDICT_POLICY, "raw_tcp", "Security Guard: non-HTTP tunnels are not permitted through the egress proxy"
+        srv_id = ""
+        if policy is not None and not policy.policy_value("block_raw_tcp", True):
+            # Raw relays are permitted by policy: tracked, closed when that changes or the server is quarantined.
+            auth = self.conn_auth.get(flow.client_conn.id, "") if flow.client_conn else ""
+            srv_id, srv_host, groups = policy.resolve_server(_peer(flow.client_conn), auth)
+            res = EvalResult(allowed=True, verdict="ALLOWED", server_id=srv_id, server_hostname=srv_host, group_ids=groups)
+            if self.cp.policy_stale():
+                reason, name = "policy_stale", "Security Guard: policy older than AEGIS_POLICY_MAX_AGE; relay blocked (fail-closed)"
+            elif srv_id in policy.quarantined:
+                verdict, reason = VERDICT_QUARANTINED, "quarantined"
+                name = "Incident response: this server is quarantined — all outbound access is blocked"
+            else:
+                self._track(flow.id, proto, flow.client_conn, policy, res, auth, proto.upper(), normalize_host(str(addr[0])),
+                            int(addr[1] or 0), url=f"{proto}://{addr[0]}:{addr[1]}", scheme=proto, flow=flow)
+                return
         flow.metadata["aegis_rejected"] = True
         flow.kill()
         self.cp.record_flow({
-            "id": _trace_id(), "server_ip": _peer(flow.client_conn), "method": proto.upper(), "scheme": proto,
+            "id": _trace_id(), "server_ip": _peer(flow.client_conn), "server_id": srv_id, "method": proto.upper(), "scheme": proto,
             "host": printable(normalize_host(str(addr[0])), 255), "port": int(addr[1] or 0),
             "path": "/", "full_url": printable(f"{proto}://{addr[0]}:{addr[1]}", 512),
-            "verdict": VERDICT_POLICY, "block_reason": "raw_tcp", "status_code": 0,
-            "matched_rule_name": "Security Guard: non-HTTP tunnels are not permitted through the egress proxy",
+            "verdict": verdict, "block_reason": reason, "status_code": 0, "matched_rule_name": name,
         })
 
     @guarded

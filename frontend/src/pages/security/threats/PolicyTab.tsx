@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import type { LucideIcon } from 'lucide-react';
-import { Ban, Bug, Database, FileCode2, Globe, KeyRound, Network, Plus, RotateCcw, Siren, Trash2 } from 'lucide-react';
+import { Ban, Bug, Database, EyeOff, FileCode2, Globe, KeyRound, Network, Plus, RotateCcw, Siren, Trash2 } from 'lucide-react';
 import { api } from '../../../api';
 import { useAction, useConsoleState } from '../../../data/AppData';
 import { useLookups } from '../../../data/lookups';
@@ -9,7 +9,7 @@ import { cn } from '../../../lib/cn';
 import { pluralize } from '../../../lib/format';
 import { useAsync } from '../../../lib/hooks';
 import { useNavigationBlocker } from '../../../lib/router';
-import type { SecurityPolicy, ThreatMode } from '../../../types';
+import type { SecurityPolicy, TelemetryQueryRedaction, ThreatMode } from '../../../types';
 import {
   Badge,
   Button,
@@ -55,6 +55,7 @@ interface Draft {
   punycode_mode: ThreatMode;
   max_upload_mib: string;
   blocked_burst_threshold: string;
+  telemetry_query_redaction: TelemetryQueryRedaction;
   icap_respmod_url: string;
   icap_reqmod_url: string;
   icap_mode: 'monitor' | 'block';
@@ -90,6 +91,7 @@ const toDraft = (p: SecurityPolicy): Draft => ({
   punycode_mode: p.punycode_mode,
   max_upload_mib: round((p.max_upload_bytes || 0) / MIB),
   blocked_burst_threshold: String(p.blocked_burst_threshold ?? 0),
+  telemetry_query_redaction: p.telemetry_query_redaction === 'none' || p.telemetry_query_redaction === 'all' ? p.telemetry_query_redaction : 'sensitive',
   icap_respmod_url: p.icap_respmod_url ?? '',
   icap_reqmod_url: p.icap_reqmod_url ?? '',
   icap_mode: p.icap_mode === 'monitor' ? 'monitor' : 'block',
@@ -153,6 +155,7 @@ function fromDraft(d: Draft): SecurityPolicy {
     punycode_mode: d.punycode_mode,
     max_upload_bytes: Math.round(Number(d.max_upload_mib) * MIB),
     blocked_burst_threshold: Number(d.blocked_burst_threshold),
+    telemetry_query_redaction: d.telemetry_query_redaction,
     icap_respmod_url: d.icap_respmod_url.trim(),
     icap_reqmod_url: d.icap_reqmod_url.trim(),
     icap_mode: d.icap_mode,
@@ -239,6 +242,8 @@ const modeOptions = (blockLabel: string, monitorLabel = 'Log a security event, a
   ];
 
 const unit = (u: string) => <span className="text-[12px] text-fg-subtle">{u}</span>;
+
+const REDACTION_LABEL: Record<TelemetryQueryRedaction, string> = { sensitive: 'Credentials masked', all: 'Queries dropped', none: 'Unredacted' };
 
 /** /threats/policy — the threat protection policy (InfoSec), read-only for everyone else. */
 export const PolicyTab: React.FC = () => {
@@ -735,6 +740,26 @@ export const PolicyTab: React.FC = () => {
           <Field label="Blocked requests per server and minute" error={err('blocked_burst_threshold')} hint={err('blocked_burst_threshold') ? undefined : '0 disables burst detection. Default 30.'} className="sm:max-w-[280px]">
             <Input type="number" min={0} max={100000} value={draft.blocked_burst_threshold} onChange={(e) => set({ blocked_burst_threshold: e.target.value })} trailing={unit('per minute')} />
           </Field>
+        </Section>
+
+        <Section
+          id="records"
+          icon={EyeOff}
+          title="Query strings in traffic records"
+          description="Signed URLs and API calls carry credentials in the query string (SAS tokens, S3 and CloudFront signatures, API keys). This setting applies to traffic records, the worker access log, log export and block pages. User names and passwords inside URLs are always removed."
+          status={<Badge tone={draft.telemetry_query_redaction === 'none' ? 'warning' : 'success'} dot>{REDACTION_LABEL[draft.telemetry_query_redaction]}</Badge>}
+        >
+          <RadioCards<TelemetryQueryRedaction>
+            aria-label="Query string redaction"
+            className="sm:grid-cols-3"
+            value={draft.telemetry_query_redaction}
+            onChange={(v) => set({ telemetry_query_redaction: v })}
+            options={[
+              { value: 'sensitive', title: 'Mask credentials', description: 'Values of credential-like parameters (token, sig, password, api_key, …) become REDACTED. Recommended.' },
+              { value: 'all', title: 'Drop query strings', description: 'Records keep scheme, host and path only.' },
+              { value: 'none', title: 'Record unchanged', description: 'Full URLs, including any credentials, reach the console, the log export and your SIEM.' },
+            ]}
+          />
         </Section>
       </fieldset>
 

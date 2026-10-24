@@ -235,6 +235,7 @@ func (s *Server) postureChecks() []PostureCheck {
 		}
 	}
 	add("workers", "platform", "Data-plane workers reporting", pass(healthy > 0, "warn"), itoa(healthy)+" healthy", "", "docs/operations.md#monitoring")
+	s.workerFreshnessChecks(add)
 	return out
 }
 
@@ -310,3 +311,72 @@ func (s *Server) auditPostureChecks(add postureAdd) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// workerFreshnessChecks covers the reporting workers' stale-policy limit (AEGIS_POLICY_MAX_AGE) and telemetry loss.
+func (s *Server) workerFreshnessChecks(add func(id, cat, title, status, detail, fix, doc string)) {
+	var unknown, noLimit, stale, lossy []string
+	healthy := 0
+	for _, dp := range s.DataPlanes() {
+		if !dp.Healthy {
+			continue
+		}
+		healthy++
+		switch {
+		case dp.PolicyMaxAgeSeconds < 0:
+			unknown = append(unknown, dp.ID)
+		case dp.PolicyMaxAgeSeconds == 0:
+			noLimit = append(noLimit, dp.ID)
+		case dp.PolicyAgeSeconds > dp.PolicyMaxAgeSeconds:
+			stale = append(stale, dp.ID)
+		}
+		if dp.FlowsDroppedTotal > 0 {
+			lossy = append(lossy, dp.ID+" ("+strconv.FormatInt(dp.FlowsDroppedTotal, 10)+")")
+		}
+	}
+	if healthy == 0 {
+		return
+	}
+	list := func(ids []string) string {
+		if len(ids) > 5 {
+			return strings.Join(ids[:5], ", ") + " and " + itoa(len(ids)-5) + " more"
+		}
+		return strings.Join(ids, ", ")
+	}
+	const fix = "Set AEGIS_POLICY_MAX_AGE on every worker (e.g. 10m): a worker cut off from the control-plane longer than that " +
+		"refuses new connections instead of enforcing a policy that may revoke nothing any more."
+	switch {
+	case len(stale) > 0:
+		add("worker-policy-age", "platform", "Workers enforce a current policy", "fail", "policy older than the limit: "+list(stale),
+			"These workers fail closed (503 policy_stale). Check their connection to the control-plane.", "docs/configuration.md#data-plane-mitmproxy-worker")
+	case len(noLimit) > 0 || len(unknown) > 0:
+		detail := ""
+		if len(noLimit) > 0 {
+			detail = "no AEGIS_POLICY_MAX_AGE: " + list(noLimit)
+		}
+		if len(unknown) > 0 {
+			detail = strings.TrimPrefix(detail+"; not reported (older worker): "+list(unknown), "; ")
+		}
+		add("worker-policy-age", "platform", "Workers enforce a current policy", "warn", detail, fix, "docs/configuration.md#data-plane-mitmproxy-worker")
+	default:
+		add("worker-policy-age", "platform", "Workers enforce a current policy", "pass", itoa(healthy)+" workers with a policy age limit", "", "")
+	}
+	cpLost := int64(0)
+	for _, n := range s.store.FlowDrops() {
+		cpLost += n
+	}
+	detail := ""
+	if len(lossy) > 0 {
+		detail = "workers: " + list(lossy)
+	}
+	if cpLost > 0 {
+		detail = strings.TrimPrefix(detail+"; control-plane: "+strconv.FormatInt(cpLost, 10), "; ")
+	}
+	status := "pass"
+	if detail != "" {
+		status = "warn"
+	}
+	add("telemetry-loss", "data", "Traffic records delivered completely", status, detail,
+		"Records were lost (counts since the worker or control-plane started). Enable the worker flow spool (AEGIS_FLOW_SPOOL_DIR) "+
+			"on persistent storage and check aegis_dp_flows_dropped_total / aegis_flows_dropped_total by reason.",
+		"docs/operations.md#traffic-telemetry-delivery")
+}

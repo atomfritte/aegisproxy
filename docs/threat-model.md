@@ -103,7 +103,10 @@ topology or add integrations.
 | Learning session opens a zero-internet tier | `record_and_allow` refused for strict-isolation groups; learning sessions and redirect grants never apply to members of strict-isolation groups; internal destinations never opened by learning or redirect grants |
 | Allowed site redirects to an arbitrary host (open redirect, user-controlled links) | Redirect grants only for rules with *Follow redirects* (and learning sessions); one object (exact path), GET/HEAD, two minutes, single hop, same server identity (not source address), never internal destinations; optional per-rule `redirect_hosts` allowlist |
 | Servers behind one NAT address use each other's grants or identity | Learning sessions and redirect grants keyed by server ID; invalid proxy credentials refused (407) instead of falling back to the address; groups with `require_proxy_token` are never identified by address |
-| Compromised server keeps communicating | Quarantine overrides every allow rule, TLS exception and learning session; Defender risk/isolation and SOAR playbooks can quarantine automatically |
+| Compromised server keeps communicating | Quarantine overrides every allow rule, TLS exception and learning session; Defender risk/isolation and SOAR playbooks can quarantine automatically. Connections that are already open (WebSockets, CONNECT and passthrough tunnels, streams, raw relays) are closed on quarantine or revocation ([operations](operations.md#connection-termination-on-revocation)) |
+| Worker cut off from the control-plane keeps an outdated policy | `AEGIS_POLICY_MAX_AGE`: the worker fails closed once its policy is older (posture check *Workers enforce a current policy*) |
+| Credentials in URLs leak into records and SIEM | `telemetry_query_redaction` (default `sensitive`) masks credential-like query parameters and user info on the worker and again on the control-plane |
+| Traffic records silently lost (outage, overload) | Acknowledgement only after durable storage, worker spool (`AEGIS_FLOW_SPOOL_DIR`), every loss counted by reason ([operations](operations.md#traffic-telemetry-delivery)) |
 
 ### Audit trail against insiders
 

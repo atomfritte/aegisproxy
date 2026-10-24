@@ -4938,6 +4938,10 @@ paths:
         - $ref: '#/components/parameters/DataPlaneYARAHeader'
         - $ref: '#/components/parameters/DataPlaneICAPHeader'
         - $ref: '#/components/parameters/DataPlaneThreatVersionHeader'
+        - $ref: '#/components/parameters/DataPlanePolicyAgeHeader'
+        - $ref: '#/components/parameters/DataPlanePolicyMaxAgeHeader'
+        - $ref: '#/components/parameters/DataPlaneFlowsDroppedHeader'
+        - $ref: '#/components/parameters/DataPlaneFlowBacklogHeader'
         - name: If-None-Match
           in: header
           required: false
@@ -4977,6 +4981,10 @@ paths:
         - $ref: '#/components/parameters/DataPlaneYARAHeader'
         - $ref: '#/components/parameters/DataPlaneICAPHeader'
         - $ref: '#/components/parameters/DataPlaneThreatVersionHeader'
+        - $ref: '#/components/parameters/DataPlanePolicyAgeHeader'
+        - $ref: '#/components/parameters/DataPlanePolicyMaxAgeHeader'
+        - $ref: '#/components/parameters/DataPlaneFlowsDroppedHeader'
+        - $ref: '#/components/parameters/DataPlaneFlowBacklogHeader'
         - name: If-None-Match
           in: header
           required: false
@@ -5047,7 +5055,10 @@ paths:
       tags: [Data-plane]
       operationId: recordFlow
       summary: Record one traffic flow
-      description: Records a flow observed by a worker (feeds learning sessions, statistics, security events and log export).
+      description: |
+        Records a flow observed by a worker (feeds learning sessions, statistics, security events and log export).
+        Same delivery semantics as `/api/dataplane/flows/batch`; a flow whose ID is stored already is acknowledged
+        without being recorded again.
       security:
         - dataPlaneKey: []
       requestBody:
@@ -5071,12 +5082,19 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '503':
+          $ref: '#/components/responses/TelemetryUnavailable'
   /api/dataplane/flows/batch:
     post:
       tags: [Data-plane]
       operationId: recordFlowBatch
       summary: Record a batch of traffic flows
-      description: Records up to 1,000 flows (`413` for larger batches; body limit 16 MiB).
+      description: |
+        Records up to 1,000 flows (`413` for larger batches; body limit 16 MiB). `201` is returned only after
+        the flows are stored durably: appended and fsync'd to the flow journal (file storage) or committed to
+        PostgreSQL (cluster). Otherwise `503` with `Retry-After`: the worker keeps the batch and resends it.
+        Delivery is at least once; flows are de-duplicated by `id` (`duplicate_count`), so a worker must send
+        a stable, unique `id` (1-64 characters `[A-Za-z0-9_-]`) per flow.
       security:
         - dataPlaneKey: []
       requestBody:
@@ -5104,6 +5122,8 @@ paths:
                 $ref: '#/components/schemas/Error'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '503':
+          $ref: '#/components/responses/TelemetryUnavailable'
 components:
   securitySchemes:
     sessionCookie:
@@ -5398,6 +5418,35 @@ components:
       description: Threat-intelligence snapshot version currently loaded by the worker.
       schema:
         type: string
+    DataPlanePolicyAgeHeader:
+      name: X-Aegis-Policy-Age
+      in: header
+      required: false
+      description: Seconds since the worker last loaded a policy bundle (empty before the first one).
+      schema:
+        type: string
+    DataPlanePolicyMaxAgeHeader:
+      name: X-Aegis-Policy-Max-Age
+      in: header
+      required: false
+      description: The worker's `AEGIS_POLICY_MAX_AGE` in seconds (0 = no limit).
+      schema:
+        type: string
+    DataPlaneFlowsDroppedHeader:
+      name: X-Aegis-Flows-Dropped
+      in: header
+      required: false
+      description: Flow records the worker lost since it started, by reason (`0` or e.g. `overflow=12,spool_full=3`).
+      schema:
+        type: string
+        maxLength: 256
+    DataPlaneFlowBacklogHeader:
+      name: X-Aegis-Flow-Backlog
+      in: header
+      required: false
+      description: Flow records waiting for delivery (memory queue and spool).
+      schema:
+        type: string
 
   headers:
     ETag:
@@ -5543,6 +5592,15 @@ components:
             error: Content-Type must be application/json
     TooManyRequests:
       description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TelemetryUnavailable:
+      description: The flows could not be stored durably (flow journal not writable, PostgreSQL unavailable). Nothing was acknowledged; retry after `Retry-After` seconds.
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
@@ -5704,6 +5762,27 @@ components:
         healthy:
           type: boolean
           description: Heartbeat within the last 60 seconds.
+        policy_age_seconds:
+          type: integer
+          format: int64
+          description: Age of the worker's policy at the last heartbeat; -1 = not reported.
+        policy_max_age_seconds:
+          type: integer
+          format: int64
+          description: The worker's `AEGIS_POLICY_MAX_AGE` in seconds; 0 = no limit, -1 = not reported.
+        flow_backlog:
+          type: integer
+          format: int64
+          description: Flow records waiting for delivery on the worker.
+        flows_dropped:
+          type: object
+          description: Flow records the worker lost since it started, by reason (`overflow`, `spool_full`, `rejected`, `spool_corrupt`).
+          additionalProperties:
+            type: integer
+            format: int64
+        flows_dropped_total:
+          type: integer
+          format: int64
     OverviewStats:
       type: object
       description: Work-queue counters for the console home page. Keys with value 0 are omitted. Team Leads only count requests of their groups.
@@ -8700,6 +8779,14 @@ components:
           minimum: 0
           maximum: 100000
           description: Blocked requests per server and minute that raise an anomaly event (0 disables).
+        telemetry_query_redaction:
+          type: string
+          enum: ['', none, sensitive, all]
+          description: |
+            Query-string redaction of recorded URLs (traffic records, access log, exports, block page).
+            `sensitive` (default; also for "") replaces the values of credential-like parameters (token, sig,
+            password, api_key, SAS and CloudFront signatures, ...) with `REDACTED`; `all` drops the query;
+            `none` records it unchanged. User info in URLs is always replaced.
         icap_respmod_url:
           type: string
           description: '`icap://host:1344/service` or `icaps://…` for RESPMOD (antivirus / sandbox); "" = off.'
@@ -9590,6 +9677,10 @@ components:
       properties:
         recorded_count:
           type: integer
+          description: Flows recorded by this request.
+        duplicate_count:
+          type: integer
+          description: Flows that were stored already (resent after a lost acknowledgement).
     BandwidthSample:
       type: object
       required: [time_label, mbps_total, mbps_direct_allow, mbps_cdn_objects, mbps_tls_bypass, requests_per_sec]

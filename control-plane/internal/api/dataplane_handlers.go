@@ -3,16 +3,19 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/store"
 )
 
 func (s *Server) verifyDataPlaneKey(r *http.Request) bool {
@@ -78,12 +81,46 @@ func (s *Server) recordHeartbeat(r *http.Request, bundleRev, threatVer string) {
 	st.ICAPStatus = clipHeader(r.Header.Get("X-Aegis-ICAP"), 160)
 	st.RemoteIP = s.clientIP(r)
 	st.LastSeenAt = time.Now().UTC()
+	st.PolicyAgeSeconds = headerSeconds(r, "X-Aegis-Policy-Age")
+	st.PolicyMaxAgeSeconds = headerSeconds(r, "X-Aegis-Policy-Max-Age")
+	st.FlowBacklog = max(headerSeconds(r, "X-Aegis-Flow-Backlog"), 0)
+	st.FlowsDropped, st.FlowsDroppedTotal = parseFlowDrops(r.Header.Get("X-Aegis-Flows-Dropped"))
 	if bundleRev != "" {
 		st.BundleRevision = bundleRev
 	}
 	if threatVer != "" {
 		st.ThreatVersion = threatVer
 	}
+}
+
+// headerSeconds parses a non-negative integer heartbeat header (-1 when absent or invalid: older worker).
+func headerSeconds(r *http.Request, name string) int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(r.Header.Get(name)), 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// parseFlowDrops parses the worker's lost-flow counters ("0" or "overflow=12,rejected=1").
+func parseFlowDrops(v string) (map[string]int64, int64) {
+	var out map[string]int64
+	var total int64
+	for i, part := range strings.Split(clipHeader(v, 256), ",") {
+		reason, num, ok := strings.Cut(part, "=")
+		reason = strings.TrimSpace(reason)
+		n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+		if !ok || err != nil || n <= 0 || i >= 8 || reason == "" || len(reason) > 32 ||
+			strings.Trim(reason, "abcdefghijklmnopqrstuvwxyz_") != "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		out[reason] = n
+		total += n
+	}
+	return out, total
 }
 
 // DataPlanes returns the known data-plane workers (healthy = heartbeat within 60s).
@@ -142,6 +179,8 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.store.GetSnapshot()
+	policy := snap.SecurityPolicy
+	policy.TelemetryQueryRedaction = store.NormalizeRedactionMode(policy.TelemetryQueryRedaction)
 
 	groups := make([]dpGroup, 0, len(snap.Groups))
 	for _, g := range snap.Groups {
@@ -190,7 +229,7 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 		"sessions":             sessions,
 		"groups":               groups,
 		"servers":              servers,
-		"security_policy":      snap.SecurityPolicy,
+		"security_policy":      policy,
 		"threat_intel_version": threatVer,
 		"block_pages":          s.blockPageBundle(snap.Revision),
 		"internal_domains":     s.cfg.InternalSuffix,
@@ -250,11 +289,22 @@ func (s *Server) handleDataPlaneRecordFlow(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &flow) {
 		return
 	}
-	recorded := s.store.RecordFlow(flow)
-	s.metrics.Inc("aegis_flows_total", "verdict", recorded.Verdict)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": recorded.ID})
+	recorded, _, ok := s.ingestFlowBatch(w, r, []models.TrafficFlow{flow})
+	if !ok {
+		return
+	}
+	id := flow.ID // a resend of a flow that is stored already
+	if len(recorded) == 1 {
+		id = recorded[0].ID
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
+const maxFlowBatch = 1000
+
+// handleDataPlaneRecordFlowBatch acknowledges (201) only once the flows are stored durably: fsync'd to the flow
+// journal (file storage) or committed to PostgreSQL (cluster). Otherwise 503 + Retry-After: the worker keeps the batch
+// and resends it; flows it delivered before are recognized by their ID (duplicate_count).
 func (s *Server) handleDataPlaneRecordFlowBatch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Flows []models.TrafficFlow `json:"flows"`
@@ -262,13 +312,31 @@ func (s *Server) handleDataPlaneRecordFlowBatch(w http.ResponseWriter, r *http.R
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if len(body.Flows) > 1000 {
-		writeError(w, http.StatusRequestEntityTooLarge, "at most 1000 flows per batch")
+	if len(body.Flows) > maxFlowBatch {
+		s.store.CountFlowDrops("batch_too_large", len(body.Flows))
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("at most %d flows per batch", maxFlowBatch))
 		return
 	}
-	recorded := s.store.RecordFlowBatch(body.Flows)
+	recorded, dups, ok := s.ingestFlowBatch(w, r, body.Flows)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"recorded_count": len(recorded), "duplicate_count": dups})
+}
+
+func (s *Server) ingestFlowBatch(w http.ResponseWriter, r *http.Request, flows []models.TrafficFlow) ([]models.TrafficFlow, int, bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	recorded, dups, err := s.store.IngestFlowBatch(ctx, flows)
+	if err != nil {
+		s.metrics.Inc("aegis_flow_batches_refused_total")
+		s.log.Warn("flow batch refused: telemetry storage unavailable; the worker retries", "flows", len(flows), "error", err)
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "telemetry storage unavailable; retry later")
+		return nil, 0, false
+	}
 	for _, f := range recorded {
 		s.metrics.Inc("aegis_flows_total", "verdict", f.Verdict)
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"recorded_count": len(recorded)})
+	return recorded, dups, true
 }

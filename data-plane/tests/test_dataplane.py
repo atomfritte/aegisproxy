@@ -1690,5 +1690,492 @@ class AddonSecurityTest(unittest.TestCase):
         self.assertEqual(len(a.conn_auth), addon_mod.MAX_TRACKED_CONNECTIONS)
         self.assertNotIn("c0", a.conn_auth)
 
+
+# -- Review round 2: long-lived connections, telemetry delivery, policy max age, query redaction ----------------------
+
+def _bundle(**changes):
+    b = json.loads(json.dumps(ADDON_BUNDLE))
+    for k, v in changes.items():
+        b[k] = v
+    return b
+
+
+class RedactionTest(unittest.TestCase):
+    def test_vectors_shared_with_control_plane(self):
+        from aegis_dp.redact import redact_url
+        with open(os.path.join(os.path.dirname(VECTORS), "redaction_vectors.json"), encoding="utf-8") as fh:
+            vectors = json.load(fh)["vectors"]
+        self.assertGreater(len(vectors), 20)
+        for v in vectors:
+            self.assertEqual(redact_url(v["in"], v["mode"]), v["out"], (v["mode"], v["in"]))
+
+    def test_record_flow_redacts_per_policy(self):
+        from aegis_dp.controlplane import ControlPlaneClient
+        written = []
+        cp = ControlPlaneClient(Config(control_plane_url="http://127.0.0.1:1", dataplane_key="k" * 40, worker_id="w1", ops_addr=""),
+                                on_flow=written.append)
+        url = "https://h.example/cb?code=abc&state=1"
+        for setting, want in ((None, "https://h.example/cb?code=REDACTED&state=1"), ("sensitive", "https://h.example/cb?code=REDACTED&state=1"),
+                              ("all", "https://h.example/cb"), ("none", url)):
+            bundle = _bundle()
+            if setting is not None:
+                bundle["security_policy"]["telemetry_query_redaction"] = setting
+            cp.policy = Policy(bundle)
+            cp.record_flow({"id": "flw-1", "full_url": url, "redirect_location": url, "redirect_parent_url": url})
+            rec = written[-1]
+            self.assertEqual((rec["full_url"], rec["redirect_location"], rec["redirect_parent_url"]), (want, want, want), setting)
+            self.assertTrue(rec["timestamp"].endswith("Z"), "records carry the time they happened (replay after outages)")
+        cp.policy = None
+        cp.record_flow({"id": "flw-2", "full_url": url})
+        self.assertIn("REDACTED", written[-1]["full_url"], "no policy loaded yet: the default (sensitive) applies")
+
+
+class _FakeControlPlane:
+    """POST /api/dataplane/flows/batch: mode ok | 503 | 429 | 400; records every accepted flow ID."""
+
+    def __init__(self):
+        import http.server
+        import threading
+        fake = self
+        self.mode, self.retry_after, self.received, self.attempts = "ok", "2", [], 0
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                fake.attempts += 1
+                fake.headers = dict(self.headers)
+                if fake.mode == "ok":
+                    fake.received.extend(f["id"] for f in body["flows"])
+                    code, payload = 201, b'{"recorded_count": 1}'
+                else:
+                    code, payload = int(fake.mode), b'{"error": "storage unavailable"}'
+                self.send_response(code)
+                if code in (429, 503):
+                    self.send_header("Retry-After", fake.retry_after)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TelemetryDeliveryTest(unittest.TestCase):
+    def setUp(self):
+        import logging
+        import tempfile
+        self._level = logging.getLogger("aegis").level
+        logging.getLogger("aegis").setLevel(logging.CRITICAL)
+        self.cp_server = _FakeControlPlane()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        import logging
+        self.cp_server.close()
+        self.tmp.cleanup()
+        logging.getLogger("aegis").setLevel(self._level)
+
+    def client(self, url=None, **cfg):
+        from aegis_dp.controlplane import ControlPlaneClient
+        return ControlPlaneClient(Config(control_plane_url=url or self.cp_server.url, dataplane_key="k" * 40, worker_id="w1",
+                                         ops_addr="", **cfg))
+
+    @staticmethod
+    def record(cp, n, start=0):
+        for i in range(start, start + n):
+            cp.record_flow({"id": f"flw-{i:06d}", "verdict": "BLOCKED", "full_url": "https://x.example/"})
+
+    def test_overflow_is_counted_and_reported(self):
+        cp = self.client(url="http://127.0.0.1:1", flow_queue_max=5)
+        self.record(cp, 8)
+        self.assertEqual((cp.queue_len(), cp.dropped["overflow"], cp.drop_summary()), (5, 3, "overflow=3"))
+        cp._flush()  # control-plane down: nothing is lost beyond the overflow
+        self.assertEqual((cp.queue_len(), cp.dropped_total()), (5, 3))
+        self.assertGreater(cp._retry_at, time.time(), "backoff after a network error")
+
+    def test_backpressure_keeps_the_batch_and_honours_retry_after(self):
+        cp = self.client()
+        self.record(cp, 3)
+        self.cp_server.mode = "503"
+        cp._flush()
+        self.assertEqual((cp.queue_len(), cp.backpressure, self.cp_server.received), (3, 1, []))
+        self.assertAlmostEqual(cp._retry_at - time.time(), 2, delta=0.5)
+        cp._flush()
+        self.assertEqual(self.cp_server.attempts, 1, "no retry before Retry-After elapsed")
+        self.cp_server.mode, cp._retry_at = "429", 0
+        cp._flush()
+        self.assertEqual((cp.queue_len(), cp.backpressure), (3, 2))
+        self.cp_server.mode, cp._retry_at = "ok", 0
+        self.record(cp, 2, start=3)
+        cp._flush()
+        self.assertEqual((cp.queue_len(), sorted(self.cp_server.received)), (0, [f"flw-{i:06d}" for i in range(5)]))
+        self.assertEqual(cp.dropped_total(), 0)
+        self.assertIn("X-Aegis-Dataplane-Key", self.cp_server.headers)
+
+    def test_rejected_batch_is_dropped_and_counted(self):
+        cp = self.client()
+        self.record(cp, 2)
+        self.cp_server.mode = "400"
+        cp._flush()
+        self.assertEqual((cp.queue_len(), cp.dropped["rejected"]), (0, 2))
+
+    def test_control_plane_outage_and_worker_restart_with_spool(self):
+        spool = os.path.join(self.tmp.name, "spool")
+        cp = self.client(url="http://127.0.0.1:1", flow_spool_dir=spool)
+        self.record(cp, 1200)
+        cp._flush()
+        segments = sorted(os.listdir(spool))
+        self.assertEqual(len(segments), 3, segments)  # batches of 500 + 500 + 200, fsync'd before any upload
+        self.assertEqual(cp.queue_len(), 1200)
+        with open(os.path.join(spool, "seg-000000000099-1.jsonl.tmp"), "wb") as fh:
+            fh.write(b'{"id": "torn')  # a write interrupted by a crash is never delivered
+        # The worker restarts while the control-plane is still down: a new client finds the spool.
+        cp2 = self.client(flow_spool_dir=spool)
+        self.assertEqual((cp2.queue_len(), len(cp2.spool)), (1200, 3))
+        self.assertFalse(any(n.endswith(".tmp") for n in os.listdir(spool)))
+        self.record(cp2, 10, start=1200)
+        self.cp_server.mode = "503"
+        cp2._flush()
+        self.assertEqual((cp2.queue_len(), self.cp_server.received), (1210, []))
+        self.cp_server.mode, cp2._retry_at = "ok", 0
+        cp2._flush()
+        self.assertEqual(sorted(self.cp_server.received), [f"flw-{i:06d}" for i in range(1210)])
+        self.assertEqual((cp2.queue_len(), os.listdir(spool), cp2.dropped_total()), (0, [], 0))
+
+    def test_spool_size_limit_discards_oldest(self):
+        from aegis_dp.spool import FlowSpool
+        sp = FlowSpool(os.path.join(self.tmp.name, "small"), 4096)
+        dropped = sum(sp.append([{"id": f"flw-{j}-{i}", "pad": "x" * 100} for i in range(10)]) for j in range(5))
+        self.assertGreater(dropped, 0)
+        self.assertLessEqual(sp.bytes, 4096)
+        name, flows, bad = sp.oldest()
+        self.assertEqual((bad, flows[0]["id"].split("-")[1] != "0"), (0, True), "the oldest batches went first")
+        self.assertEqual(sp.flows + dropped, 50)
+
+    def test_shutdown_spools_pending_records(self):
+        spool = os.path.join(self.tmp.name, "spool")
+        cp = self.client(url="http://127.0.0.1:1", flow_spool_dir=spool)
+        self.record(cp, 7)
+        cp.stop()
+        self.assertEqual(self.client(flow_spool_dir=spool).queue_len(), 7)
+
+    def test_policy_staleness(self):
+        cp = self.client(policy_max_age=60)
+        self.assertFalse(cp.policy_stale(), "no policy yet: answered as unavailable, not stale")
+        cp.policy = Policy(_bundle())
+        cp.last_sync_ok = time.time() - 59
+        self.assertFalse(cp.policy_stale())
+        cp.last_sync_ok = time.time() - 61
+        self.assertTrue(cp.policy_stale())
+        unlimited = self.client()
+        unlimited.policy, unlimited.last_sync_ok = cp.policy, time.time() - 10 ** 6
+        self.assertFalse(unlimited.policy_stale(), "AEGIS_POLICY_MAX_AGE unset (0): never stale")
+
+    def test_config(self):
+        import unittest.mock
+        from aegis_dp.config import ConfigError, parse_duration
+        self.assertEqual([parse_duration(v) for v in ("", "0", "900", "90s", "15m", "2h", "1d", "1h30m")],
+                         [0, 0, 900, 90, 900, 7200, 86400, 5400])
+        for bad in ("15x", "m", "-5", "1.5h"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_duration(bad)
+        env = {"AEGIS_DATAPLANE_KEY": "k" * 40}
+        for value, want in (("", 0.0), ("15m", 900.0)):
+            with unittest.mock.patch.dict(os.environ, dict(env, AEGIS_POLICY_MAX_AGE=value), clear=True):
+                self.assertEqual(Config.from_env().policy_max_age, want)
+        for value in ("10s", "soon"):
+            with unittest.mock.patch.dict(os.environ, dict(env, AEGIS_POLICY_MAX_AGE=value), clear=True):
+                with self.assertRaises(ConfigError):
+                    Config.from_env()
+        with unittest.mock.patch.dict(os.environ, dict(env, AEGIS_FLOW_SPOOL_DIR="/var/spool/aegis", AEGIS_FLOW_SPOOL_MAX="64m"), clear=True):
+            c = Config.from_env()
+            self.assertEqual((c.flow_spool_dir, c.flow_spool_max), ("/var/spool/aegis", 64 << 20))
+        with unittest.mock.patch.dict(os.environ, dict(env, AEGIS_FLOW_SPOOL_MAX="10k"), clear=True):
+            with self.assertRaises(ConfigError):
+                Config.from_env()
+
+    def test_readyz_reports_the_reason(self):
+        import urllib.error
+        import urllib.request
+        from aegis_dp.ops import Metrics, start_ops_server
+        state = {"reason": "policy stale (last successful sync 20m ago, maximum 15m)"}
+        srv = start_ops_server("127.0.0.1:0", Metrics(), dict, lambda: state["reason"])
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/readyz"
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(url, timeout=5)
+            self.assertEqual((err.exception.code, err.exception.read()), (503, b"policy stale (last successful sync 20m ago, maximum 15m)\n"))
+            err.exception.close()
+            state["reason"] = ""
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class LiveConnectionDecisionTest(unittest.TestCase):
+    """liveconns.decide: when a connection admitted earlier must be closed."""
+
+    def setUp(self):
+        self.t = ThreatSnapshot(THREATS)
+        self.g = RedirectGrants()
+
+    def conn(self, kind="websocket", host="dl.example", res=None, **kw):
+        from aegis_dp.liveconns import LiveConn
+        res = res or Policy(_bundle()).evaluate("10.1.0.5", "", "GET", host, 443, "/ws", f"https://{host}/ws", self.t, self.g)
+        return LiveConn(key="k", kind=kind, client_id="c1", peer="10.1.0.5", auth="", method="CONNECT" if kind in ("connect", "passthrough") else "GET",
+                        host=host, port=443, path="/ws", url=f"https://{host}/ws", verdict=res.verdict, allowed=res.allowed,
+                        server_id=res.server_id, group_ids=list(res.group_ids), **kw)
+
+    def decide(self, conn, bundle):
+        from aegis_dp.liveconns import decide
+        return decide(conn, Policy(bundle), self.t, self.g)[0]
+
+    def test_reasons(self):
+        c = self.conn()
+        self.assertEqual(c.verdict, VERDICT_ALLOWED)
+        self.assertEqual(self.decide(c, _bundle()), "")
+        quarantined = _bundle()
+        quarantined["servers"][0]["quarantined"] = True
+        self.assertEqual(self.decide(c, quarantined), "quarantined")
+        self.assertEqual(self.decide(c, _bundle(rules=ADDON_BUNDLE["rules"][1:])), "rule_revoked")
+        disabled = _bundle()
+        disabled["rules"][0]["enabled"] = False
+        self.assertEqual(self.decide(c, disabled), "rule_revoked")
+        expired = _bundle()
+        expired["rules"][0]["expires_at"] = "2001-01-01T00:00:00Z"
+        self.assertEqual(self.decide(c, expired), "rule_revoked")
+        moved = _bundle(groups=[{"id": "g1"}, {"id": "g2"}])
+        moved["servers"][0]["group_ids"] = ["g2"]
+        self.assertEqual(self.decide(c, moved), "group_changed")
+        guard = _bundle()
+        guard["rules"].append({"id": "b1", "name": "no ws", "action": "BLOCK", "host_pattern": "dl.example", "path_pattern": "/ws",
+                               "group_ids": ["*"], "enabled": True})
+        self.assertEqual(self.decide(c, guard), "block_rule")
+        threat = ThreatSnapshot(dict(THREATS, domains={"dl.example": 0}))
+        from aegis_dp.liveconns import decide
+        self.assertEqual(decide(c, Policy(_bundle()), threat, self.g)[0], "threat_intel")
+
+    def test_learning_session_and_redirect_grant(self):
+        session = {"id": "s1", "name": "learn", "server_id": "srv-1", "mode": "record_and_allow", "status": "active", "expires_at": FUTURE}
+        learning = Policy(_bundle(sessions=[session])).evaluate("10.1.0.5", "", "GET", "new.example", 443, "/x", "https://new.example/x", self.t, self.g)
+        self.assertEqual(learning.verdict, VERDICT_LEARNING)
+        c = self.conn(host="new.example", res=learning)
+        self.assertEqual(self.decide(c, _bundle(sessions=[session])), "")
+        self.assertEqual(self.decide(c, _bundle()), "learning_session_ended")
+        # A download admitted by a redirect grant keeps it for the whole transfer...
+        self.g.register("srv-1", "https://objects.example/ws", "https://dl.example/a", "r1", "downloads")
+        granted = Policy(_bundle()).evaluate("10.1.0.5", "", "GET", "objects.example", 443, "/ws", "https://objects.example/ws", self.t, self.g)
+        self.assertEqual(granted.verdict, VERDICT_REDIRECT)
+        c = self.conn(host="objects.example", res=granted, grant=(granted.redirect_parent_url, "r1", "downloads", time.time() + 120))
+        self.g = RedirectGrants()  # ...after the 2-minute grant expired
+        self.assertEqual(self.decide(c, _bundle()), "")
+        quarantined = _bundle()
+        quarantined["servers"][0]["quarantined"] = True
+        self.assertEqual(self.decide(c, quarantined), "quarantined", "a pinned grant never outlives a quarantine")
+
+    def test_tunnels_and_raw_relays(self):
+        p = Policy(_bundle())
+        connect = self.conn("connect", res=p.evaluate("10.1.0.5", "", "CONNECT", "dl.example", 443, "/", "", self.t, self.g))
+        self.assertEqual(self.decide(connect, _bundle()), "")
+        self.assertEqual(self.decide(connect, _bundle(rules=[])), "rule_revoked")
+        bypass = self.conn("passthrough", host="update.example",
+                           res=p.evaluate("10.1.0.5", "", "CONNECT", "update.example", 443, "/", "", self.t, self.g))
+        self.assertEqual(bypass.verdict, VERDICT_TLS_BYPASS)
+        self.assertEqual(self.decide(bypass, _bundle()), "")
+        self.assertEqual(self.decide(bypass, _bundle(tls_bypass=[])), "tls_bypass_revoked")
+        raw = self.conn("tcp")
+        relays_on = _bundle()
+        relays_on["security_policy"]["block_raw_tcp"] = False
+        self.assertEqual(self.decide(raw, relays_on), "")
+        self.assertEqual(self.decide(raw, _bundle()), "raw_tcp_disabled")
+        relays_on["servers"][0]["quarantined"] = True
+        self.assertEqual(self.decide(raw, relays_on), "quarantined")
+
+    def test_next_expiry_and_registry(self):
+        from aegis_dp.liveconns import Registry, next_expiry
+        now = time.time()
+        b = _bundle()
+        b["rules"][0]["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 30))
+        b["rules"][1]["expires_at"] = "2001-01-01T00:00:00Z"
+        self.assertAlmostEqual(next_expiry(Policy(b), now), int(now + 30), delta=1)
+        self.assertEqual(next_expiry(Policy(_bundle()), now), float("inf"))
+        reg = Registry()
+        a, b2, c = self.conn("connect"), self.conn(), self.conn("passthrough")
+        a.key, b2.key, c.key = ("connect", "c1"), "flow-1", ("passthrough", "c1")
+        for x in (a, b2, c):
+            reg.add(x)
+        self.assertEqual([x.kind for x in reg.snapshot()], ["websocket", "passthrough", "connect"])
+        self.assertEqual(reg.kinds()["connect"], 1)
+        reg.drop_client("c1")
+        self.assertEqual((len(reg), reg.kinds()["websocket"]), (0, 0))
+
+
+@unittest.skipUnless(HAVE_MITMPROXY, "mitmproxy not installed (runs in the data-plane image)")
+class LongLivedConnectionTest(unittest.TestCase):
+    """Hook-level: quarantine/revocation closes WebSockets, tunnels and relays; stale policies fail closed."""
+
+    setUpClass = AddonSecurityTest.setUpClass
+    tearDownClass = AddonSecurityTest.tearDownClass
+    addon = AddonSecurityTest.addon
+    flow = AddonSecurityTest.flow
+    exchange = AddonSecurityTest.exchange
+    records = AddonSecurityTest.records
+    call = staticmethod(AddonSecurityTest.call)
+
+    def websocket(self, a, host="dl.example"):
+        from mitmproxy import websocket as mws
+        hdrs = [("Host", host), ("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")]
+        f = self.flow(host, "/ws?token=s3cr3t", headers=hdrs)
+        resp, _ = self.exchange(a, f, [("Upgrade", "websocket"), ("Connection", "Upgrade")], b"", status=101)
+        self.assertEqual(resp.status_code, 101)
+        f.websocket = mws.WebSocketData()
+        self.call(a, "websocket_start", f)
+        self.assertIsNotNone(a.live.get(f.id))
+        return f
+
+    def send(self, a, f, text):
+        from mitmproxy import websocket as mws
+        from wsproto.frame_protocol import Opcode
+        f.websocket.messages.append(mws.WebSocketMessage(Opcode.TEXT, True, text.encode()))
+        self.call(a, "websocket_message", f)
+        return f.websocket.messages[-1]
+
+    @staticmethod
+    def quarantined():
+        b = _bundle(revision=4)
+        b["servers"][0]["quarantined"] = True
+        return Policy(b)
+
+    def test_quarantine_closes_open_websocket(self):
+        a = self.addon()
+        f = self.websocket(a)
+        self.assertFalse(self.send(a, f, "BEFORE").dropped)
+        a.cp.policy = self.quarantined()
+        self.assertEqual(a.revalidate_now(), 1)
+        self.assertEqual(f.metadata["aegis_terminated"], "quarantined")
+        self.assertIsNone(a.live.get(f.id))
+        self.assertFalse(f.killable, "the flow was killed")
+        rec = self.records(a)[-1]
+        self.assertEqual((rec["verdict"], rec["block_reason"], rec["security_flags"]),
+                         ("QUARANTINED", "connection_terminated", ["CONNECTION_TERMINATED:quarantined"]))
+        self.assertEqual(rec["full_url"], "http://dl.example/ws?token=REDACTED")
+        self.assertTrue(self.send(a, f, "AFTER-QUARANTINE").dropped, "nothing reaches the destination afterwards")
+        self.assertIn('aegis_dp_connections_terminated_total{kind="websocket",reason="quarantined"} 1', a.metrics.render({}))
+
+    def test_message_after_policy_change_is_checked_before_revalidation_runs(self):
+        a = self.addon()
+        f = self.websocket(a)
+        a.cp.policy = self.quarantined()  # the loop has not processed the update yet
+        self.assertTrue(self.send(a, f, "AFTER-QUARANTINE").dropped)
+        self.assertEqual(self.records(a)[-1]["security_flags"], ["CONNECTION_TERMINATED:quarantined"])
+        a.cp.policy = Policy(_bundle(rules=[]))
+        self.assertTrue(self.send(a, f, "still closed").dropped)
+
+    def test_revoked_rule_closes_connect_tunnel_and_passthrough(self):
+        a = self.addon()
+        c = self.flow("dl.example", "", method="CONNECT", port=443)
+        self.call(a, "http_connect", c)
+        self.assertIsNone(c.response)
+        client = tflow.tclient_conn()
+        client.peername, client.sni = ("10.1.0.5", 40001), "update.example"
+        cx = mcontext.Context(client, moptions.Options())
+        cx.server = mconn.Server(address=("update.example", 443))
+        hello = mtls.ClientHelloData(cx, None)
+        self.call(a, "tls_clienthello", hello)
+        self.assertTrue(hello.ignore_connection)
+        self.assertEqual(a.live.kinds()["connect"] + a.live.kinds()["passthrough"], 2)
+        self.assertEqual(a.revalidate_now(), 0)
+        a.cp.policy = Policy(_bundle(rules=ADDON_BUNDLE["rules"][1:], tls_bypass=[]))
+        self.assertEqual(a.revalidate_now(), 2)
+        flags = sorted(r["security_flags"][0] for r in self.records(a)[-2:])
+        self.assertEqual(flags, ["CONNECTION_TERMINATED:rule_revoked", "CONNECTION_TERMINATED:tls_bypass_revoked"])
+        a.client_disconnected(c.client_conn)
+        self.assertEqual(len(a.live), 0)
+
+    def test_streamed_response_and_raw_relay(self):
+        a = self.addon()
+        f = self.flow("dl.example", "/events", headers=[("Host", "dl.example")])
+        self.call(a, "requestheaders", f)
+        f.response = tutils.tresp(headers=mhttp.Headers([(b"Content-Type", b"text/event-stream")]))
+        self.call(a, "responseheaders", f)
+        self.assertIsNotNone(a.live.get(f.id), "tracked until the response completed")
+        a.cp.policy = self.quarantined()
+        self.assertEqual(a.revalidate_now(), 1)
+        self.assertEqual(f.metadata["aegis_terminated"], "quarantined")
+        self.call(a, "response", f)
+        self.assertEqual(len(a.live), 0)
+        relays = _bundle()
+        relays["security_policy"]["block_raw_tcp"] = False
+        a.cp.policy = Policy(relays)
+        t = tflow.ttcpflow()
+        t.client_conn.peername = ("10.1.0.5", 40002)
+        self.call(a, "tcp_start", t)
+        self.assertIsNotNone(a.live.get(t.id))
+        a.cp.policy = Policy(_bundle())
+        self.call(a, "tcp_message", t)
+        self.assertEqual(t.messages[-1].content, b"")
+        self.assertEqual(self.records(a)[-1]["security_flags"], ["CONNECTION_TERMINATED:raw_tcp_disabled"])
+
+    def test_stale_policy_fails_closed(self):
+        a = self.addon()
+        a.cfg.policy_max_age = 60
+        f = self.websocket(a)
+        a.cp.last_sync_ok = time.time() - 30
+        self.assertEqual(a._not_ready(), "")
+        self.assertEqual(a.revalidate_now(), 0)
+        a.cp.last_sync_ok = time.time() - 600
+        self.assertTrue(a._not_ready().startswith("policy stale"))
+        for ua, marker in (("curl/8", b"POLICY STALE"), ("Mozilla/5.0", b"<!DOCTYPE html>")):
+            r = self.flow("dl.example", "/x?token=abc", headers=[("Host", "dl.example"), ("User-Agent", ua), ("Accept", "text/html")])
+            self.call(a, "requestheaders", r)
+            self.assertEqual((r.response.status_code, r.response.headers["X-Aegis-Block-Reason"]), (503, "policy_stale"))
+            self.assertIn(marker, r.response.raw_content)
+            self.assertNotIn(b"abc", r.response.raw_content)
+            self.assertEqual(self.records(a)[-1]["block_reason"], "policy_stale")
+        c = self.flow("dl.example", "", method="CONNECT", port=443)
+        self.call(a, "http_connect", c)
+        self.assertEqual(c.response.status_code, 503)
+        self.assertEqual(a.revalidate_now(), 1)
+        self.assertEqual(f.metadata["aegis_terminated"], "policy_stale")
+        hdrs = a._engine_status()
+        self.assertEqual(hdrs["X-Aegis-Policy-Max-Age"], "60")
+        self.assertGreaterEqual(int(hdrs["X-Aegis-Policy-Age"]), 600)
+        self.assertEqual(a._gauges()["aegis_dp_policy_stale"], 1.0)
+
+    def test_block_page_and_records_redact_queries(self):
+        a = self.addon()
+        f = self.flow("blocked.example", "/cb?code=s3cr3t&state=1", headers=[("Host", "blocked.example"), ("User-Agent", "curl/8")])
+        self.call(a, "requestheaders", f)
+        self.assertEqual(f.response.status_code, 403)
+        self.assertNotIn(b"s3cr3t", f.response.raw_content)
+        self.assertIn(b"code=REDACTED&state=1", f.response.raw_content)
+        self.assertEqual(self.records(a)[-1]["full_url"], "http://blocked.example/cb?code=REDACTED&state=1")
+        a.cp.policy.security["telemetry_query_redaction"] = "none"
+        f = self.flow("blocked.example", "/cb?code=s3cr3t", headers=[("Host", "blocked.example"), ("User-Agent", "curl/8")])
+        self.call(a, "requestheaders", f)
+        self.assertIn(b"s3cr3t", f.response.raw_content)
+
+    def test_heartbeat_reports_telemetry_loss(self):
+        a = self.addon()
+        a.cfg.flow_queue_max = 2
+        for i in range(5):
+            a.cp.record_flow({"id": f"flw-{i}", "verdict": "BLOCKED"})
+        hdrs = a._engine_status()
+        self.assertEqual((hdrs["X-Aegis-Flows-Dropped"], hdrs["X-Aegis-Flow-Backlog"]), ("overflow=3", "2"))
+        g = a._gauges()
+        self.assertEqual((g['aegis_dp_flows_dropped_total{reason="overflow"}'], g['aegis_dp_flows_dropped_total{reason="rejected"}']), (3.0, 0.0))
+
+
 if __name__ == "__main__":
     unittest.main()

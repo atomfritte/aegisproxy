@@ -104,15 +104,18 @@ approvals policy set. SLA, assignment, comments, bulk review, extension and revo
 | `GET /healthz` | control-plane | liveness |
 | `GET /readyz` | control-plane | state loaded + storage reachable; fails while draining |
 | `GET /metrics` | control-plane | HTTP metrics, logins, evaluations, flows by verdict, pending requests, open security events, threat-intel indicators and feed age, healthy data-planes, audit log writable (`AEGIS_METRICS_TOKEN`) |
-| `GET :9091/healthz`, `/readyz` | data-plane | liveness / policy loaded |
-| `GET :9091/metrics` | data-plane | flows by verdict, AV scans and duration, clamd availability, YARA and ICAP scans and duration, policy revision and sync age, telemetry queue |
+| `GET :9091/healthz`, `/readyz` | data-plane | liveness / policy loaded and not stale (`/readyz` answers 503 with the reason) |
+| `GET :9091/metrics` | data-plane | flows by verdict, AV scans and duration, clamd availability, YARA and ICAP scans and duration, policy revision, sync age, max age and staleness, telemetry queue, spool bytes, lost records by reason, tracked and terminated connections |
 | `GET /api/system/posture` | control-plane | security posture score and checks ([below](#security-posture)) |
 
 Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prometheusRule.enabled=true`):
 
 - `increase(aegis_dp_hook_errors_total[10m]) > 0` — a worker blocked traffic after an internal error (fail-closed)
 - `aegis_dataplanes_healthy < expected` (control-plane view of worker heartbeats)
-- `aegis_dp_policy_sync_age_seconds > 120`
+- `aegis_dp_policy_sync_age_seconds > 120`; `aegis_dp_policy_stale == 1` (the worker fails closed)
+- `increase(aegis_dp_flows_dropped_total[1h]) > 0` or `increase(aegis_flows_dropped_total[1h]) > 0` —
+  traffic records were lost ([telemetry delivery](#traffic-telemetry-delivery)); `aegis_dp_telemetry_queue`
+  growing for 15 minutes (the control-plane does not accept records)
 - `aegis_dp_clamd_available == 0`
 - `increase(aegis_dp_icap_scans_total{result="error"}[15m]) > 0`, or a data-plane reporting `icap_status`
   `…=down` / `yara_status` `error:…` (**Settings → Data planes**)
@@ -132,6 +135,59 @@ Logs are structured JSON (`AEGIS_LOG_FORMAT=json`). Audit events are written as 
 `audit.jsonl`. To forward audit, traffic ("browsing") and security records to a SIEM or observability platform
 (syslog/rsyslog, OpenTelemetry, Splunk, Elastic/OpenSearch, Sentinel, Datadog, Loki, webhooks, files) configure
 **Settings → Integrations → Log export** — see [log-export.md](log-export.md).
+
+### Traffic telemetry delivery
+
+Traffic records ("flows") travel from a worker to the control-plane **at least once**, and the control-plane
+stores each flow ID once:
+
+1. The worker queues each record in memory (20,000 records). With `AEGIS_FLOW_SPOOL_DIR` it moves them to
+   fsync'd spool segments every flush interval and when it shuts down, so they survive a restart.
+2. It uploads batches of up to 500 records, oldest first, to `POST /api/dataplane/flows/batch`, and removes a batch
+   only after a `201`.
+3. The control-plane answers `201` only once the batch is stored durably. With file storage the batch is appended
+   to `DATA_DIR/flow-journal/` and fsync'd; the journal is replayed after a crash until the next state save includes
+   it. In a cluster the batch is committed to PostgreSQL. Otherwise it answers `503` with `Retry-After`:
+   the worker keeps the batch and retries (`429`/`503` honour `Retry-After`; network errors and other `5xx` back
+   off exponentially up to 30 s).
+4. A resend after a lost acknowledgement is recognized by flow ID (`duplicate_count`,
+   `aegis_flow_duplicates_total`). In PostgreSQL a unique index on `aegis_flows.flow_id` covers resends to another
+   replica.
+
+Records are lost only in these cases, and each one is counted:
+
+| Where | Metric reason | Cause |
+|---|---|---|
+| worker | `overflow` | memory queue full: no spool and the control-plane unreachable or refusing for too long |
+| worker | `spool_full` | `AEGIS_FLOW_SPOOL_MAX` reached (oldest records discarded) |
+| worker | `rejected` | the control-plane refused a batch as malformed (`400`/`413`/`422`) |
+| worker | `spool_corrupt` | unreadable spool lines (e.g. disk corruption) |
+| control-plane | `queue_overflow` | cluster: PostgreSQL unreachable while more than the in-memory telemetry queue accumulated |
+| control-plane | `batch_too_large` | a batch with more than 1,000 records |
+
+Worker counters are `aegis_dp_flows_dropped_total{reason}` and are also reported in the heartbeat. Per worker they
+appear under **Settings → Data planes** and as `aegis_dataplane_flows_dropped_total{dataplane,reason}` /
+`aegis_dataplane_flow_backlog{dataplane}` on the control-plane. The control-plane's own counter is
+`aegis_flows_dropped_total{reason}`; refused batches are counted in `aegis_flow_batches_refused_total`. The posture
+check *Traffic records delivered completely* warns while any of these counters is above zero.
+
+**Control-plane outage.** Workers keep enforcing the last policy and queue records. Without a spool, at most
+20,000 records per worker are kept, which is minutes on a busy worker. Enable the spool for an outage budget
+(about 1 KiB per record: 256 MiB holds roughly 250,000 records). After `AEGIS_POLICY_MAX_AGE`, workers fail closed
+([configuration](configuration.md#data-plane-mitmproxy-worker)).
+
+### Connection termination on revocation
+
+Workers track long-lived connections (requests in progress, SSE and other streamed responses, WebSockets, CONNECT
+tunnels, TLS passthrough and raw relays). They evaluate them again after every policy or threat-intel update, when a
+rule, TLS exception or learning session expires, and when the policy becomes stale. A connection that is no longer
+allowed is closed. Reasons: server quarantined, threat intelligence, TLS exception revoked, rule revoked or blocked,
+learning session ended, redirect grant expired, group membership changed, raw TCP disabled, or policy stale. The
+closure is recorded as a traffic record with flag `CONNECTION_TERMINATED:<reason>` (block reason
+`connection_terminated`), raises a security event, and is counted in
+`aegis_dp_connections_terminated_total{kind,reason}`. The client's whole connection is closed, so other HTTP/2
+streams multiplexed on it are reset as well. A WebSocket message that arrives after the revocation is dropped and
+not forwarded.
 
 ## Audit trail
 
