@@ -27,7 +27,8 @@ const (
 // withWrite runs fn as one atomic configuration mutation.
 //
 // Single node (file backend): fn runs under the store mutex and the state is persisted
-// asynchronously. Cluster (PostgreSQL): the cluster-wide write lock is taken first, the local
+// asynchronously; while the audit log cannot be written nothing is changed (ErrAuditUnavailable).
+// Cluster (PostgreSQL): the cluster-wide write lock is taken first, the local
 // configuration is refreshed if another replica committed a newer revision, fn runs, and the
 // result is committed synchronously. If the commit fails the local state is restored from
 // storage and the error is returned to the caller — no acknowledged write is ever lost.
@@ -35,6 +36,9 @@ func (s *Store) withWrite(fn func() error) error {
 	if s.cluster == nil {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if err := s.auditWritableLocked(); err != nil {
+			return err
+		}
 		return fn()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), clusterWriteTimeout)
@@ -133,6 +137,9 @@ func (s *Store) configDocLocked() ([]byte, error) {
 
 // applyConfigDocLocked replaces the configuration while keeping local telemetry windows.
 func (s *Store) applyConfigDocLocked(doc []byte, rev uint64) error {
+	if err := requireSealedAuditSecrets(doc); err != nil {
+		return fmt.Errorf("cluster configuration: %w", err)
+	}
 	var cfg StateSnapshot
 	if err := json.Unmarshal(doc, &cfg); err != nil {
 		return fmt.Errorf("decode cluster configuration: %w", err)
@@ -176,8 +183,60 @@ func (s *Store) recompileSessionsLocked(ids map[string]bool) {
 	}
 }
 
+// importFileAuditTrailLocked copies the audit trail of a single-node installation into the cluster
+// (migration): every event of the audit log and its rotated generations, oldest first, then window
+// events the log missed. Events stored already (same ID) are skipped, so a repeated migration never
+// duplicates them.
+func (s *Store) importFileAuditTrailLocked(ctx context.Context, tx ClusterTx) (anchorScan, error) {
+	var sc anchorScan
+	batch := make([]models.AuditEvent, 0, 500)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		err := tx.ImportAudit(ctx, batch)
+		batch = batch[:0]
+		return err
+	}
+	missing := make(map[string]bool, len(s.state.AuditEvents))
+	for _, ev := range s.state.AuditEvents {
+		missing[ev.ID] = true
+	}
+	add := func(ev models.AuditEvent) error {
+		_ = sc.add(ev)
+		delete(missing, ev.ID)
+		if batch = append(batch, ev); len(batch) == cap(batch) {
+			return flush()
+		}
+		return nil
+	}
+	if sink := s.opts.AuditSink; sink != nil {
+		files, err := sink.snapshot()
+		if err != nil {
+			return sc, err
+		}
+		err = scanTrail(files, add)
+		closeTrail(files)
+		if err != nil {
+			return sc, err
+		}
+	}
+	for i := len(s.state.AuditEvents) - 1; i >= 0; i-- {
+		if ev := s.state.AuditEvents[i]; missing[ev.ID] {
+			if err := add(ev); err != nil {
+				return sc, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return sc, err
+	}
+	s.log.Info("imported the audit trail of the file storage", "events", sc.events)
+	return sc, nil
+}
+
 // initCluster loads (or atomically initializes) the shared configuration at start-up.
-func (s *Store) initCluster(seed func()) error {
+func (s *Store) initCluster(seed func() error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	tx, err := s.cluster.BeginWrite(ctx, 0)
@@ -195,16 +254,39 @@ func (s *Store) initCluster(seed func()) error {
 		}
 		s.log.Info("joined cluster", "backend", s.cluster.Name(), "node", s.cluster.NodeID(), "revision", s.state.Revision)
 	} else {
-		seed()
+		if err := seed(); err != nil {
+			return err
+		}
 		s.log.Info("initialized empty cluster storage", "backend", s.cluster.Name(), "node", s.cluster.NodeID())
 	}
 	fresh := tx.StoredDoc() == nil
-	if !fresh {
+	switch {
+	case !fresh:
 		audits, err := tx.RecentAudit(ctx, maxAuditEvents)
 		if err != nil {
 			return err
 		}
 		s.state.AuditEvents = audits
+	case s.importedFileState:
+		// Migration from file storage: the complete audit trail, not only the in-memory window.
+		sc, err := s.importFileAuditTrailLocked(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("import the audit trail of the file storage: %w", err)
+		}
+		audits, err := tx.RecentAudit(ctx, maxAuditEvents)
+		if err != nil {
+			return err
+		}
+		s.state.AuditEvents = audits
+		if s.state.AuditAnchor == "" {
+			s.establishAuditAnchorLocked(sc, false)
+		}
+	default:
+		var sc anchorScan
+		for i := len(s.state.AuditEvents) - 1; i >= 0; i-- {
+			_ = sc.add(s.state.AuditEvents[i])
+		}
+		s.establishAuditAnchorLocked(sc, false)
 	}
 	before, _ := s.configDocLocked()
 	s.pendingAudit = nil
@@ -225,8 +307,8 @@ func (s *Store) initCluster(seed func()) error {
 		s.log.Info("re-encrypting secrets with the current key", "secrets", reseal, "key_id", sealed.KeyID())
 	}
 	pending := s.pendingAudit
-	if fresh {
-		// Persist the complete seeded/imported audit history, oldest first (keeps seq order = chain order).
+	if fresh && !s.importedFileState {
+		// Persist the complete seeded audit history, oldest first (keeps seq order = chain order).
 		pending = append([]models.AuditEvent(nil), s.state.AuditEvents...)
 		slices.Reverse(pending)
 	}

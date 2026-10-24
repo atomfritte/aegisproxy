@@ -203,6 +203,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/simulate/request", s.authed(s.handleSimulateProxyRequest))
 	s.mux.HandleFunc("GET /api/audit/verify", s.authed(s.handleVerifyAudit))
 	s.mux.HandleFunc("GET /api/audit/export", s.authed(s.handleExportAudit))
+	s.mux.HandleFunc("POST /api/audit/retention", s.authed(s.handleAuditRetention))
 
 	// Identity administration
 	s.mux.HandleFunc("POST /api/users", s.authed(s.handleUpsertUser))
@@ -272,6 +273,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, msg)
 	case errors.Is(err, store.ErrSessionRecording):
 		writeError(w, http.StatusConflict, msg)
+	case errors.Is(err, store.ErrAuditUnavailable):
+		writeError(w, http.StatusServiceUnavailable, msg)
 	case strings.Contains(msg, "not found"):
 		writeError(w, http.StatusNotFound, msg)
 	case strings.Contains(msg, "already"):

@@ -178,10 +178,20 @@ func (s *Server) postureChecks() []PostureCheck {
 	}
 	add("audit-export", "governance", "Audit trail forwarded to a SIEM", pass(auditExport, "warn"), "",
 		"Add a log export destination with the audit stream (Settings → Integrations → Log export).", "docs/log-export.md")
+	audit := s.store.AuditStatus()
 	if n, err := s.store.VerifyAuditChain(); err != nil {
 		add("audit-chain", "governance", "Audit hash chain intact", "fail", err.Error(), "Investigate tampering; compare with the exported audit trail.", "docs/security.md")
+	} else if audit.LegacyEvents > 0 {
+		// Pre-2.1 events use the unkeyed hash; they are accepted only before the sealed cutover.
+		add("audit-chain", "governance", "Audit hash chain intact", "warn", itoa(n)+" events verified; "+itoa(audit.LegacyEvents)+" legacy events (pre-2.1, unkeyed hash) before the sealed cutover",
+			"Keep an archived copy of the legacy part of the trail (exported before the upgrade) as independent evidence.", "docs/operations.md#audit-trail")
 	} else {
 		add("audit-chain", "governance", "Audit hash chain intact", "pass", itoa(n)+" events verified", "", "")
+	}
+	if !audit.Writable {
+		// File storage refuses changes meanwhile; in a cluster the database stays the trail of record.
+		add("audit-log", "governance", "Audit log writable", pass(s.store.StorageName() != "file", "fail"), audit.Error,
+			"Free disk space or fix the audit log file (no symbolic link or FIFO); changes resume automatically.", "docs/operations.md#audit-trail")
 	}
 
 	// Detection

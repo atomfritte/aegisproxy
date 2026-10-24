@@ -567,5 +567,18 @@ func (s *Server) handleVerifyAudit(w http.ResponseWriter, r *http.Request, claim
 		s.log.Error("audit trail verification failed", "error", res.Error, "events", res.Events)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"valid": res.OK, "events_checked": res.Events, "error": res.Error,
-		"first_id": res.FirstID, "last_id": res.LastID, "legacy_events": res.Legacy, "scope": "complete"})
+		"first_id": res.FirstID, "last_id": res.LastID, "legacy_events": res.Legacy, "scope": "complete",
+		"starts_at_genesis": res.StartsAtGenesis, "head_matches": res.HeadMatches})
+}
+
+// handleAuditRetention re-seals the start of the trail after the operator removed old generations
+// (Super Admin; the remaining trail must verify, and the change is an audit event).
+func (s *Server) handleAuditRetention(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	res, err := s.store.ApplyAuditRetention(r.Context(), s.cfg.AuditLogPath, claims)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"valid": res.OK, "events_checked": res.Events, "first_id": res.FirstID,
+		"last_id": res.LastID, "starts_at_genesis": res.StartsAtGenesis})
 }

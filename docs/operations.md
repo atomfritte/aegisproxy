@@ -65,7 +65,7 @@ approvals policy set. SLA, assignment, comments, bulk review, extension and revo
 |---|---|---|
 | `GET /healthz` | control-plane | liveness |
 | `GET /readyz` | control-plane | state loaded + storage reachable; fails while draining |
-| `GET /metrics` | control-plane | HTTP metrics, logins, evaluations, flows by verdict, pending requests, open security events, threat-intel indicators and feed age, healthy data-planes (`AEGIS_METRICS_TOKEN`) |
+| `GET /metrics` | control-plane | HTTP metrics, logins, evaluations, flows by verdict, pending requests, open security events, threat-intel indicators and feed age, healthy data-planes, audit log writable (`AEGIS_METRICS_TOKEN`) |
 | `GET :9091/healthz`, `/readyz` | data-plane | liveness / policy loaded |
 | `GET :9091/metrics` | data-plane | flows by verdict, AV scans and duration, clamd availability, YARA and ICAP scans and duration, policy revision and sync age, telemetry queue |
 | `GET /api/system/posture` | control-plane | security posture score and checks ([below](#security-posture)) |
@@ -83,6 +83,9 @@ Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prom
 - `aegis_access_requests_pending > 0` for more than one business day
 - `aegis_export_spool_bytes > 0` for 15 minutes or `increase(aegis_export_records_dropped_total[1h]) > 0`
   (a log export destination is unreachable or rejecting records)
+- `aegis_audit_log_writable == 0` — the audit log cannot be written (disk full, replaced file); with file
+  storage configuration changes are refused until it recovers ([audit trail](#audit-trail); not yet part of the
+  shipped `PrometheusRule`)
 
 Logs are structured JSON (`AEGIS_LOG_FORMAT=json`). Audit events are written as `msg="audit"` log lines and to
 `audit.jsonl`. To forward audit, traffic ("browsing") and security records to a SIEM or observability platform
@@ -95,39 +98,70 @@ Every administrative action is an audit event (actor, role, action, category, en
 state, affected groups) linked into a hash chain (`prev_hash`, `event_hash`). Since 2.1 each `event_hash` is an
 HMAC-SHA256 (`hash_version: 2`) over a length-prefixed encoding of the event, keyed with a random per-installation
 audit chain key that is stored encrypted with `AEGIS_ENCRYPTION_KEY`: somebody with write access to the database or
-the state file alone cannot recompute a valid chain after changing, inserting or deleting events. Events written
-before 2.1 keep their SHA-256 hash (`hash_version` absent) and stay verifiable. The console keeps the latest 2,000 events in memory;
-the complete trail lives in `audit.jsonl` (file mode) or the `aegis_audit` table (cluster mode, never deleted
-automatically).
+the state file alone cannot recompute a valid chain after changing, inserting or deleting events. A configuration
+whose audit chain key (or anchor, below) is stored unencrypted was modified outside AegisProxy: the control-plane
+refuses to start with it. The console keeps the latest 2,000 events in memory; the complete trail lives in
+`audit.jsonl` (file mode) or the `aegis_audit` table (cluster mode, never deleted automatically).
+
+**Trail anchor.** The configuration also holds a sealed *anchor* (encrypted, keyed with the audit chain key): the
+hash the trail starts from (genesis, or a retention point) and the end of the pre-2.1 prefix. Events written
+before 2.1 keep their unkeyed SHA-256 hash (`hash_version` absent) and stay verifiable — but only as that sealed
+prefix: an unkeyed event after the first keyed one, or anywhere in a trail that has no pre-2.1 prefix, fails the
+verification (a "hash-version downgrade": the unkeyed hash can be recomputed by anyone). The anchor is sealed at
+the first start of a release that has it: from the complete trail on upgrade (recorded as `AUDIT_ANCHOR_SEALED`),
+at initialization for new installations. During a rolling cluster upgrade, replicas of older releases drop it from
+the configuration when they write; it is sealed again (and audited again) once they are gone.
 
 | Endpoint | Content |
 |---|---|
-| `GET /api/audit/verify` | `{valid, events_checked, first_id, last_id, legacy_events[, error]}` — checks every hash and link of the **complete** trail (same sources as the export); Super Admin, InfoSec, Auditor |
-| `GET /api/audit/export` | the **complete** trail as JSON Lines, oldest first: cluster mode streams the `aegis_audit` table; file mode streams `audit.jsonl` including its rotated generations (`audit.jsonl-YYYYMMDD[.gz]`, `audit.jsonl-YYYYMMDDhhmmss[.gz]`, `audit.jsonl.N[.gz]`) in the same directory; without a file the in-memory window |
+| `GET /api/audit/verify` | `{valid, events_checked, first_id, last_id, legacy_events, starts_at_genesis, head_matches[, error]}` — checks every hash and link of the **complete** trail (same sources as the export), that it starts at its sealed origin, that unkeyed events occur only in the sealed pre-2.1 prefix, and that it reaches the newest event known to the control-plane (missing newest events or generations fail); Super Admin, InfoSec, Auditor |
+| `GET /api/audit/export` | the **complete** trail as JSON Lines, oldest first: cluster mode streams the `aegis_audit` table; file mode streams `audit.jsonl` and all its rotated generations (`audit.jsonl-YYYYMMDD[.gz]`, `audit.jsonl-YYYYMMDDhhmmss[.gz]`, `audit.jsonl.N[.gz]`) in the same directory — also while `audit.jsonl` itself is missing after a logrotate rename — as a consistent snapshot of the moment the export started |
+| `POST /api/audit/retention` | after you removed old generations (or `aegis_audit` rows) for retention: verifies the remaining trail and re-seals its start (Super Admin; recorded as `AUDIT_RETENTION_APPLIED`). Until then the verification reports the missing start |
 
 The export is streamed (no size limit, no write timeout) and is available to Super Admins, InfoSec Approvers and
-Auditors (Team Leads see only the audit events of their groups in the console). Offline, the links can be checked
-without a key: every event's `prev_hash` equals the `event_hash` of the event before it. Pre-2.1 events can also be
-recomputed as SHA-256 of `prev_hash|id|revision|timestamp (RFC 3339 with nanoseconds, UTC)|actor|actor_role|action|
-category|entity_type|entity_id|entity_name|summary|scope_groups (comma-joined)|before_state|after_state|rollback rule`;
-version-2 hashes need the audit chain key, so use `GET /api/audit/verify` (reference implementation:
-`computeAuditEventHash` in `control-plane/internal/store/audit.go`). Shipping the audit stream to a SIEM in real time
-gives you an independent copy to compare against.
+Auditors (Team Leads see only the audit events of their groups in the console). Generations are ordered by
+their content (the first event's revision and chain link), not by their names, so logrotate's local-date names,
+the built-in UTC names and clock steps cannot reorder the trail. Offline, the links can be checked without a
+key: every event's `prev_hash` equals the `event_hash` of the event before it, and the first event's `prev_hash`
+is 64 zeros. Pre-2.1 events can also be recomputed as SHA-256 of `prev_hash|id|revision|timestamp (RFC 3339 with
+nanoseconds, UTC)|actor|actor_role|action|category|entity_type|entity_id|entity_name|summary|scope_groups
+(comma-joined)|before_state|after_state|rollback rule`; version-2 hashes need the audit chain key, so use
+`GET /api/audit/verify` (reference implementation: `computeAuditEventHash` in
+`control-plane/internal/store/audit.go`). Shipping the audit stream to a SIEM in real time gives you an
+independent copy to compare against — the only defence against somebody who controls the server and replaces
+state, key and trail together.
+
+**Durability (file mode).** Every event is written and flushed (`fsync`) to `audit.jsonl` before the change is
+acknowledged; the state file follows within a second. After a crash in between, the next start adopts the events
+that reached the log but not the state into the trail and records `AUDIT_TRAIL_RECOVERED` (their configuration
+changes were not saved and are not in effect); events that reached the state but not the log are appended to the
+log. A failed or partial write (disk full) is cut off again — the log never keeps a torn line — and while the log
+cannot be written the control-plane refuses configuration changes with HTTP 503 (`audit log unavailable`); the
+posture check *Audit log writable* fails, `aegis_audit_log_writable` is 0 and `/readyz` reports
+`"audit_log": "unavailable"` (reads and policy distribution continue). Changes resume, and the log is completed,
+as soon as it can be written again. The audit log and its generations must be regular files: a symbolic link or
+FIFO at their names is refused (point `AEGIS_AUDIT_LOG` at the real location instead of linking it).
 
 Rotation works on every platform without losing events:
 
 * **Built in (all platforms, default):** when `audit.jsonl` reaches `AEGIS_AUDIT_ROTATE_MB` (default 256 MB) the
   control-plane renames it to `audit.jsonl-YYYYMMDDhhmmss` (UTC) and continues in a new file. Older generations
   are gzip-compressed one rotation later (like logrotate's `delaycompress`, so a log shipper can finish reading the
-  newest one). Rotation waits while an export or verification is reading the generations. This is the only
-  rotation on Windows, which cannot rename a file another process holds open, and in containers.
+  newest one); an existing generation, compressed or not, is never overwritten. An export or verification never
+  delays rotation or compression: it reads from the files it opened at its start. This is the only rotation on
+  Windows, which cannot rename a file another process holds open, and in containers.
 * **logrotate (Linux package, `deploy/systemd/aegis.logrotate`):** additionally rotates monthly by **renaming**
   (`dateext`, `nocreate`); the control-plane notices the rename and continues in a new file on the next event.
   Earlier releases used `copytruncate`, which could lose lines written during rotation.
 
 Rotated generations are **never deleted** by AegisProxy: keep them for your retention period (the export and the
-verification include them) and archive or delete them according to your retention policy. Set
-`AEGIS_AUDIT_ROTATE_MB=0` only if an external tool rotates the file.
+verification include them). To delete old generations according to your retention policy, remove the oldest ones
+and call `POST /api/audit/retention`; deleting them without it makes the verification fail. Set
+`AEGIS_AUDIT_ROTATE_MB=0` only if an external tool rotates the file. Deleting `aegis_state.json` while keeping the
+audit log starts a new chain (with a new key) behind the old one, which then no longer verifies: archive
+`audit.jsonl*` before such a reset. Migrating from file to cluster storage imports the complete trail (audit log
+with all generations, plus events only the state held) into `aegis_audit`; events already stored are skipped, so a
+repeated migration does not duplicate them.
 
 ## Security posture
 
@@ -146,7 +180,7 @@ Score: every `pass` counts 2 points, `warn` 1 and `fail` 0 out of 2; `info` chec
 | platform | HTTPS for console and API · demo mode off · `/metrics` protected · interception CA validity (warn < 90 days, fail < 30 days) · data-plane workers reporting |
 | data | secrets encrypted at rest |
 | identity | bootstrap password file removed · SSO enabled · password login limited to break-glass accounts · 2–5 Super Admins · 1–2 break-glass accounts · no accounts unused for 90 days · no service-account key expiring within 14 days · service accounts restricted to source networks |
-| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM · audit hash chain intact |
+| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM · audit hash chain intact (warn while legacy pre-2.1 events exist) · audit log writable (shown when it is not) |
 | detection | threat intelligence in `block` mode · downloads scanned (ClamAV, ICAP or YARA) · DLP active · threat-intel sources up to date |
 
 ## Backup and restore
