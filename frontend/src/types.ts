@@ -1413,6 +1413,9 @@ export interface CAInfo {
   download_crt: string;
   download_pem: string;
   download_der: string;
+  /** SHA-256 (hex) of the served PEM / DER files, e.g. for Dockerfile `ADD --checksum`. */
+  pem_sha256?: string;
+  der_sha256?: string;
   linux_script: string;
   windows_script?: string;
   public_url?: string;

@@ -123,6 +123,7 @@ export const RootCaCard: React.FC = () => {
                 <div className="text-[13px] font-semibold text-fg">Install on servers</div>
                 <p className="mt-0.5 text-[12.5px] leading-5 text-fg-muted">
                   Each command checks the installer against its SHA-256 before running it; the installer then verifies the fingerprint above before adding the CA to the system trust store.
+                  Copy the commands from this console over https: they are only as trustworthy as the connection that delivered them.
                 </p>
               </div>
               <CodeBlock title="Linux (run as root)" code={cmds.linux} wrap />

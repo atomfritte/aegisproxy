@@ -51,9 +51,13 @@ if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '<windows_script_sha256 from th
 powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
-Both installers pin the CA by its SHA-256 fingerprint (shown in the console under **TLS & CA**). Copy the
-commands from the console over https: with a plain-http `AEGIS_PUBLIC_URL` the script hash is the only
-protection against a script altered in transit (the Linux installer prints a warning in that case).
+Both installers pin the CA by its SHA-256 fingerprint (shown in the console under **TLS & CA**). They refuse a
+download that holds more than the one pinned certificate (an extra root in a PEM bundle, PKCS#7 or PFX), and
+they add only the verified certificate to the trust store, never the downloaded file. Copy the commands from
+the console over https: with a plain-http `AEGIS_PUBLIC_URL` the script hash is the only protection against
+a script altered in transit (both installers print a warning in that case). For other tooling,
+`GET /api/public/ca/info` also returns `pem_sha256` and `der_sha256`, the SHA-256 of the exact download files
+(e.g. for a Dockerfile `ADD --checksum=sha256:…`).
 For larger fleets distribute the CA and proxy settings with configuration management (Ansible, GPO, Intune,
 cloud-init).
 

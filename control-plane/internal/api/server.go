@@ -52,6 +52,9 @@ type Server struct {
 	proxyHosts   *proxyHostSet
 	caLimit      *rateLimiter
 
+	untrustedProxies sync.Map // forwarding peers already reported as not trusted (throttle.go)
+	untrustedWarned  atomic.Int64
+
 	sseMu      sync.Mutex
 	sseClients int
 	ssePerUser map[string]int
@@ -105,7 +108,7 @@ func NewServer(d Deps) *Server {
 		ssePerUser:   make(map[string]int),
 	}
 	if d.Config != nil {
-		s.proxyHosts = newProxyHostSet(d.Config.TrustedProxyHosts, s.log)
+		s.proxyHosts = newProxyHostSet(d.Config.TrustedProxyHosts, s.log, s.metrics)
 	}
 	s.routes()
 	s.handler = s.middleware(http.HandlerFunc(s.serveMux))

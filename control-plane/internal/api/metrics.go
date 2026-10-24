@@ -109,6 +109,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.store.AuditStatus().Writable {
 		writable = 1
 	}
+	for _, st := range s.proxyHosts.hostStatus() {
+		fmt.Fprintf(w, "%s %d\n", seriesKey("aegis_trusted_proxy_host_addresses", "host", st.host), st.addrs)
+		fmt.Fprintf(w, "%s %g\n", seriesKey("aegis_trusted_proxy_host_lookup_age_seconds", "host", st.host), st.age)
+	}
 	gauge("aegis_audit_log_writable", "1 while the audit log can be written (file storage refuses changes otherwise).", writable)
 	if ti := s.store.ThreatIntel(); ti != nil {
 		st := ti.Snapshot().Status()

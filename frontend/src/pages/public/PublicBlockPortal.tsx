@@ -538,7 +538,10 @@ export const PublicBlockPortal: React.FC<Props> = ({ meta, prefill = null, onSwi
                         <code className="min-w-0 flex-1 break-all rounded-md border border-border bg-surface-2 px-2 py-1.5 font-mono text-[11px] leading-[18px] text-fg">{ca.fingerprint}</code>
                         <CopyButton text={ca.fingerprint} label="Copy fingerprint" />
                       </div>
-                      <p className="mt-1.5 text-[11.5px] leading-[18px] text-fg-subtle">Compare it with the value in the {product} console before trusting the certificate.</p>
+                      <p className="mt-1.5 text-[11.5px] leading-[18px] text-fg-subtle">
+                        Compare it with the value in the {product} console, opened over https, before trusting the certificate: a value on this page is only as trustworthy as the
+                        connection that delivered it.
+                      </p>
                     </div>
                   </div>
                 ) : (
@@ -568,6 +571,7 @@ export const PublicBlockPortal: React.FC<Props> = ({ meta, prefill = null, onSwi
               </div>
               <div className="border-t border-border p-5">
                 <p className="text-[13px] font-semibold text-fg">Import guide</p>
+                <p className="mt-0.5 text-[11.5px] leading-[18px] text-fg-subtle">Every command trusts the certificate only after its fingerprint matched the value from the console.</p>
                 <div className="mt-2 flex flex-wrap gap-1.5" role="tablist" aria-label="Platform">
                   {TRUST_OS.map((t) => (
                     <button

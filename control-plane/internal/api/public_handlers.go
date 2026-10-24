@@ -72,6 +72,7 @@ func (s *Server) handlePublicCAInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cmds := s.caInstallCommands()
+	pemSum, derSum := sha256.Sum256(s.caMgr.CertPEM), sha256.Sum256(s.caMgr.CertDER)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subject":               s.caMgr.Subject,
 		"issuer":                s.caMgr.Issuer,
@@ -84,6 +85,8 @@ func (s *Server) handlePublicCAInfo(w http.ResponseWriter, r *http.Request) {
 		"download_crt":          "/api/public/ca/aegis-ca.crt",
 		"download_pem":          "/api/public/ca/aegis-ca.pem",
 		"download_der":          "/api/public/ca/aegis-ca.der",
+		"pem_sha256":            hex.EncodeToString(pemSum[:]), // of the served files (Dockerfile ADD --checksum)
+		"der_sha256":            hex.EncodeToString(derSum[:]),
 		"linux_script":          "/api/public/ca/install-linux.sh",
 		"windows_script":        "/api/public/ca/install-windows.ps1",
 		"linux_script_sha256":   cmds.LinuxSHA256,
@@ -167,16 +170,30 @@ set -euo pipefail
 %[4]s
 EXPECTED_FP='%[1]s'
 CA_URL=%[2]s
-TMP_CA="$(mktemp /tmp/aegis-ca.XXXXXX.crt)"
-trap 'rm -f "$TMP_CA"' EXIT
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "[!] Please run as root (sudo)." >&2
     exit 1
 fi
 
+TMP_DIR="$(mktemp -d /tmp/aegis-ca.XXXXXX)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+DOWNLOAD="$TMP_DIR/download.crt"
+TMP_CA="$TMP_DIR/aegis-enterprise-ca.crt"
+
 echo "[*] Downloading AegisProxy Enterprise Root CA (expected SHA-256: $EXPECTED_FP)..."
-curl -fsSL --proto '=https,http' --max-time 30 "$CA_URL" -o "$TMP_CA"
+curl -fsSL --proto '=https,http' --max-time 30 "$CA_URL" -o "$DOWNLOAD"
+
+# Exactly one certificate: a download carrying a second (attacker) root next to the pinned one is
+# refused, and only the verified certificate - re-encoded by openssl, nothing else from the
+# download - is installed.
+PEM_BLOCKS="$(grep -c -- '-----BEGIN' "$DOWNLOAD" || true)"
+PARSED="$(openssl crl2pkcs7 -nocrl -certfile "$DOWNLOAD" 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null | grep -c '^subject' || true)"
+if [ "$PEM_BLOCKS" != "1" ] || [ "$PARSED" != "1" ] || ! grep -q -- '-----BEGIN CERTIFICATE-----' "$DOWNLOAD"; then
+    echo "[!] SECURITY ERROR: the download must contain exactly one certificate (found $PEM_BLOCKS PEM blocks, $PARSED certificates)." >&2
+    exit 1
+fi
+openssl x509 -in "$DOWNLOAD" -out "$TMP_CA"
 
 ACTUAL_FP="$(openssl x509 -noout -fingerprint -sha256 -in "$TMP_CA" | awk -F= '{print $2}')"
 if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then
@@ -227,6 +244,14 @@ echo "[+] Done! All SSL/TLS traffic via AegisProxy is now trusted."
 func (s *Server) windowsInstallScript() string {
 	fp := strings.ReplaceAll(s.caMgr.Fingerprint, ":", "")
 	caURL := strings.ReplaceAll(s.cfg.PublicURL+"/api/public/ca/aegis-ca.der", "'", "''")
+	insecure := ""
+	if strings.HasPrefix(strings.ToLower(s.cfg.PublicURL), "http://") {
+		insecure = `
+# WARNING: AEGIS_PUBLIC_URL uses plain http, so this script can be altered in transit. Run it only
+# after its SHA-256 matched the value shown in the AegisProxy console.
+Write-Warning 'This installer was served over plain http (AEGIS_PUBLIC_URL); make sure its SHA-256 matched the console value.'
+`
+	}
 	script := fmt.Sprintf(`#Requires -RunAsAdministrator
 # AegisProxy Enterprise Root CA - Windows Server Trust Installer
 # Usage (elevated PowerShell): never pipe it into iex. Download it, compare its SHA-256 with the value
@@ -238,19 +263,38 @@ func (s *Server) windowsInstallScript() string {
 $ErrorActionPreference = 'Stop'
 $ExpectedFingerprint = '%s'
 $CaUrl = '%s'
-
+%s
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 $tmp = Join-Path $env:TEMP ("aegis-ca-" + [guid]::NewGuid().ToString() + ".cer")
 try {
     Write-Host "[*] Downloading AegisProxy Enterprise Root CA..."
     Invoke-WebRequest -UseBasicParsing -Uri $CaUrl -OutFile $tmp
-    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($tmp)
+    # The .der download must be byte for byte the pinned certificate (its SHA-256 is the CA fingerprint), so
+    # trailing data, a PEM bundle, or a PKCS#7/PFX carrying a second (attacker) root is refused; only the
+    # verified certificate - not the downloaded file - is added to the store.
+    $bytes = [IO.File]::ReadAllBytes($tmp)
     $sha = [System.Security.Cryptography.SHA256]::Create()
+    $download = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+    if ($download -ne $ExpectedFingerprint) {
+        throw "SECURITY ERROR: the download (SHA-256 $download) is not the pinned CA certificate $ExpectedFingerprint"
+    }
+    $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($bytes)
+    if ("$type" -ne 'Cert') {
+        throw "SECURITY ERROR: the download must be a single certificate, not $type"
+    }
+    $all = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    $all.Import($bytes)
+    if ($all.Count -ne 1) {
+        throw "SECURITY ERROR: the download must contain exactly one certificate (found $($all.Count))"
+    }
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$bytes)
     $actual = ([BitConverter]::ToString($sha.ComputeHash($cert.RawData))).Replace('-', '')
     if ($actual -ne $ExpectedFingerprint) {
         throw "SECURITY ERROR: CA fingerprint $actual does not match expected $ExpectedFingerprint"
     }
-    Import-Certificate -FilePath $tmp -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+    try { $store.Add($cert) } finally { $store.Close() }
     Write-Host "[+] Installed into Cert:\LocalMachine\Root ($($cert.Subject))"
 
     # PEM copy for runtimes with their own trust store (Node.js, Python certifi, Java keytool import). The file is
@@ -288,7 +332,7 @@ try {
 } finally {
     Remove-Item -Force -ErrorAction SilentlyContinue $tmp
 }
-`, s.cfg.PublicURL, fp, caURL)
+`, s.cfg.PublicURL, fp, caURL, insecure)
 	return script
 }
 

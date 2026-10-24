@@ -495,8 +495,9 @@ paths:
       operationId: getLinuxCAInstallScript
       summary: Linux CA trust installer
       description: |
-        Bash script that downloads the CA from `AEGIS_PUBLIC_URL`, verifies its pinned SHA-256
-        fingerprint and installs it into the Debian/Ubuntu/Alpine, RHEL/Fedora or SLES trust store, and
+        Bash script that downloads the CA from `AEGIS_PUBLIC_URL`, refuses a download that is not exactly
+        one certificate, verifies its pinned SHA-256 fingerprint and installs only that certificate
+        (re-encoded by openssl) into the Debian/Ubuntu/Alpine, RHEL/Fedora or SLES trust store, and
         sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `NODE_EXTRA_CA_CERTS`.
         Never pipe it into a shell: use `linux_command` from `/api/public/ca/info` (shown in the console),
         which downloads the script, checks it against `linux_script_sha256` and only then runs it with sudo.
@@ -517,7 +518,8 @@ paths:
       operationId: getWindowsCAInstallScript
       summary: Windows CA trust installer
       description: |
-        PowerShell script (run elevated) that verifies the pinned fingerprint, imports the CA into
+        PowerShell script (run elevated) that refuses a download that is not byte for byte the pinned
+        DER certificate (PKCS#7 bundles, PFX, PEM, trailing data), adds only that certificate to
         `Cert:\LocalMachine\Root`, writes a PEM copy for Node.js and optionally (`$env:AEGIS_PROXY`)
         configures the WinHTTP and machine-wide proxy. Served as `text/plain` (`Content-Disposition:
         inline; filename="install-windows.ps1"`). Never pipe it into `iex`: use `windows_command` from
@@ -5883,7 +5885,7 @@ components:
               type: boolean
     CAInfo:
       type: object
-      required: [subject, issuer, serial, not_before, not_after, fingerprint, pem_content, public_url, download_crt, download_pem, download_der, linux_script, windows_script, linux_script_sha256, windows_script_sha256, linux_command, windows_command]
+      required: [subject, issuer, serial, not_before, not_after, fingerprint, pem_content, public_url, download_crt, download_pem, download_der, pem_sha256, der_sha256, linux_script, windows_script, linux_script_sha256, windows_script_sha256, linux_command, windows_command]
       properties:
         subject:
           type: string
@@ -5911,6 +5913,12 @@ components:
           type: string
         download_der:
           type: string
+        pem_sha256:
+          type: string
+          description: SHA-256 (hex) of the served PEM file (`aegis-ca.crt` / `aegis-ca.pem`), e.g. for `ADD --checksum` in a Dockerfile. Compare values with the console over https.
+        der_sha256:
+          type: string
+          description: SHA-256 (hex) of the served DER file (`aegis-ca.der`).
         linux_script:
           type: string
         windows_script:

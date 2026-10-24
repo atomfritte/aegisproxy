@@ -26,6 +26,23 @@ var (
 	usernameRe            = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,63}$`)
 )
 
+// IsBreakGlassUsername reports whether username names an enabled break-glass account; sign-in
+// throttling locks those per source address instead of for everyone.
+func (s *Store) IsBreakGlassUsername(username string) bool {
+	username = strings.ToLower(strings.TrimSpace(username))
+	if !usernameRe.MatchString(username) {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, u := range s.state.Users {
+		if u.Username == username {
+			return u.BreakGlass && !u.Disabled
+		}
+	}
+	return false
+}
+
 // AuthenticateLocal verifies local credentials in constant time with respect to account
 // existence and transparently upgrades outdated password hashes.
 func (s *Store) AuthenticateLocal(username, password string) (*models.User, error) {

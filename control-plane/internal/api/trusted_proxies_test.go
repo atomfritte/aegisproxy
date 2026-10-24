@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +83,66 @@ func TestTrustedProxyHosts(t *testing.T) {
 	var none *proxyHostSet
 	if none.contains(netip.MustParseAddr("10.0.0.1")) {
 		t.Fatal("no hosts configured must trust nothing")
+	}
+}
+
+// A failing lookup keeps only that host's previous addresses, and only for a bounded time: an address
+// recycled for another pod must not stay trusted forever while DNS is broken.
+func TestTrustedProxyHostsExpireWhileLookupsFail(t *testing.T) {
+	answers := map[string][]netip.Addr{
+		"console.aegis.svc.cluster.local":         {netip.MustParseAddr("10.244.1.17")},
+		"ingress.ingress-nginx.svc.cluster.local": {netip.MustParseAddr("10.244.9.9")},
+	}
+	failing := map[string]bool{}
+	m := NewMetrics()
+	p := &proxyHostSet{hosts: []string{"console.aegis.svc.cluster.local", "ingress.ingress-nginx.svc.cluster.local"}, refresh: time.Hour,
+		maxStale: 5 * time.Minute, metrics: m, addrs: map[netip.Addr]bool{},
+		lookup: func(_ context.Context, h string) ([]netip.Addr, error) {
+			if failing[h] {
+				return nil, errors.New("SERVFAIL")
+			}
+			return answers[h], nil
+		}}
+	p.resolve()
+	has := func(a string) bool { p.mu.Lock(); defer p.mu.Unlock(); return p.addrs[netip.MustParseAddr(a)] }
+
+	failing["console.aegis.svc.cluster.local"] = true
+	answers["ingress.ingress-nginx.svc.cluster.local"] = []netip.Addr{netip.MustParseAddr("10.244.9.10")}
+	p.resolve()
+	if !has("10.244.1.17") || !has("10.244.9.10") || has("10.244.9.9") {
+		t.Fatal("a failing host must keep its own addresses while the other host is updated")
+	}
+	p.mu.Lock()
+	p.state["console.aegis.svc.cluster.local"].lastOK = time.Now().Add(-6 * time.Minute)
+	p.mu.Unlock()
+	p.resolve()
+	if has("10.244.1.17") {
+		t.Fatal("addresses of a host whose lookups fail longer than maxStale must expire")
+	}
+	if !has("10.244.9.10") {
+		t.Fatal("the healthy host must stay trusted")
+	}
+	var b strings.Builder
+	m.write(&b)
+	if !strings.Contains(b.String(), `aegis_trusted_proxy_host_expired_total{host="console.aegis.svc.cluster.local"} 1`) {
+		t.Fatalf("expiry not counted:\n%s", b.String())
+	}
+	st := p.hostStatus()
+	if len(st) != 2 || st[0].addrs != 0 || st[1].addrs != 1 || st[1].age < 0 {
+		t.Fatalf("host status %+v", st)
+	}
+}
+
+// Qualified names are resolved as absolute names: with Kubernetes' ndots:5 a relative lookup would try
+// the node's DNS search domains first, where somebody else may publish the same name.
+func TestTrustedProxyHostNamesAreAbsolute(t *testing.T) {
+	for in, want := range map[string]string{
+		"aegis-console-headless.aegis.svc.cluster.local": "aegis-console-headless.aegis.svc.cluster.local.",
+		"lb.example.": "lb.example.",
+		"console":     "console", // single label: Docker Compose service names use the search list
+	} {
+		if got := absoluteName(in); got != want {
+			t.Errorf("absoluteName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

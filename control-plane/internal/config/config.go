@@ -71,7 +71,8 @@ type Config struct {
 	CORSOrigins    []string
 	TrustedProxies []netip.Prefix
 	// TrustedProxyHosts are DNS names (e.g. a headless Service of the console pods) whose current
-	// addresses are trusted like TrustedProxies.
+	// addresses are trusted like TrustedProxies. Names with a dot are resolved as absolute names (never
+	// below the DNS search domains); stored without the trailing dot.
 	TrustedProxyHosts []string
 	InternalSuffix    []string
 
