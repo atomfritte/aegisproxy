@@ -46,6 +46,9 @@ type ClusterTx interface {
 	StoredRevision() uint64
 	// RecentAudit reads the audit window inside the locked transaction.
 	RecentAudit(ctx context.Context, limit int) ([]models.AuditEvent, error)
+	// ImportAudit appends existing audit events (migration from file storage) in the given order,
+	// skipping events whose ID is stored already.
+	ImportAudit(ctx context.Context, audits []models.AuditEvent) error
 	Commit(ctx context.Context, doc []byte, rev uint64, audits []models.AuditEvent) error
 	Rollback(ctx context.Context)
 }

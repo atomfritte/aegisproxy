@@ -90,6 +90,9 @@ type StateSnapshot struct {
 	YaraRuleSets []models.YaraRuleSet `json:"yara_rule_sets"`
 	// AuditChainKey keys the audit hash chain (hex, sealed at rest); never exposed by the API.
 	AuditChainKey sealed.String `json:"audit_chain_key,omitempty"`
+	// AuditAnchor seals where the audit trail starts and where its unkeyed pre-2.1 prefix ends
+	// (JSON keyed with the audit chain key, sealed at rest); never exposed by the API.
+	AuditAnchor sealed.String `json:"audit_anchor,omitempty"`
 	// SSOClientKeys authenticate the console to the IdP with private_key_jwt (private keys sealed).
 	SSOClientKeys []models.SSOClientKey `json:"sso_client_keys,omitempty"`
 	// SCIM configures inbound provisioning (token digests only); SCIMGroups are the pushed groups.
@@ -144,6 +147,10 @@ type Store struct {
 	seenFlows    seenSet
 
 	importedTelemetry bool
+	importedFileState bool // the cluster was initialized from a single-node state file
+	// auditIntegrityErr is set at start-up when the audit trail cannot be trusted (state and audit log
+	// diverged, invalid anchor); verification and the posture check report it.
+	auditIntegrityErr string
 	closed            chan struct{}
 	closeOnce         sync.Once
 	persistWG         sync.WaitGroup
@@ -198,6 +205,9 @@ func NewStore(opts Options) (*Store, error) {
 		if err := s.loadClusterTelemetry(); err != nil {
 			return nil, fmt.Errorf("load telemetry from cluster storage: %w", err)
 		}
+		if err := s.ensureClusterAuditAnchor(); err != nil {
+			s.log.Error("could not seal the audit trail anchor", "error", err)
+		}
 		s.mu.Lock()
 		for _, f := range s.state.Flows {
 			s.traffic.add(f)
@@ -223,14 +233,17 @@ func NewStore(opts Options) (*Store, error) {
 
 // seedClusterLocked initializes an empty cluster: an existing single-node state file is imported
 // (migration path from file storage), otherwise a fresh production or demo state is seeded.
-func (s *Store) seedClusterLocked() {
+func (s *Store) seedClusterLocked() error {
 	if data, err := os.ReadFile(s.filePath); err == nil && len(data) > 0 {
 		var legacy StateSnapshot
 		if err := json.Unmarshal(data, &legacy); err == nil {
+			if err := requireSealedAuditSecrets(data); err != nil {
+				return fmt.Errorf("state file %s: %w", s.filePath, err)
+			}
 			s.state = legacy
-			s.importedTelemetry = true
+			s.importedTelemetry, s.importedFileState = true, true
 			s.log.Warn("imported existing file state into cluster storage — keep the file as backup, it is no longer used", "path", s.filePath)
-			return
+			return nil
 		}
 	}
 	s.state = StateSnapshot{SchemaVersion: currentSchemaVersion}
@@ -240,6 +253,7 @@ func (s *Store) seedClusterLocked() {
 		s.seedProduction()
 	}
 	s.importedTelemetry = true
+	return nil
 }
 
 // Close flushes pending state to disk and stops the persistence loop.
@@ -357,6 +371,7 @@ func (s *Store) asyncDiskPersistLoop() {
 			return
 		}
 		s.persist(false)
+		s.retryAuditSink()
 	}
 }
 
@@ -433,8 +448,12 @@ func writeStateFile(path string, data []byte) error {
 func (s *Store) loadOrSeed() error {
 	staleBefore := sealed.StaleCount()
 	data, err := os.ReadFile(s.filePath)
+	existing := err == nil && len(data) > 0
 	switch {
-	case err == nil && len(data) > 0:
+	case existing:
+		if err := requireSealedAuditSecrets(data); err != nil {
+			return fmt.Errorf("state file %s: %w", s.filePath, err)
+		}
 		if err := json.Unmarshal(data, &s.state); err != nil {
 			return fmt.Errorf("state file %s is corrupt (%v); restore %s.bak or move it away to start fresh", s.filePath, err, s.filePath)
 		}
@@ -451,6 +470,12 @@ func (s *Store) loadOrSeed() error {
 	default:
 		return fmt.Errorf("read state: %w", err)
 	}
+	// Before anything appends to the chain: line up the audit log with the loaded state and seal or
+	// check the trail anchor.
+	if existing {
+		s.reconcileAuditTrailLocked()
+	}
+	s.ensureFileAuditAnchorLocked(existing)
 
 	s.migrateLocked()
 	if err := s.ensureBootstrapAdminLocked(); err != nil {
@@ -471,6 +496,9 @@ func (s *Store) loadOrSeed() error {
 	if n := sealed.StaleCount() - staleBefore; n > 0 {
 		s.log.Info("re-encrypting secrets with the current key", "secrets", n, "key_id", sealed.KeyID())
 	}
+	if err := s.syncAuditSinkLocked(); err != nil { // seeded events never went through the sink
+		s.log.Error("audit log could not be completed", "error", err)
+	}
 	s.dirty = true // always rewritten at start: migrations and re-encryption after a key rotation
 	s.persistNow()
 	return nil
@@ -484,9 +512,15 @@ func (s *Store) syncExportLocked() {
 	s.opts.Exporter.Apply(s.state.ExportSinks)
 }
 
-// emitAudit writes a committed audit event to the local JSONL sink and the log exporter.
+// emitAudit writes a committed audit event to the local JSONL sink and the log exporter. With file
+// storage the audit log is the trail of record: it receives every window event it is missing (after
+// a failed write too), and a write failure makes the store refuse further changes (withWrite).
 func (s *Store) emitAudit(ev models.AuditEvent) {
-	s.opts.AuditSink.Write(ev)
+	if s.cluster == nil {
+		_ = s.syncAuditSinkLocked()
+	} else {
+		_ = s.opts.AuditSink.Write(ev)
+	}
 	s.opts.Exporter.Publish(export.AuditEvent(ev))
 }
 

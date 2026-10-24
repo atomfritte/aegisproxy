@@ -228,6 +228,23 @@ func queryAudit(ctx context.Context, q pgQuerier, limit int) ([]models.AuditEven
 	return out, rows.Err()
 }
 
+func (t *pgTx) ImportAudit(ctx context.Context, audits []models.AuditEvent) error {
+	batch := &pgx.Batch{}
+	for _, ev := range audits {
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		batch.Queue(`INSERT INTO aegis_audit (id, ts, actor, action, category, event_hash, prev_hash, node_id, doc)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
+			ev.ID, ev.Timestamp, ev.Actor, ev.Action, ev.Category, ev.EventHash, ev.PrevHash, t.b.nodeID, raw)
+	}
+	if err := t.tx.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("import audit events: %w", err)
+	}
+	return nil
+}
+
 func (t *pgTx) Commit(ctx context.Context, doc []byte, rev uint64, audits []models.AuditEvent) error {
 	if rev <= t.rev {
 		return fmt.Errorf("refusing to commit non-increasing revision %d (stored %d)", rev, t.rev)

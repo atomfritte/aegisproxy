@@ -61,6 +61,7 @@ export const AuditTrailPage: React.FC = () => {
   const [eventId, setEventId] = useQueryParam('event');
   const [verifying, setVerifying] = useState(false);
   const [verify, setVerify] = useState<(AuditVerifyResult & { at: string }) | null>(null);
+  const legacyEvents = verify?.legacy_events ?? 0;
 
   const events = state.audit_events ?? [];
   const rules = state.rules ?? [];
@@ -84,7 +85,11 @@ export const AuditTrailPage: React.FC = () => {
     try {
       const r = await api.audit.verify();
       setVerify({ ...r, at: new Date().toISOString() });
-      if (r.valid) toast.success(`Hash chain intact`, { description: `${formatNumber(r.events_checked)} events checked.` });
+      if (r.valid && (r.legacy_events ?? 0) > 0)
+        toast.warning(`Hash chain intact`, {
+          description: `${formatNumber(r.events_checked)} events checked, ${formatNumber(r.legacy_events ?? 0)} of them legacy (unkeyed).`,
+        });
+      else if (r.valid) toast.success(`Hash chain intact`, { description: `${formatNumber(r.events_checked)} events checked.` });
     } catch (err) {
       toast.error(err, { title: 'Verification failed' });
     } finally {
@@ -201,7 +206,7 @@ export const AuditTrailPage: React.FC = () => {
 
       {verify && (
         <Callout
-          tone={verify.valid ? 'success' : 'danger'}
+          tone={!verify.valid ? 'danger' : legacyEvents > 0 ? 'warning' : 'success'}
           className="mb-5"
           title={verify.valid ? 'Hash chain intact' : 'Hash chain broken'}
           action={
@@ -211,7 +216,13 @@ export const AuditTrailPage: React.FC = () => {
           }
         >
           {verify.valid
-            ? `All ${formatNumber(verify.events_checked)} events link to their predecessor. Checked ${formatDateTime(verify.at)}.`
+            ? `All ${formatNumber(verify.events_checked)} events link to their predecessor${
+                verify.starts_at_genesis === false ? ', starting at the sealed retention point' : ' from the first event'
+              } up to the newest one. Checked ${formatDateTime(verify.at)}.${
+                legacyEvents > 0
+                  ? ` ${formatNumber(legacyEvents)} legacy events from before 2.1 use the unkeyed hash, which anyone can recompute: they are accepted only before the sealed cutover — keep an archived copy as independent evidence.`
+                  : ''
+              }`
             : `The chain breaks after ${formatNumber(verify.events_checked)} events${verify.error ? `: ${verify.error}` : ''}. Export the ledger and compare it with your archived copy.`}
         </Callout>
       )}

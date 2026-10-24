@@ -35,7 +35,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "revision": s.store.GetRevision(), "storage": s.store.StorageName()})
+	audit := "writable"
+	if !s.store.AuditStatus().Writable {
+		audit = "unavailable" // reads keep working; changes are refused (aegis_audit_log_writable, posture)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "revision": s.store.GetRevision(), "storage": s.store.StorageName(), "audit_log": audit})
 }
 
 func (s *Server) handlePublicMeta(w http.ResponseWriter, r *http.Request) {

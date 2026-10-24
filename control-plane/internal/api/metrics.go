@@ -105,6 +105,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	gauge("aegis_access_requests_pending", "Access requests awaiting review.", float64(pending))
 	gauge("aegis_security_events_open", "Unacknowledged security events.", float64(open))
+	writable := 0.0
+	if s.store.AuditStatus().Writable {
+		writable = 1
+	}
+	gauge("aegis_audit_log_writable", "1 while the audit log can be written (file storage refuses changes otherwise).", writable)
 	if ti := s.store.ThreatIntel(); ti != nil {
 		st := ti.Snapshot().Status()
 		gauge("aegis_threatintel_indicators", "Compiled threat-intel indicators.", float64(st.Domains+st.URLs+st.IPs+st.CIDRs+st.Hashes))

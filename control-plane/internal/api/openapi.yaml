@@ -4774,7 +4774,10 @@ paths:
       summary: Verify the audit hash chain
       description: |
         Verifies every hash and link of the complete audit trail (database in cluster mode; audit.jsonl and
-        its rotated generations in file mode). A broken chain is reported with `200` and `valid: false`.
+        its rotated generations in file mode), that it starts at its sealed origin (genesis or a retention
+        point), that unkeyed pre-2.1 events occur only in the sealed prefix before the keyed cutover, and that
+        it reaches the newest event known to the control-plane. A broken chain is reported with `200` and
+        `valid: false`.
 
         **Roles:** Super Admin, InfoSec Approver, Auditor (Team Leads: 403).
       responses:
@@ -4786,6 +4789,33 @@ paths:
                 $ref: '#/components/schemas/AuditVerifyResult'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /api/audit/retention:
+    post:
+      tags: [Audit]
+      operationId: applyAuditRetention
+      summary: Re-seal the start of the audit trail after old generations were removed
+      description: |
+        After the operator removed the oldest audit log generations (or `aegis_audit` rows) for retention,
+        the verification reports the missing start. This call verifies the remaining trail completely and
+        seals its first event as the new origin; the change is recorded as `AUDIT_RETENTION_APPLIED`.
+        `400` when the remaining trail does not verify or still starts at its sealed origin.
+
+        **Roles:** Super Admin.
+      responses:
+        '200':
+          description: Verification of the remaining trail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditVerifyResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /api/audit/export:
     get:
       tags: [Audit]
@@ -9302,7 +9332,13 @@ components:
           type: string
         legacy_events:
           type: integer
-          description: Events in the pre-2.1 (unkeyed) hash format.
+          description: Events in the pre-2.1 (unkeyed) hash format; accepted only in the sealed prefix before the keyed cutover.
+        starts_at_genesis:
+          type: boolean
+          description: The first event links to the genesis hash (false after an audit retention point was applied).
+        head_matches:
+          type: boolean
+          description: The trail reaches the newest event known to the control-plane.
         scope:
           type: string
           enum: [complete]

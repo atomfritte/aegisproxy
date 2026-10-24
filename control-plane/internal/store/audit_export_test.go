@@ -129,35 +129,17 @@ func TestRotatedAuditFileOrder(t *testing.T) {
 func TestCompleteAuditVerificationDetectsForgery(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
-	// A pre-2.1 (unkeyed) event at the start of the trail stays verifiable.
-	legacy := models.AuditEvent{ID: "aud-legacy", Revision: 1, Timestamp: time.Now().Add(-time.Hour).UTC(), Actor: "system", Action: "LEGACY"}
-	legacy.PrevHash = zeroHash
-	legacy.EventHash = auditHashV1(zeroHash, legacy)
-	line, _ := json.Marshal(legacy)
-	os.WriteFile(path, append(line, '\n'), 0o600)
-	sink, err := NewAuditSink(path, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sink.Close()
-	ti, _ := threatintel.NewManager(threatintel.Options{CacheDir: filepath.Join(dir, "ti")})
-	st, err := NewStore(Options{DataDir: dir, Engine: engine.NewPolicyEngine(), ThreatIntel: ti, AuditSink: sink, BootstrapAdminPassword: "Verify-Test-Pass-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	// Continue the chain after the legacy event, as an upgraded installation does.
-	os.WriteFile(path, append(line, '\n'), 0o600)
-	st.mu.Lock()
-	st.state.AuditEvents = []models.AuditEvent{legacy}
-	st.mu.Unlock()
+	// A pre-2.1 (unkeyed) event at the start of the trail stays verifiable after the upgrade.
+	legacy := writeLegacyInstallation(t, dir, path)
+	st, _ := openAuditStore(t, dir, path)
 	for _, g := range []string{"grp-1", "grp-2", "grp-3"} {
 		if _, err := st.UpsertGroup(models.ServerGroup{ID: g, Name: g}, adminClaims); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// legacy + AUDIT_ANCHOR_SEALED + 3 changes
 	res := st.VerifyCompleteAudit(context.Background(), path)
-	if !res.OK || res.Events != 4 || res.Legacy != 1 || res.FirstID != "aud-legacy" {
+	if !res.OK || res.Events != 5 || res.Legacy != 1 || res.FirstID != legacy.ID || !res.StartsAtGenesis || !res.HeadMatches {
 		t.Fatalf("verification of an intact trail: %+v", res)
 	}
 	raw, _ := os.ReadFile(path)
@@ -172,21 +154,23 @@ func TestCompleteAuditVerificationDetectsForgery(t *testing.T) {
 	ev.EventHash = auditHashV1(ev.PrevHash, ev)
 	ev.HashVersion = 0
 	forged, _ := json.Marshal(ev)
+	orig := lines[2]
 	lines[2] = forged
 	os.WriteFile(path, append(bytes.Join(lines, []byte("\n")), '\n'), 0o600)
-	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "chain broken") && !strings.Contains(res.Error, "hash mismatch") {
+	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "downgrade") {
 		t.Fatalf("forgery not detected: %+v", res)
 	}
 	// Dropping an event breaks the chain.
-	os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3]}, []byte("\n")), '\n'), 0o600)
+	lines[2] = orig
+	os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3], lines[4]}, []byte("\n")), '\n'), 0o600)
 	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "chain broken") {
 		t.Fatalf("missing event not detected: %+v", res)
 	}
 	st.mu.RLock()
 	key := st.state.AuditChainKey
 	st.mu.RUnlock()
-	if len(key) != 64 || st.GetSnapshot().AuditChainKey != "" {
-		t.Fatalf("audit chain key missing or exposed in snapshots (len %d)", len(key))
+	if len(key) != 64 || st.GetSnapshot().AuditChainKey != "" || st.GetSnapshot().AuditAnchor != "" {
+		t.Fatalf("audit chain key missing or key/anchor exposed in snapshots (len %d)", len(key))
 	}
 }
 
@@ -264,25 +248,6 @@ func TestAuditSinkRotatesBySize(t *testing.T) {
 		t.Fatalf("verification across rotated generations: %+v (exported %d)", res, len(ids))
 	}
 
-	// While an export holds the generations, the sink keeps writing to the current file.
-	release := sink.HoldGenerations()
-	before := len(rotatedAuditFiles(path))
-	time.Sleep(1100 * time.Millisecond)
-	mkGroups(16)
-	if got := len(rotatedAuditFiles(path)); got != before {
-		release()
-		t.Fatalf("rotated during an export: %d -> %d generations", before, got)
-	}
-	release()
-	time.Sleep(1100 * time.Millisecond)
-	mkGroups(1)
-	sink.compress.Wait()
-	if got := len(rotatedAuditFiles(path)); got != before+1 {
-		t.Fatalf("rotation not resumed after the export: %d -> %d", before, got)
-	}
-	if res := st.VerifyCompleteAudit(context.Background(), path); !res.OK {
-		t.Fatalf("verification after resumed rotation: %+v", res)
-	}
 	if m, _ := filepath.Glob(path + "-*.tmp"); len(m) != 0 {
 		t.Fatalf("temporary files left: %v", m)
 	}

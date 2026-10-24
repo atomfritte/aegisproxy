@@ -356,3 +356,137 @@ func TestClusterKeyRotationReencrypts(t *testing.T) {
 		t.Fatal("cluster config still contains secrets sealed with the old key")
 	}
 }
+
+func newClusterNodeWithSink(t *testing.T, dsn, dir, path string) (*Store, *AuditSink) {
+	t.Helper()
+	be, err := NewPostgresBackend(context.Background(), dsn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := NewAuditSink(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti, _ := threatintel.NewManager(threatintel.Options{CacheDir: filepath.Join(dir, "ti")})
+	st, err := NewStore(Options{DataDir: dir, Engine: engine.NewPolicyEngine(), ThreatIntel: ti, Cluster: be, AuditSink: sink,
+		BootstrapAdminPassword: "Cluster-Root-Pass-9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		st.Close()
+		sink.Close()
+		be.Close()
+	})
+	return st, sink
+}
+
+func clusterAuditIDs(t *testing.T, st *Store) []string {
+	t.Helper()
+	var ids []string
+	if err := st.cluster.StreamAudit(context.Background(), func(raw []byte) error {
+		var ev models.AuditEvent
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return err
+		}
+		ids = append(ids, ev.ID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// Finding 12: migrating from file storage imports the complete trail (all generations), not only the
+// in-memory window, and a repeated migration neither fails nor duplicates events. Finding 1 for the
+// database: a trail re-hashed with the unkeyed algorithm fails the verification.
+func TestClusterImportsCompleteFileAuditTrail(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	st, sink := openAuditStore(t, dir, path)
+	mkAuditGroups(t, st, 4)
+	rotateByCopy(t, path, path+"-20260101")
+	mkAuditGroups(t, st, 4)
+	st.mu.Lock()
+	st.state.AuditEvents = st.state.AuditEvents[:3] // a long-running installation: the window is only the tail
+	st.markDirtyLocked()
+	st.mu.Unlock()
+	closeAuditStore(st, sink)
+	fileSink, err := NewAuditSink(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _ := fileSink.snapshot()
+	var want []string
+	scanTrail(files, func(ev models.AuditEvent) error { want = append(want, ev.ID); return nil })
+	closeTrail(files)
+	fileSink.Close()
+
+	node, nodeSink := newClusterNodeWithSink(t, dsn, dir, path)
+	got := clusterAuditIDs(t, node)
+	if !strings.HasPrefix(strings.Join(got, ","), strings.Join(want, ",")) {
+		t.Fatalf("imported %d events, want the %d of the file trail first:\n%v\n%v", len(got), len(want), got, want)
+	}
+	if res := node.VerifyCompleteAudit(context.Background(), path); !res.OK || !res.StartsAtGenesis {
+		t.Fatalf("verification after the migration: %+v", res)
+	}
+	mkAuditGroups(t, node, 1)
+	if res := node.VerifyCompleteAudit(context.Background(), path); !res.OK {
+		t.Fatalf("verification after a change on the cluster: %+v", res)
+	}
+	stored := clusterAuditIDs(t, node)
+
+	// The configuration is lost and the file state is imported once more: nothing is duplicated.
+	closeAuditStore(node, nodeSink)
+	be, _ := NewPostgresBackend(context.Background(), dsn, nil)
+	defer be.Close()
+	if _, err := be.pool.Exec(context.Background(), "UPDATE aegis_config SET revision = 0"); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := newClusterNodeWithSink(t, dsn, dir, path)
+	if ids := clusterAuditIDs(t, again); len(ids) < len(stored) || strings.Join(ids[:len(stored)], ",") != strings.Join(stored, ",") {
+		t.Fatalf("repeated migration changed the stored trail: %d -> %d events", len(stored), len(ids))
+	}
+	if res := again.VerifyCompleteAudit(context.Background(), path); !res.OK {
+		t.Fatalf("verification after a repeated migration: %+v", res)
+	}
+
+	// Somebody with database access re-hashes the trail with the unkeyed algorithm.
+	rows, err := be.pool.Query(context.Background(), "SELECT seq, doc FROM aegis_audit ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		seq int64
+		ev  models.AuditEvent
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		var raw []byte
+		if err := rows.Scan(&r.seq, &raw); err != nil {
+			t.Fatal(err)
+		}
+		json.Unmarshal(raw, &r.ev)
+		all = append(all, r)
+	}
+	rows.Close()
+	prev := zeroHash
+	for i := range all {
+		ev := &all[i].ev
+		ev.HashVersion = 0
+		ev.PrevHash = prev
+		ev.EventHash = auditHashV1(prev, *ev)
+		prev = ev.EventHash
+		raw, _ := json.Marshal(ev)
+		if _, err := be.pool.Exec(context.Background(), "UPDATE aegis_audit SET doc = $1, event_hash = $2, prev_hash = $3 WHERE seq = $4",
+			raw, ev.EventHash, ev.PrevHash, all[i].seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res := again.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "downgrade") {
+		t.Fatalf("re-hashed database trail accepted: %+v", res)
+	}
+}

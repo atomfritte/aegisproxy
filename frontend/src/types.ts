@@ -1122,6 +1122,14 @@ export interface AuditVerifyResult {
   valid: boolean;
   events_checked: number;
   error?: string;
+  first_id?: string;
+  last_id?: string;
+  /** Pre-2.1 events with the unkeyed hash; only valid in the sealed prefix before the keyed cutover. */
+  legacy_events?: number;
+  /** False after an audit retention point was applied (older events removed by the operator). */
+  starts_at_genesis?: boolean;
+  /** The trail reaches the newest event known to the control-plane. */
+  head_matches?: boolean;
 }
 
 export interface UserInput {
