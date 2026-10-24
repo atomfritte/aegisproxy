@@ -118,6 +118,53 @@ func TestSecurityPosture(t *testing.T) {
 	}
 }
 
+// Enforcing DLP/AV with oversize "allow" lets padded content through unscanned: the posture warns (review round 2).
+func TestPostureWarnsAboutOversizeAllowWithEnforcingInspection(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	posture := func() map[string]PostureCheck {
+		res := decode[struct {
+			Checks []PostureCheck `json:"checks"`
+		}](t, h.do(t, "GET", "/api/system/posture", nil, nil).Body)
+		byID := map[string]PostureCheck{}
+		for _, c := range res.Checks {
+			byID[c.ID] = c
+		}
+		return byID
+	}
+	set := func(change func(p *models.SecurityPolicy)) {
+		p := h.st.GetSnapshot().SecurityPolicy
+		change(&p)
+		if r := h.do(t, "POST", "/api/security/policy", p, ui); r.StatusCode != 200 {
+			t.Fatalf("update policy: %d", r.StatusCode)
+		}
+	}
+	set(func(p *models.SecurityPolicy) {
+		p.DLPMode, p.DLPOversizeAction = "block", "allow"
+		p.AVEnabled, p.AVMode, p.AVOversizeAction = true, "block", "allow"
+	})
+	byID := posture()
+	if c := byID["dlp-oversize"]; c.Status != "warn" || !strings.Contains(c.Remediation, "dlp_oversize_action") {
+		t.Errorf("dlp-oversize: %+v", c)
+	}
+	if c := byID["scan-oversize"]; c.Status != "warn" {
+		t.Errorf("scan-oversize: %+v", c)
+	}
+	set(func(p *models.SecurityPolicy) { p.DLPOversizeAction, p.AVOversizeAction = "block", "block" })
+	byID = posture()
+	if byID["dlp-oversize"].Status != "pass" || byID["scan-oversize"].Status != "pass" {
+		t.Errorf("block: %+v %+v", byID["dlp-oversize"], byID["scan-oversize"])
+	}
+	set(func(p *models.SecurityPolicy) {
+		p.DLPMode, p.DLPOversizeAction = "monitor", "allow"
+		p.AVMode, p.AVOversizeAction = "monitor", "allow"
+	})
+	byID = posture()
+	if _, ok := byID["dlp-oversize"]; ok || byID["scan-oversize"].Status != "info" {
+		t.Errorf("monitor only: %+v %+v", byID["dlp-oversize"], byID["scan-oversize"])
+	}
+}
+
 func TestPublicRequestOptions(t *testing.T) {
 	h := newHarness(t)
 	h.login(t)

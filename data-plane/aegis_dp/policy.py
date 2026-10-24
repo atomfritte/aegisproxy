@@ -38,6 +38,13 @@ ALLOWED_VERDICTS = {VERDICT_ALLOWED, VERDICT_LEARNING, VERDICT_REDIRECT, VERDICT
 SECURITY_VERDICTS = {VERDICT_THREAT, VERDICT_MALWARE, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_POLICY, VERDICT_QUARANTINED}
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
+# Cloud platform endpoints outside the link-local range (169.254.0.0/16 is covered by is_link_local). Same list as
+# netguard.cloudMetadata on the control-plane; shared vectors in testdata/destination_vectors.json.
+_CLOUD_METADATA = tuple(ipaddress.ip_network(n) for n in (
+    "168.63.129.16/32",   # Azure WireServer (goal state, extension configuration, health)
+    "fd00:ec2::254/128",  # AWS instance metadata over IPv6
+    "100.100.100.200/32",  # Alibaba Cloud instance metadata
+))
 DEFAULT_INTERNAL_SUFFIXES = (".internal.corp", ".local", ".localdomain", ".internal", ".lan", ".home.arpa")
 
 
@@ -105,14 +112,19 @@ def parse_ip(host: str):
     return addr.ipv4_mapped or addr if isinstance(addr, ipaddress.IPv6Address) else addr
 
 
+def is_cloud_metadata(addr) -> bool:
+    return any(addr.version == net.version and addr in net for net in _CLOUD_METADATA)
+
+
 def is_internal_addr(addr) -> bool:
     return bool(addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_multicast
-                or addr.is_unspecified or (addr.version == 4 and addr in _CGNAT))
+                or addr.is_unspecified or (addr.version == 4 and addr in _CGNAT) or is_cloud_metadata(addr))
 
 
 def is_forbidden_addr(addr) -> bool:
-    """Destinations no rule may ever open: loopback, link-local (cloud metadata), unspecified, multicast."""
-    return bool(addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast)
+    """Destinations no rule may ever open: loopback, link-local and other cloud metadata endpoints (Azure
+    WireServer, AWS IMDS over IPv6, Alibaba Cloud), unspecified, multicast."""
+    return bool(addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast or is_cloud_metadata(addr))
 
 
 def is_internal_host(host: str, suffixes) -> bool:

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,6 +40,28 @@ func TestNormalizationVectorsSharedWithDataPlane(t *testing.T) {
 	for _, c := range v.Paths {
 		if got, ok := CanonicalizePath(c.In); got != c.Out || ok != c.OK {
 			t.Errorf("CanonicalizePath(%q) = (%q, %v), want (%q, %v)", c.In, got, ok, c.Out, c.OK)
+		}
+	}
+}
+
+// Destination classification shared with the data-plane's is_internal_addr (testdata/destination_vectors.json).
+func TestDestinationVectorsSharedWithDataPlane(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "destination_vectors.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Addresses []struct {
+			Addr     string `json:"addr"`
+			Internal bool   `json:"internal"`
+		} `json:"addresses"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil || len(v.Addresses) == 0 {
+		t.Fatalf("vectors: %v", err)
+	}
+	for _, c := range v.Addresses {
+		if got := IsInternalAddr(netip.MustParseAddr(c.Addr)); got != c.Internal {
+			t.Errorf("IsInternalAddr(%s) = %v, want %v", c.Addr, got, c.Internal)
 		}
 	}
 }

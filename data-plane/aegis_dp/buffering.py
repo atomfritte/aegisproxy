@@ -4,8 +4,10 @@ mitmproxy keeps every body that is not streamed in memory until it is complete. 
 body_size_limit (AEGIS_BODY_SIZE_LIMIT, default 1g per message), so a handful of concurrent large responses
 without Content-Length (or chunked uploads) could exhaust a worker. The addon therefore streams every body that
 nothing needs to see, and gives each body it buffers for inspection a BodyGuard: a per-flow cap plus a share of
-the worker's budget (AEGIS_BUFFER_BUDGET). Bodies of known size are admitted when the headers arrive, bodies of
-unknown size chunk by chunk.
+the worker's budget (AEGIS_BUFFER_BUDGET). Only bytes that have actually arrived are accounted, chunk by chunk (a
+declared Content-Length only decides "too large" up front and never reserves anything, so idle connections that
+announce large bodies hold nothing), and one client - its server identity, else its address - may hold at most
+AEGIS_BUFFER_CLIENT_SHARE of the budget, so a single client cannot exhaust it for everyone else.
 
 mitmproxy 12 has no addon hook for the chunks of a body it buffers. install() therefore wraps
 HttpStream.check_body_size, which mitmproxy runs for exactly these chunks (it enforces body_size_limit and
@@ -40,54 +42,91 @@ def parse_size(value: str) -> Optional[int]:
     return int(num) * mult
 
 
-class BufferBudget:
-    """Bytes of message bodies all flows of one worker may hold for inspection at the same time. Used from the
-    event loop only; the ops thread reads the counters."""
+DEFAULT_CLIENT_SHARE = 0.25  # AEGIS_BUFFER_CLIENT_SHARE unset
 
-    def __init__(self, total: int) -> None:
+
+class BufferBudget:
+    """Bytes of message bodies all flows of one worker may hold for inspection at the same time, and the part of it
+    each client may hold. Used from the event loop only; the ops thread reads the counters."""
+
+    def __init__(self, total: int, client_share: float = DEFAULT_CLIENT_SHARE) -> None:
         self.total = max(0, int(total))
+        self.client_share = min(1.0, max(0.0, float(client_share)))
         self.used = 0
         self.peak = 0
+        self.clients: Dict[str, int] = {}
 
-    def reserve(self, n: int) -> bool:
+    def client_limit(self, cap: int) -> int:
+        """Bytes one client may hold: its share of the budget, but at least one complete scan of a body up to
+        ``cap`` (the body plus its decoded copy), so a single large scan still fits an otherwise idle worker."""
+        return min(self.total, max(int(self.total * self.client_share), 2 * max(0, int(cap))))
+
+    def reserve(self, n: int, client: str = "", limit: Optional[int] = None) -> bool:
         if n <= 0:
             return True
         if self.used + n > self.total:
             return False
+        held = self.clients.get(client, 0) if client else 0
+        if client and limit is not None and held + n > limit:
+            return False
         self.used += n
+        if client:
+            self.clients[client] = held + n
         self.peak = max(self.peak, self.used)
         return True
 
-    def release(self, n: int) -> None:
+    def release(self, n: int, client: str = "") -> None:
         self.used = max(0, self.used - n)
+        if client:
+            left = self.clients.get(client, 0) - n
+            if left > 0:
+                self.clients[client] = left
+            else:
+                self.clients.pop(client, None)
+
+    def top_client(self) -> int:
+        return max(self.clients.values(), default=0)
 
 
 class BodyGuard:
     """Accounting for one buffered body. ``on_exceed(reason, size)`` runs once when the body outgrows the cap
-    ("oversize") or the budget ("busy"). It adjusts the flow and returns STREAM (``message.stream`` is set: the
-    rest is relayed unbuffered) or BLOCK (requests: ``flow.response`` holds the block page, the upload is
-    discarded; responses: the response was replaced by the block message with a discarding stream)."""
+    ("oversize") or the budget or the client's share of it ("busy"). It adjusts the flow and returns STREAM
+    (``message.stream`` is set: the rest is relayed unbuffered) or BLOCK (requests: ``flow.response`` holds the block
+    page, the upload is discarded; responses: the response was replaced by the block message with a discarding
+    stream)."""
 
-    __slots__ = ("budget", "cap", "on_exceed", "reserved", "exceeded", "__weakref__")
+    __slots__ = ("budget", "cap", "on_exceed", "client", "limit", "reserved", "exceeded", "__weakref__")
 
-    def __init__(self, budget: BufferBudget, cap: int, on_exceed: Callable[[str, int], str]) -> None:
+    def __init__(self, budget: BufferBudget, cap: int, on_exceed: Callable[[str, int], str], client: str = "") -> None:
         self.budget, self.cap, self.on_exceed = budget, max(0, int(cap)), on_exceed
+        self.client = client
+        self.limit = budget.client_limit(self.cap)
         self.reserved = 0
         self.exceeded = ""
 
+    def declared(self, size: int) -> Optional[str]:
+        """Decision for a body whose size is announced (Content-Length) before any of it arrived: "oversize" beyond
+        the cap, "busy" when it could never fit the budget or the client's share. Nothing is reserved."""
+        if size > self.cap:
+            return "oversize"
+        if size > min(self.budget.total, self.limit):
+            return "busy"
+        return None
+
     def admit(self, size: int) -> Optional[str]:
-        """None while ``size`` buffered bytes fit the cap and the budget, otherwise "oversize" or "busy"."""
+        """None while ``size`` buffered bytes fit the cap, the budget and the client's share, otherwise "oversize"
+        or "busy"."""
         if size > self.cap:
             return "oversize"
         if size > self.reserved:
-            if not self.budget.reserve(size - self.reserved):
+            if not self.budget.reserve(size - self.reserved, self.client, self.limit):
                 return "busy"
             self.reserved = size
         return None
 
     def hold(self, n: int) -> bool:
         """Reserves ``n`` more bytes beyond the cap (a decoded copy kept while scanners run) until release()."""
-        if not self.budget.reserve(n):
+        if not self.budget.reserve(n, self.client, self.limit):
             return False
         self.reserved += max(0, n)
         return True
@@ -99,7 +138,7 @@ class BodyGuard:
 
     def release(self) -> None:
         if self.reserved:
-            self.budget.release(self.reserved)
+            self.budget.release(self.reserved, self.client)
             self.reserved = 0
 
 

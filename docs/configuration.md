@@ -117,6 +117,7 @@ aegis-control-plane version
 | `AEGIS_THREAT_SYNC_INTERVAL_SECONDS` | `30` | Threat-intel sync (gzip, ETag). |
 | `AEGIS_LOG_LEVEL` | `INFO` | Log level of the addon. |
 | `AEGIS_BUFFER_BUDGET` | `min(512m, AEGIS_BODY_SIZE_LIMIT)` | Bytes of message bodies one worker holds for inspection at the same time (`k`/`m`/`g` suffixes, at least `1m`); see [memory sizing](#data-plane-memory-sizing). |
+| `AEGIS_BUFFER_CLIENT_SHARE` | `25%` | Part of `AEGIS_BUFFER_BUDGET` one client (its server identity, else its source address) may hold, `1%`–`100%`; never less than one complete scan (2 × the per-flow limit). See [memory sizing](#data-plane-memory-sizing). |
 
 Container-specific (`data-plane/entrypoint.sh`):
 
@@ -142,17 +143,31 @@ A worker keeps a message body in memory only while an inspection needs it; every
 | Upload | buffered only for DLP, ICAP REQMOD or the `max_upload_bytes` check of a body without `Content-Length`, up to `max(dlp_max_scan_bytes, icap_max_bytes when REQMOD is set, 8 MiB)` (or `max_upload_bytes` when that is larger); beyond that `dlp_oversize_action` decides (`allow`: streamed, `DLP_UNSCANNED:oversize`; `block`: 413). Uploads of blocked requests are discarded as they arrive |
 
 All buffered bodies of a worker — plus decoded copies kept while scan engines run — share the
-`AEGIS_BUFFER_BUDGET`. When it is exhausted, new bodies are handled like oversized ones, flagged `…:busy`
-(`AV_UNSCANNED:busy`, `DLP_UNSCANNED:busy`, `ICAP_UNSCANNED:busy`); with `av_oversize_action` /
-`dlp_oversize_action` = `block` they are answered with 503 (`inspection_busy`) instead, and a body without
-`Content-Length` that must stay buffered for `max_upload_bytes` is answered with 503 as well. The
-metrics `aegis_dp_buffered_bytes`, `aegis_dp_buffered_bytes_peak`, `aegis_dp_buffer_budget_bytes` and
-`aegis_dp_buffer_limited_total{direction,reason}` show the usage.
+`AEGIS_BUFFER_BUDGET`. Only bytes that have actually arrived are counted, chunk by chunk: a `Content-Length`
+decides "too large" up front but reserves nothing, so idle connections announcing large bodies hold no budget.
+One client — its server identity (proxy token or registered address), else its source address — may hold at
+most `AEGIS_BUFFER_CLIENT_SHARE` of the budget (default 25 %, but always enough for one complete scan), so a
+single client cannot use up the inspection capacity of everyone else on the worker.
+
+A body that does not fit the budget or the client's share is **busy**, which is not the same as oversize:
+
+| Busy body | Handling |
+|---|---|
+| Upload, DLP or ICAP REQMOD in `block` mode, or `max_upload_bytes` check of a body without `Content-Length` | 503 `inspection_busy` with `Retry-After: 5` — whatever `dlp_oversize_action` says |
+| Download, an inspection that can block is active (blocked file types, threat-intel hashes in `block` mode, ClamAV / YARA / ICAP RESPMOD in `block` mode) | 503 `inspection_busy` with `Retry-After: 5` — whatever `av_oversize_action` says |
+| Monitor-only inspections, or no inspection | streamed and flagged `…:busy` (`AV_UNSCANNED:busy`, `DLP_UNSCANNED:busy`, `ICAP_UNSCANNED:busy`) |
+
+`dlp_oversize_action` / `av_oversize_action` therefore apply only to bodies that are larger than the scan
+limit, never to a capacity shortage: exhausting the budget cannot turn an enforcing inspection off. The metrics
+`aegis_dp_buffered_bytes`, `aegis_dp_buffered_bytes_peak`, `aegis_dp_buffer_budget_bytes`,
+`aegis_dp_buffer_clients`, `aegis_dp_buffered_bytes_top_client` (bytes held by the client holding the most) and
+`aegis_dp_buffer_limited_total{direction,reason}` show the usage; a `top_client` value at its share together
+with rising `reason="busy"` counts points to one client exhausting its share.
 
 Plan the worker's memory limit as roughly **2 × budget + 256 MiB** (mitmproxy copies a body once when it is
 complete; Python, YARA rules and TLS state need the rest). The defaults (budget 512 MiB) fit the Helm chart's
 2 GiB limit; lower `AEGIS_BUFFER_BUDGET` for smaller hosts, and raise it together with the memory limit when
-many concurrent downloads should be scanned instead of flagged `AV_UNSCANNED:busy`.
+many concurrent transfers should be scanned instead of being answered with 503 `inspection_busy`.
 
 ## Console (separate hosting, `frontend/Dockerfile`)
 

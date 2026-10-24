@@ -60,6 +60,7 @@ class Config:
     access_log_rotate_mb: int = 0  # > 0: the worker rotates a file destination itself (default on Windows)
     access_log_keep: int = 10
     buffer_budget: int = 0  # bytes of bodies buffered for inspection at once; 0 = min(512 MiB, body_size_limit)
+    buffer_client_share: int = 25  # percent of the budget one client (server identity, else address) may hold
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -91,6 +92,9 @@ class Config:
             raise ConfigError("AEGIS_BUFFER_BUDGET must be a size such as 512m or 1g") from exc
         if budget and budget < 1 << 20:
             raise ConfigError("AEGIS_BUFFER_BUDGET must be at least 1m")
+        share_raw = os.environ.get("AEGIS_BUFFER_CLIENT_SHARE", "25").strip().removesuffix("%").strip()
+        if not share_raw.isdigit() or not 1 <= int(share_raw) <= 100:
+            raise ConfigError("AEGIS_BUFFER_CLIENT_SHARE must be a percentage from 1 to 100 (e.g. 25%)")
         return cls(
             control_plane_url=os.environ.get("CONTROL_PLANE_URL", "http://localhost:8081").rstrip("/"),
             dataplane_key=key,
@@ -111,4 +115,5 @@ class Config:
             access_log_rotate_mb=rotate_mb,
             access_log_keep=keep,
             buffer_budget=budget,
+            buffer_client_share=int(share_raw),
         )
