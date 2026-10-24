@@ -234,12 +234,16 @@ Describe 'Install-AegisControlPlane.ps1' {
             $rule.Direction | Should -Be 'Inbound'
         }
 
-        It 'registers the daily log rotation as SYSTEM with a quoted command line' {
+        It 'registers the daily log rotation as the service account (not SYSTEM) with a quoted command line' {
             $task = $FakeWin.Tasks['\AegisProxy\AegisProxy Control-Plane Log Rotation']
-            $task.Principal.UserId | Should -Be 'S-1-5-18'
+            $task.Principal.UserId | Should -Be 'NT SERVICE\AegisControlPlane' -Because 'as SYSTEM it would act on files and links in a directory the service can modify'
+            $task.Principal.LogonType | Should -Be 'ServiceAccount'
+            $task.Principal.RunLevel | Should -Be 'Limited'
             $task.Trigger.Daily | Should -BeTrue
             $task.Action.Argument | Should -BeLike ('*-File "{0}" -LogFile "{1}" -RetentionDays 30' -f (Join-Path $InstallDir 'Invoke-AegisLogRotation.ps1'), (Join-Path (Join-Path $DataRoot 'logs') 'control-plane.log'))
             $rotation = Join-Path $InstallDir 'Invoke-AegisLogRotation.ps1'
+            (Get-FakeAccess $rotation)['NT SERVICE\AegisControlPlane'] | Should -Be 'RX' -Because 'the account running the script must not be able to change it'
+            Test-FakeWritable $rotation | Should -BeFalse
             [System.IO.File]::ReadAllBytes($rotation)[0..2] | Should -Be @(0xEF, 0xBB, 0xBF) -Because 'Windows PowerShell 5.1 runs the task'
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($rotation, [ref]$null, [ref]$errors) | Out-Null
@@ -265,6 +269,94 @@ Describe 'Install-AegisControlPlane.ps1' {
                 Test-FakeWritable $path | Should -BeFalse -Because "$path runs with service or SYSTEM rights"
             }
             (Get-FakeAccess (Join-Path $custom 'aegis-control-plane.exe'))['NT SERVICE\AegisControlPlane'] | Should -Be 'RX'
+        }
+    }
+
+    Context 'directories that existed before the first installation' {
+        BeforeEach {
+            # A local user created the data directories in advance (ProgramData allows that), owns them and granted
+            # Authenticated Users modify explicitly - on the data root and on secrets.
+            $script:Planter = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+            $script:LogsDir = Join-Path $DataRoot 'logs'
+            foreach ($dir in @($SecretsDir, $CertsDir, $LogsDir, (Join-Path $DataRoot 'data'))) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            foreach ($dir in @($DataRoot, $SecretsDir)) {
+                $FakeWin.Acl[(Get-FakeFullPath $dir)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-11' = '(OI)(CI)M' } }
+            }
+            Set-FakeOwner -Path $DataRoot -Sid $Planter
+        }
+
+        It 'refuses a pre-seeded <Name> on a first installation and changes nothing' -TestCases @(
+            @{ Name = 'JWT key'; PlantIn = 'SecretsDir'; PlantFile = 'jwt.key' }, @{ Name = 'encryption key'; PlantIn = 'SecretsDir'; PlantFile = 'encryption.key' },
+            @{ Name = 'data-plane key'; PlantIn = 'SecretsDir'; PlantFile = 'dataplane.key' }, @{ Name = 'TLS key'; PlantIn = 'SecretsDir'; PlantFile = 'tls-key.pem' },
+            @{ Name = 'bootstrap password'; PlantIn = 'SecretsDir'; PlantFile = 'bootstrap-admin-password' }, @{ Name = 'metrics token'; PlantIn = 'SecretsDir'; PlantFile = 'metrics.token' },
+            @{ Name = 'CA'; PlantIn = 'CertsDir'; PlantFile = 'mitmproxy-ca.pem' }, @{ Name = 'state file'; PlantIn = 'DataRoot'; PlantFile = 'data\aegis_state.json' },
+            @{ Name = 'binary'; PlantIn = 'InstallDir'; PlantFile = 'aegis-control-plane.exe' }
+        ) {
+            $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
+            New-Item -ItemType Directory -Path (Split-Path -Parent $planted) -Force | Out-Null
+            Set-Content -LiteralPath $planted -Value ('p' * 64)
+            Set-FakeOwner -Path $planted -Sid $Planter
+            $err = { & $Installer @Base } | Should -Throw '*Refusing to adopt 1 file(s)*service AegisControlPlane is not installed*-AdoptExistingSecrets*' -PassThru
+            "$err" | Should -Match ([regex]::Escape((Split-Path -Leaf $planted)))
+            $FakeWin.Services.Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            Get-Content -LiteralPath $planted | Should -Be ('p' * 64)
+        }
+
+        It 'keeps restored secrets and CA with -AdoptExistingSecrets, but takes ownership and removes the planted ACEs' {
+            $preJwt = 'p' * 64
+            [System.IO.File]::WriteAllText((Join-Path $SecretsDir 'jwt.key'), $preJwt)
+            $preFp = New-TestCa -Dir $CertsDir -Subject 'CN=Restored CA'
+            Set-FakeOwner -Path $DataRoot -Sid $Planter
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ AdoptExistingSecrets = $true; SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'AdoptExistingSecrets: keeping 5 pre-existing file'
+            ([System.IO.File]::ReadAllText((Join-Path $SecretsDir 'jwt.key'))).Trim() | Should -Be $preJwt
+            @(Get-FakeCall 'aegis-control-plane' | Where-Object { $_.Args[0] -eq 'gen-ca' }).Count | Should -Be 0
+            $run.Output | Should -Match ([regex]::Escape($preFp))
+            foreach ($path in @($DataRoot, $SecretsDir, $CertsDir, (Join-Path $SecretsDir 'jwt.key'), (Join-Path $CertsDir 'mitmproxy-ca.pem'))) {
+                (Get-Acl -LiteralPath $path).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $path
+                (Get-FakeAccess $path).ContainsKey('*S-1-5-11') | Should -BeFalse -Because $path
+            }
+            Get-PrincipalList $SecretsDir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'NT SERVICE\AegisControlPlane')
+            Get-PrincipalList (Join-Path $CertsDir 'mitmproxy-ca.pem') | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544')
+            Test-FakeWritable (Join-Path $SecretsDir 'jwt.key') | Should -BeFalse
+        }
+
+        It 'takes over empty pre-existing directories (and old logs) without -AdoptExistingSecrets' {
+            $oldLog = Join-Path $LogsDir 'control-plane.log'
+            Set-Content -LiteralPath $oldLog -Value 'log line'
+            $FakeWin.Acl[(Get-FakeFullPath $oldLog)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-1-0' = 'F' } }
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'ACLs verified'
+            $FakeWin.Acl[(Get-FakeFullPath $DataRoot)].Grants.Contains('*S-1-5-11') | Should -BeFalse -Because 'the explicit ACE on the data root itself is removed'
+            @(Get-FakeCall 'icacls.exe' | Where-Object { $_.Args[1] -eq '/remove' -and $_.Args[2] -eq '*S-1-5-11' }).Count | Should -Be 1
+            foreach ($path in @($DataRoot, $SecretsDir, $LogsDir, $oldLog)) {
+                (Get-Acl -LiteralPath $path).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $path
+                Test-FakeWritable -Path $path -Principals @('*S-1-5-11', '*S-1-1-0', '*S-1-5-32-545') | Should -BeFalse -Because $path
+            }
+            Get-PrincipalList $DataRoot | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544')
+            Get-PrincipalList $LogsDir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'NT SERVICE\AegisControlPlane')
+        }
+
+        It 'aborts before starting the service when the resulting ACL cannot be verified' {
+            $FakeWin.IcaclsIgnore = @('/remove')
+            { & $Installer @Base -SkipFirewall } | Should -Throw '*ACL verification failed*: access for S-1-5-11 is not expected*'
+            $FakeWin.Services['AegisControlPlane'].Status | Should -Be 'Stopped'
+            @(Get-FakeCall 'Start-Service').Count | Should -Be 0
+        }
+
+        It 'refuses a junction in the data directories and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
+            Remove-Item -LiteralPath $SecretsDir -Recurse -Force
+            New-Item -ItemType SymbolicLink -Path $SecretsDir -Target $target | Out-Null
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed*secrets*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
         }
     }
 
@@ -297,6 +389,14 @@ Describe 'Install-AegisControlPlane.ps1' {
             @(Get-FakeCall 'New-Item').Count | Should -Be 1 -Because 'the existing event log source is kept'
             $FakeWin.Registry[$EventLogKey]['TypesSupported'] | Should -Be 7
             @(Get-FakeCall 'Invoke-CimMethod').Count | Should -Be 0
+        }
+
+        It 'does not vouch for the secrets once a foreign ACE was added to the secrets directory, and repairs it with -AdoptExistingSecrets' {
+            $FakeWin.Acl[(Get-FakeFullPath $SecretsDir)].Grants['*S-1-5-11'] = '(OI)(CI)R'
+            { & $Installer @Base } | Should -Throw '*Refusing to adopt*secrets: access for S-1-5-11 is not expected*'
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ AdoptExistingSecrets = $true })).ExitCode | Should -Be 0
+            (Get-FakeAccess $SecretsDir).ContainsKey('*S-1-5-11') | Should -BeFalse
+            foreach ($name in $SecretsBefore.Keys) { [System.IO.File]::ReadAllText((Join-Path $SecretsDir $name)) | Should -Be $SecretsBefore[$name] }
         }
 
         It 'removes an earlier extra variable passed with an empty value' {
@@ -385,6 +485,20 @@ Describe 'Install-AegisControlPlane.ps1' {
         It 'rejects imported secrets shorter than 32 characters' {
             [System.IO.File]::WriteAllText((Join-Path (Join-Path $Node1 'secrets') 'jwt.key'), 'too-short')
             { & $Installer @Cluster } | Should -Throw '*shorter than 32 characters*'
+        }
+
+        It 'refuses -<Parameter> from an SMB share without encryption before changing anything' -TestCases @(
+            @{ Parameter = 'ImportSecretsDir'; Leaf = 'secrets' }, @{ Parameter = 'CaSourceDir'; Leaf = 'certs' }
+        ) {
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'node1'; ShareName = 'c$'; Encrypted = $false })
+            $p = Join-Parameters $Cluster @{ $Parameter = "\\node1\c$\ProgramData\AegisProxy\$Leaf" }
+            { & $Installer @p } | Should -Throw "*-$Parameter reads secrets from \\node1\c$ over an SMB connection that is not encrypted*-RequirePrivacy*-AllowUnencryptedImport*"
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $DataRoot | Should -BeFalse
+            # Encrypted: the check passes (the share itself does not exist in the fake, so the import fails later).
+            $FakeWin.Smb.Connections[0].Encrypted = $true
+            $err = { & $Installer @p } | Should -Throw -PassThru
+            "$err" | Should -Not -Match 'SMB connection'
         }
     }
 
@@ -489,6 +603,21 @@ Describe 'Install-AegisControlPlane.ps1' {
             $run.Output | Should -Match 'is not installed'
         }
 
+        It 'removes the program files without following a junction inside them' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })).ExitCode | Should -Be 0
+            $outside = Join-Path $FakeWin.Root 'outside'
+            New-Item -ItemType Directory -Path $outside | Out-Null
+            Set-Content -LiteralPath (Join-Path $outside 'keep.txt') -Value 'x'
+            New-Item -ItemType SymbolicLink -Path (Join-Path $InstallDir 'link') -Target $outside | Out-Null
+            # Windows PowerShell 5.1's Remove-Item -Recurse deletes the content of junction targets.
+            Mock Remove-Item -ParameterFilter { $Recurse -and "$LiteralPath$Path" -notlike 'HKLM:*' } { throw 'Remove-Item -Recurse follows junctions in Windows PowerShell 5.1' }
+            $run = Invoke-Installer -Path $Installer -Parameters @{ Uninstall = $true; Confirm = $false }
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'only with -AdoptExistingSecrets'
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $outside 'keep.txt') | Should -BeTrue
+        }
+
         It 'keeps everything with -WhatIf' {
             (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
             Invoke-Installer -Path $Installer -Parameters @{ Uninstall = $true; WhatIf = $true } | Out-Null
@@ -553,6 +682,26 @@ Describe 'Install-AegisControlPlane.ps1' {
             Write-SecretFile -Path $p -Value 'xyz'
             [System.IO.File]::ReadAllBytes($p) | Should -Be ([System.Text.Encoding]::ASCII.GetBytes("xyz`n"))
             Read-SecretFile (Join-Path $FakeWin.Root 'missing') | Should -BeNullOrEmpty
+        }
+
+        It 'Assert-EncryptedSmbSource accepts encrypted connections, resolves mapped drives and refuses the rest' {
+            . ([scriptblock]::Create((Import-ScriptFunction -Path $Installer -Name 'Assert-EncryptedSmbSource', 'Write-Ok', 'Write-Note')))
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'node1'; ShareName = 'c$'; Encrypted = $true },
+                [pscustomobject]@{ ServerName = 'fs'; ShareName = 'aegis'; Encrypted = $false })
+            $FakeWin.Smb.Mappings['Z:'] = '\\fs\aegis'
+            Assert-EncryptedSmbSource -Name '-X' -Path '\\node1\c$\ProgramData\AegisProxy\secrets' 6>&1 | Should -Match 'is encrypted'
+            Assert-EncryptedSmbSource -Name '-X' -Path '\\?\UNC\node1\c$\ProgramData' 6>&1 | Should -Match 'is encrypted'
+            { Assert-EncryptedSmbSource -Name '-X' -Path 'Z:\secrets' } | Should -Throw '*\\fs\aegis over an SMB connection that is not encrypted*'
+            { Assert-EncryptedSmbSource -Name '-X' -Path '\\other\share\secrets' } | Should -Throw '*\\other\share*not encrypted*'
+            Assert-EncryptedSmbSource -Name '-X' -Path 'Z:\secrets' -AllowUnencrypted 6>&1 | Should -Match 'Continuing because of -AllowUnencryptedImport'
+            Assert-EncryptedSmbSource -Name '-X' -Path 'C:\Backup\secrets' 6>&1 | Should -BeNullOrEmpty
+            Assert-EncryptedSmbSource -Name '-X' -Path (Join-Path $FakeWin.Root 'secrets') 6>&1 | Should -BeNullOrEmpty
+        }
+
+        It 'Get-ServiceSid computes virtual account SIDs like Windows' {
+            . ([scriptblock]::Create((Import-ScriptFunction -Path $Installer -Name 'Get-ServiceSid')))
+            Get-ServiceSid 'TrustedInstaller' | Should -Be 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+            Get-ServiceSid 'AegisControlPlane' | Should -Be (Get-FakeSid 'NT SERVICE\AegisControlPlane')
         }
 
         It 'Get-CaInfo prefers the DER file and returns the SHA-256 fingerprint' {

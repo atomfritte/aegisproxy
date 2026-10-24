@@ -1,18 +1,19 @@
 # Test doubles for the Windows installers (dot-sourced by the *.Tests.ps1 files).
 #
-# A small in-memory "Windows" - services, registry values, firewall rules, scheduled tasks, IIS objects and
-# NTFS ACLs with inheritance - sits behind stub commands, so the installers run unchanged under Pester on
-# Linux and on Windows. Stubs are global functions (they take precedence over cmdlets and executables);
-# executables the scripts start by full path (control-plane binary, WinSW, python.exe) are global aliases
-# named after that path. Nothing here changes the real system: every system-changing command the
-# installers use is replaced, and all files live below the per-test root.
+# A small in-memory "Windows" - services, registry values, firewall rules, scheduled tasks, IIS objects,
+# SMB connections and NTFS ACLs with owners and inheritance - sits behind stub commands, so the installers
+# run unchanged under Pester on Linux and on Windows. Stubs are global functions (they take precedence over
+# cmdlets and executables); executables the scripts start by full path (control-plane binary, WinSW,
+# python.exe) are global aliases named after that path. Nothing here changes the real system: every
+# system-changing command the installers use is replaced, and all files live below the per-test root.
+# Junctions are modelled by real symbolic links below the root (both carry the ReparsePoint attribute).
 
 $script:FakeStubFunctions = @(
     'Get-Service', 'Start-Service', 'Stop-Service', 'New-Service', 'Set-Service', 'Get-CimInstance', 'Invoke-CimMethod',
     'Get-NetFirewallRule', 'New-NetFirewallRule', 'Remove-NetFirewallRule',
     'Get-ScheduledTask', 'Register-ScheduledTask', 'Unregister-ScheduledTask', 'New-ScheduledTaskAction',
     'New-ScheduledTaskTrigger', 'New-ScheduledTaskPrincipal', 'New-ScheduledTaskSettingsSet', 'Get-WinEvent',
-    'Install-WindowsFeature', 'Enable-WindowsOptionalFeature',
+    'Install-WindowsFeature', 'Enable-WindowsOptionalFeature', 'Get-Acl', 'Get-SmbConnection', 'Get-SmbMapping',
     'sc.exe', 'icacls.exe', 'robocopy.exe',
     'FakeControlPlaneExe', 'FakePython', 'FakeWinSW', 'FakeHttpStatus')
 
@@ -35,6 +36,9 @@ function Initialize-FakeWindows {
         Firewall      = [ordered]@{}
         Tasks         = @{}
         Acl           = @{}
+        Owner         = @{}        # full path -> owner SID; everything else is owned by Administrators
+        IcaclsIgnore  = @()        # icacls switches that report success but change nothing (broken ACL tooling)
+        Smb           = @{ Connections = @(); Mappings = @{} }
         Calls         = New-Object System.Collections.Generic.List[object]
         Aliases       = New-Object System.Collections.Generic.List[string]
         Healthy       = $true      # control-plane /healthz once running
@@ -161,6 +165,9 @@ function Initialize-FakeWindows {
         param([string]$TaskName, [string]$TaskPath, $Action, $Trigger, $Principal, $Settings, [string]$Description, [switch]$Force)
         $key = "$TaskPath$TaskName"
         if ($global:FakeWin.Tasks.ContainsKey($key) -and -not $Force) { throw "Task $key exists." }
+        if ($Principal -and "$($Principal.UserId)" -match '\\' -and -not (Test-FakePrincipal $Principal.UserId)) {
+            throw "No mapping between account names and security IDs was done: $($Principal.UserId)"
+        }
         $global:FakeWin.Tasks[$key] = @{ Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings; Description = $Description }
     }
     function global:Get-ScheduledTask {
@@ -181,6 +188,40 @@ function Initialize-FakeWindows {
         [pscustomobject]@{ Success = $true; RestartNeeded = 'No' }
     }
     function global:Enable-WindowsOptionalFeature { param([switch]$Online, [string[]]$FeatureName, [switch]$All, [switch]$NoRestart) $global:FakeWin.Iis.Features = @($FeatureName) }
+
+    function global:Get-Acl {
+        # Owner, protection flag and access rules (SIDs) as the real cmdlet reports them for
+        # GetOwner/GetAccessRules(..., [SecurityIdentifier]).
+        [CmdletBinding()]
+        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath)
+        $target = Get-FakeFullPath "$LiteralPath$Path"
+        if (-not ([System.IO.File]::Exists($target) -or [System.IO.Directory]::Exists($target))) { throw "Cannot find path '$target' because it does not exist." }
+        $entry = $global:FakeWin.Acl[$target]
+        $acl = [pscustomobject]@{
+            Owner                   = $(if ($global:FakeWin.Owner.ContainsKey($target)) { $global:FakeWin.Owner[$target] } else { 'S-1-5-32-544' })
+            AreAccessRulesProtected = [bool]($entry -and $entry.Protected)
+            Rules                   = @(Get-FakeAccessRule $target)
+        }
+        Add-Member -InputObject $acl -MemberType ScriptMethod -Name GetOwner -Value { param($Type) [pscustomobject]@{ Value = $this.Owner } }
+        Add-Member -InputObject $acl -MemberType ScriptMethod -Name GetAccessRules -Value {
+            param($IncludeExplicit, $IncludeInherited, $Type)
+            @($this.Rules | Where-Object { ($IncludeExplicit -and -not $_.IsInherited) -or ($IncludeInherited -and $_.IsInherited) })
+        }
+        $acl
+    }
+
+    function global:Get-SmbConnection {
+        [CmdletBinding()]
+        param([string]$ServerName)
+        @($global:FakeWin.Smb.Connections | Where-Object { -not $ServerName -or $_.ServerName -eq $ServerName })
+    }
+    function global:Get-SmbMapping {
+        [CmdletBinding()]
+        param([string]$LocalPath)
+        $mapping = $global:FakeWin.Smb.Mappings[$LocalPath.ToUpperInvariant()]
+        if ($mapping) { [pscustomobject]@{ LocalPath = $LocalPath; RemotePath = $mapping; Status = 'OK' } }
+        else { Write-Error -Message "No MSFT_SmbMapping objects found with property 'LocalPath' equal to '$LocalPath'." -Category ObjectNotFound }
+    }
 
     function global:sc.exe {
         $a = @($args)
@@ -216,35 +257,68 @@ function Initialize-FakeWindows {
     }
 
     function global:icacls.exe {
-        # Supports the subset the installers use: <path> [/inheritance:r] [/grant[:r] principal:(flags)rights ...] [/Q]
+        # Supports the subset the installers use: <path> [/setowner principal] [/reset] [/inheritance:r]
+        # [/grant:r principal:(flags)rights ...] [/remove[:g|:d] principal] [/T] [/C] [/Q]. With /T, /setowner and
+        # /reset also apply to everything below <path>; /reset drops the explicit ACEs (the item inherits again).
         $a = @($args)
         Add-FakeCall 'icacls.exe' $a
         $global:LASTEXITCODE = 0
         $path = Get-FakeFullPath $a[0]
-        if (-not (Test-Path -LiteralPath $path)) { "${path}: The system cannot find the file specified."; $global:LASTEXITCODE = 2; return }
-        $entry = $global:FakeWin.Acl[$path]
-        if (-not $entry) { $entry = @{ Protected = $false; Grants = [ordered]@{} }; $global:FakeWin.Acl[$path] = $entry }
-        $mode = $null
+        if (-not ([System.IO.File]::Exists($path) -or [System.IO.Directory]::Exists($path))) { "${path}: The system cannot find the file specified."; $global:LASTEXITCODE = 2; return }
+        $ops = New-Object System.Collections.Generic.List[object]
+        $mode = $null; $recurse = $false
         for ($i = 1; $i -lt $a.Count; $i++) {
             $t = $a[$i]
             switch -Regex ($t) {
-                '^/inheritance:r$' { $entry.Protected = $true; $mode = $null; continue }
+                '^/inheritance:r$' { $ops.Add(@('protect')); $mode = $null; continue }
                 '^/grant:r$' { $mode = 'grant'; continue }
-                '^/Q$' { $mode = $null; continue }
+                '^/reset$' { $ops.Add(@('reset')); $mode = $null; continue }
+                '^/(setowner|remove(:[gd])?)$' {
+                    $principal = "$($a[$i + 1])"; $i++
+                    if (-not (Test-FakePrincipal $principal)) {
+                        "${principal}: No mapping between account names and security IDs was done."; $global:LASTEXITCODE = 1332; return
+                    }
+                    $ops.Add(@(($t -replace ':[gd]$', '').TrimStart('/'), $principal)); $mode = $null; continue
+                }
+                '^/T$' { $recurse = $true; continue }
+                '^/[CQ]$' { $mode = $null; continue }
                 '^/' { "Invalid parameter `"$t`""; $global:LASTEXITCODE = 87; return }
                 default {
-                    if ($mode -ne 'grant' -or $t -notmatch '^(?<p>[^:]+):(?<ace>(\((OI|CI|IO|NP)\))*(F|M|RX|R|W))$') {
+                    if ($mode -ne 'grant' -or $t -notmatch '^(?<p>[^:]+):(?<ace>(\((OI|CI|IO|NP)\))*(F|M|RX|R|W|\([A-Z]+(,[A-Z]+)*\)))$') {
                         "Invalid parameter `"$t`""; $global:LASTEXITCODE = 87; return
                     }
                     $principal = $Matches['p']; $ace = $Matches['ace']
                     if (-not (Test-FakePrincipal $principal)) {
                         "${principal}: No mapping between account names and security IDs was done."; $global:LASTEXITCODE = 1332; return
                     }
-                    $entry.Grants[$principal] = $ace
+                    $ops.Add(@('grant', $principal, $ace))
                 }
             }
         }
-        'Successfully processed 1 files; Failed processing 0 files'
+        $targets = @($path)
+        if ($recurse -and [System.IO.Directory]::Exists($path)) {
+            $targets += @(Get-ChildItem -LiteralPath $path -Recurse -Force | ForEach-Object { Get-FakeFullPath $_.FullName })
+        }
+        foreach ($op in $ops) {
+            if ($global:FakeWin.IcaclsIgnore -contains "/$($op[0])") { continue }
+            switch ($op[0]) {
+                'setowner' { foreach ($target in $targets) { $global:FakeWin.Owner[$target] = Get-FakeSid $op[1] } }
+                'reset' { foreach ($target in $targets) { $global:FakeWin.Acl.Remove($target) } }
+                default {
+                    $entry = $global:FakeWin.Acl[$path]
+                    if (-not $entry) { $entry = @{ Protected = $false; Grants = [ordered]@{} }; $global:FakeWin.Acl[$path] = $entry }
+                    switch ($op[0]) {
+                        'protect' { $entry.Protected = $true }
+                        'grant' { $entry.Grants[$op[1]] = $op[2] }
+                        'remove' {
+                            $sid = Get-FakeSid $op[1]
+                            foreach ($key in @($entry.Grants.Keys)) { if ((Get-FakeSid $key) -eq $sid) { $entry.Grants.Remove($key) } }
+                        }
+                    }
+                }
+            }
+        }
+        'Successfully processed {0} files; Failed processing 0 files' -f $targets.Count
     }
 
     function global:robocopy.exe {
@@ -333,11 +407,11 @@ function Initialize-FakeWindows {
             for ($i = 2; $i -lt $a.Count; $i++) {
                 if ($a[$i] -eq '-r') {
                     foreach ($line in Get-Content -LiteralPath $a[$i + 1]) {
-                        if ($line -match '^\s*(?<n>[A-Za-z0-9._-]+)==(?<v>[0-9][0-9.]*)') { $py.Packages[$Matches['n'].ToLowerInvariant()] = $Matches['v'] }
+                        if ($line -match '^\s*(?<n>[A-Za-z0-9._-]+)==(?<v>[0-9][^\s;]*)') { $py.Packages[$Matches['n'].ToLowerInvariant()] = $Matches['v'] }
                     }
                     $i++
                 }
-                elseif ($a[$i] -match '^(?<n>[A-Za-z0-9._-]+)==(?<v>[0-9][0-9.]*)$') {
+                elseif ($a[$i] -match '^(?<n>[A-Za-z0-9._-]+)==(?<v>[0-9][^\s;]*)$') {
                     $py.Packages[$Matches['n'].ToLowerInvariant()] = $Matches['v']
                     # mitmproxy's own metadata caps Brotli below the fixed release.
                     if ($Matches['n'] -eq 'mitmproxy') { $py.Packages['brotli'] = '1.1.0' }
@@ -352,6 +426,22 @@ function Initialize-FakeWindows {
                 'import sys; print(sys.version_info*' { $py.Version; return }
                 'import http.server*' { if ($py.Packages.ContainsKey('mitmproxy')) { $py.Packages['mitmproxy'] } else { 'ModuleNotFoundError'; $global:LASTEXITCODE = 1 }; return }
                 'import yara_x' { if (-not $py.Packages.ContainsKey('yara-x')) { 'ModuleNotFoundError'; $global:LASTEXITCODE = 1 }; return }
+                'import re, sys, importlib.metadata*' {
+                    # Security baseline check: installed versions against requirements-security.txt (packaging.version).
+                    $low = @()
+                    foreach ($line in Get-Content -LiteralPath $a[2]) {
+                        if ($line -notmatch '^\s*(?<n>[A-Za-z0-9._-]+)==(?<v>\S+)') { continue }
+                        $name = $Matches['n']; $minimum = $Matches['v']
+                        $have = $py.Packages[$name.ToLowerInvariant()]
+                        if (-not $have) { continue }
+                        $cmp = Compare-FakePep440 $have $minimum
+                        if ($null -eq $cmp) { 'Traceback (most recent call last):'; "packaging.version.InvalidVersion: Invalid version: '$have'"; $global:LASTEXITCODE = 1; return }
+                        if ($cmp -lt 0) { $low += "$name $have < $minimum" }
+                    }
+                    $low -join '; '
+                    $global:LASTEXITCODE = [int]($low.Count -gt 0)
+                    return
+                }
                 'import importlib.metadata*' {
                     $n = "$($a[2])".ToLowerInvariant()
                     if ($py.Packages.ContainsKey($n)) { $py.Packages[$n] } else { 'PackageNotFoundError'; $global:LASTEXITCODE = 1 }
@@ -501,6 +591,72 @@ function global:Test-FakePrincipal([string]$Principal) {
     return $Principal -in @('NT AUTHORITY\LocalService', 'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'BUILTIN\Users')
 }
 
+function global:Get-FakeSid([string]$Principal) {
+    # SID string of an icacls principal; virtual accounts are hashed like Windows does (S-1-5-80: upper-case
+    # service name, S-1-5-82: lower-case application pool name).
+    if ($Principal -match '^\*?(?<sid>S-1-[0-9-]+)$') { return $Matches['sid'] }
+    $virtual = $null
+    if ($Principal -match '^NT SERVICE\\(?<n>.+)$') { $virtual = @('S-1-5-80', $Matches['n'].ToUpperInvariant()) }
+    elseif ($Principal -match '^IIS AppPool\\(?<n>.+)$') { $virtual = @('S-1-5-82', $Matches['n'].ToLowerInvariant()) }
+    if ($virtual) {
+        $hash = [System.Security.Cryptography.SHA1]::HashData([System.Text.Encoding]::Unicode.GetBytes($virtual[1]))
+        return $virtual[0] + '-' + ((0..4 | ForEach-Object { [System.BitConverter]::ToUInt32($hash, 4 * $_) }) -join '-')
+    }
+    $wellKnown = @{ 'NT AUTHORITY\LocalService' = 'S-1-5-19'; 'NT AUTHORITY\SYSTEM' = 'S-1-5-18'; 'BUILTIN\Administrators' = 'S-1-5-32-544'; 'BUILTIN\Users' = 'S-1-5-32-545' }
+    if ($wellKnown.ContainsKey($Principal)) { return $wellKnown[$Principal] }
+    return $Principal
+}
+
+function global:ConvertFrom-FakeAce([string]$Ace) {
+    # '(OI)(CI)RX' or '(CI)(WD,AD)' -> inheritance flags and the FileSystemRights mask icacls would write.
+    $simple = @{ F = 0x1F01FF; M = 0x1301BF; RX = 0x1200A9; R = 0x120089; W = 0x120116 }
+    $specific = @{ RD = 0x1; WD = 0x2; AD = 0x4; REA = 0x8; WEA = 0x10; X = 0x20; DC = 0x40; RA = 0x80; WA = 0x100
+        D = 0x10000; RC = 0x20000; WDAC = 0x40000; WO = 0x80000; S = 0x100000; GA = 0x10000000; GE = 0x20000000; GW = 0x40000000; GR = [int]::MinValue }
+    $flags = @([regex]::Matches($Ace, '\((OI|CI|IO|NP)\)') | ForEach-Object { $_.Groups[1].Value })
+    $rights = $Ace -replace '\((OI|CI|IO|NP)\)', ''
+    $mask = 0
+    if ($simple.ContainsKey($rights)) { $mask = $simple[$rights] }
+    else { foreach ($token in $rights.Trim('(', ')').Split(',')) { $mask = $mask -bor $specific[$token] } }
+    [pscustomobject]@{ Flags = $flags; Rights = $mask }
+}
+
+function global:Get-FakeAccessRule([string]$Path) {
+    # Access rules of Path as Get-Acl reports them: its explicit ACEs, then the ACEs its ancestors pass on (up to
+    # and including the nearest protected one), each with the SID of its principal.
+    $isDir = [System.IO.Directory]::Exists($Path)   # not Test-Path: it is mocked, which is slow
+    $current = $Path
+    $depth = 0
+    while ($current) {
+        $entry = $global:FakeWin.Acl[$current]
+        if ($entry) {
+            foreach ($p in $entry.Grants.Keys) {
+                $ace = ConvertFrom-FakeAce $entry.Grants[$p]
+                if ($depth -gt 0) {
+                    if (-not ($ace.Flags -contains $(if ($isDir) { 'CI' } else { 'OI' }))) { continue }
+                    if ($depth -gt 1 -and $ace.Flags -contains 'NP') { continue }
+                }
+                $inheritance = @()
+                if ($ace.Flags -contains 'OI') { $inheritance += 'ObjectInherit' }
+                if ($ace.Flags -contains 'CI') { $inheritance += 'ContainerInherit' }
+                [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = Get-FakeSid $p }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]$ace.Rights
+                    AccessControlType = 'Allow'
+                    IsInherited       = ($depth -gt 0)
+                    InheritanceFlags  = $(if ($inheritance.Count) { $inheritance -join ', ' } else { 'None' })
+                    PropagationFlags  = $(if ($depth -eq 0 -and $ace.Flags -contains 'IO') { 'InheritOnly' } else { 'None' })
+                }
+            }
+            if ($entry.Protected) { break }
+        }
+        if ($current -eq $global:FakeWin.Root) { break }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+        $depth++
+    }
+}
+
 function global:Test-RobocopyExcluded([string]$Relative, [string[]]$ExcludeDirs, [string[]]$ExcludeFiles) {
     $parts = @($Relative -split '[\\/]')
     for ($i = 0; $i -lt $parts.Count - 1; $i++) { if ($ExcludeDirs -contains $parts[$i]) { return $true } }
@@ -513,7 +669,7 @@ function Get-FakeAccess {
     # including) the nearest protected one. Returns @{ principal = rights }.
     param([Parameter(Mandatory = $true)][string]$Path)
     $path = Get-FakeFullPath $Path
-    $isDir = Test-Path -LiteralPath $path -PathType Container
+    $isDir = [System.IO.Directory]::Exists($path)
     $result = @{}
     $current = $path
     $first = $true
@@ -525,7 +681,7 @@ function Get-FakeAccess {
                 $inherits = if ($isDir) { $ace -match '\(CI\)' } else { $ace -match '\(OI\)' }
                 if ($first -and $ace -match '\(IO\)') { continue }
                 if (-not $first -and -not $inherits) { continue }
-                $rights = $ace -replace '\([A-Z]+\)', ''
+                $rights = $ace -replace '\((OI|CI|IO|NP)\)', ''
                 if (-not $result.ContainsKey($p)) { $result[$p] = $rights }
             }
             if ($entry.Protected) { break }
@@ -547,11 +703,30 @@ function Get-PrincipalList([string]$Path) {
 function Join-Sorted([string[]]$Items) { (@($Items) | Sort-Object) -join ',' }
 
 function Test-FakeWritable {
-    # True if one of the given principals may create or change files at Path.
+    # True if one of the given principals may create, change, delete or re-ACL files at Path.
     param([string]$Path, [string[]]$Principals = @($script:SidUsers, $script:SidAuthenticatedUsers))
     $access = Get-FakeAccess $Path
-    foreach ($p in $Principals) { if ($access.ContainsKey($p) -and $access[$p] -in @('F', 'M', 'W')) { return $true } }
+    foreach ($p in $Principals) { if ($access.ContainsKey($p) -and ((ConvertFrom-FakeAce $access[$p]).Rights -band 0x500D0156)) { return $true } }
     return $false
+}
+
+function Set-FakeOwner {
+    # Owner of Path (and everything below it), e.g. a non-administrator who created a directory in advance.
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Sid)
+    $global:FakeWin.Owner[(Get-FakeFullPath $Path)] = $Sid
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)) { $global:FakeWin.Owner[(Get-FakeFullPath $item.FullName)] = $Sid }
+}
+
+function global:Compare-FakePep440([string]$Left, [string]$Right) {
+    # -1/0/1 like packaging.version.Version for release[{a|b|rc}N][.postN][.devN]; $null for an invalid version.
+    $keys = foreach ($v in @($Left, $Right)) {
+        if ($v -notmatch '^(?<rel>\d+(\.\d+)*)((?<pre>a|b|rc)(?<pren>\d+))?(\.post(?<post>\d+))?(\.dev(?<dev>\d+))?$') { return $null }
+        $release = @($Matches['rel'].Split('.') | ForEach-Object { [int]$_ }) + @(0, 0, 0, 0, 0, 0)
+        $phase = if ($Matches['pre']) { @{ a = -3; b = -2; rc = -1 }[$Matches['pre']] } elseif ($Matches['post']) { 1 } elseif ($Matches['dev']) { -4 } else { 0 }
+        , (@($release[0..5]) + @($phase))
+    }
+    for ($i = 0; $i -lt 7; $i++) { if ($keys[0][$i] -ne $keys[1][$i]) { return [math]::Sign($keys[0][$i] - $keys[1][$i]) } }
+    return 0
 }
 
 function global:New-TestCa {

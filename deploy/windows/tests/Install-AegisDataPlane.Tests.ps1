@@ -109,13 +109,51 @@ Describe 'Install-AegisDataPlane.ps1' {
             { & $Installer @p } | Should -Throw '*must contain the CA private key AND certificate*'
         }
 
-        It 'requires -CaFile unless a CA is staged or the control-plane CA is on this host' {
+        It 'requires -CaFile unless a CA is staged or an installed control-plane on this host restricts its CA to administrators' {
             $p = $Base.Clone(); $p.Remove('CaFile')
             { & $Installer @p } | Should -Throw '*-CaFile is required*'
-            New-TestCa -Dir (Join-Path $env:ProgramData 'AegisProxy\certs') | Out-Null
+            $certs = Join-Path $env:ProgramData 'AegisProxy\certs'
+            New-TestCa -Dir $certs | Out-Null
+            { & $Installer @p } | Should -Throw '*-CaFile is required*' -Because 'without a control-plane service anybody may have put the file there'
+            $FakeWin.Services['AegisControlPlane'] = @{ Status = 'Running'; StartType = 'Automatic' }
+            { & $Installer @p } | Should -Throw '*control-plane CA on this host is not restricted*S-1-5-11*'
+            $FakeWin.Acl[(Get-FakeFullPath $certs)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F' } }
             $run = Invoke-Installer -Path $Installer -Parameters $p
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Match 'Using the control-plane CA on this host'
+        }
+
+        It 'refuses -<Parameter> from an SMB share without encryption before changing anything' -TestCases @(
+            @{ Parameter = 'DataPlaneKeyFile'; Leaf = 'secrets\dataplane.key' }, @{ Parameter = 'CaFile'; Leaf = 'certs\mitmproxy-ca.pem' }
+        ) {
+            $FakeWin.Smb.Connections = @([pscustomobject]@{ ServerName = 'cp1'; ShareName = 'c$'; Encrypted = $false })
+            $p = $Base.Clone(); $p[$Parameter] = "\\cp1\c$\ProgramData\AegisProxy\$Leaf"
+            { & $Installer @p } | Should -Throw "*-$Parameter reads secrets from \\cp1\c$ over an SMB connection that is not encrypted*"
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'refuses a base interpreter that <Case>' -TestCases @(
+            @{ Case = 'non-administrators can modify (C:\Python312 below a client volume root)'; Dir = 'Python312'; Relative = ''; Ace = $null; Groups = 'Authenticated Users' },
+            @{ Case = 'lets users create files in Lib (sitecustomize.py)'; Dir = 'Program Files\Python313'; Relative = 'Lib'; Ace = '(CI)(WD,AD)'; Groups = 'Users' },
+            @{ Case = 'lets everyone change site-packages'; Dir = 'Program Files\Python313'; Relative = 'Lib\site-packages'; Ace = '(OI)(CI)M'; Groups = 'Everyone' }
+        ) {
+            $pyHome = Join-Path $env:SystemDrive $Dir
+            $py = Join-Path $pyHome 'python.exe'
+            New-FakeBinary -Path $py
+            Register-FakeExecutable -Path $py -Function FakePython
+            New-Item -ItemType Directory -Path (Join-Path $pyHome 'Lib\site-packages') -Force | Out-Null
+            $weak = if ($Relative) { Join-Path $pyHome $Relative } else { $pyHome }
+            if ($Ace) {
+                $grantee = @{ Users = '*S-1-5-32-545'; Everyone = '*S-1-1-0' }[$Groups]
+                $FakeWin.Acl[(Get-FakeFullPath $weak)] = @{ Protected = $false; Grants = [ordered]@{ $grantee = $Ace } }
+            }
+            $err = { & $Installer @Base -PythonExe $py } | Should -Throw "*can be modified by non-administrators*($Groups)*C:\Program Files\Python312*-AllowWritablePython*" -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($Groups)"))
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py; AllowWritablePython = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Continuing because of -AllowWritablePython'
         }
 
         It 'rejects clamd address <Address>' -TestCases @(@{ Address = 'unix:///var/run/clamd.ctl' }, @{ Address = 'clamd' }, @{ Address = 'tcp://h:p' }) {
@@ -341,10 +379,40 @@ Describe 'Install-AegisDataPlane.ps1' {
             $FakeWin.Services.Count | Should -Be 0
         }
 
-        It 'refuses a hash-pinned requirements file below the security baseline' {
+        It 'refuses a hash-pinned requirements file below the security baseline (<Version>)' -TestCases @(
+            @{ Version = '1.1.0' }, @{ Version = '1.2.1rc1' }, @{ Version = '1.2.1.dev3' }
+        ) {
+            # [version] cannot parse pre-releases; the comparison runs in the venv with packaging (PEP 440).
             $req = Join-Path $FakeWin.Root 'requirements-win.txt'
-            Set-Content -LiteralPath $req -Value @('mitmproxy==12.3.0 --hash=sha256:aa', 'Brotli==1.1.0 --hash=sha256:bb')
-            { & $Installer @Base -RequirementsFile $req } | Should -Throw '*Brotli 1.1.0*requires >= 1.2.1*'
+            Set-Content -LiteralPath $req -Value @('mitmproxy==12.3.0 --hash=sha256:aa', "Brotli==$Version --hash=sha256:bb")
+            { & $Installer @Base -RequirementsFile $req } | Should -Throw "*does not meet the security baseline*Brotli $Version < 1.2.1*"
+            $check = @(Get-FakeCall 'python' | Where-Object { $_.Args[0] -eq '-c' -and $_.Args[1] -like 'import re, sys, importlib.metadata*' })
+            $check.Count | Should -Be 1
+            $check[0].Exe | Should -Be $VenvPython
+            $check[0].Args[1] | Should -Match 'from packaging\.version import Version'
+            $check[0].Args[1] | Should -Not -Match '"' -Because 'Windows PowerShell 5.1 mangles double quotes in native arguments'
+            $check[0].Args[2] | Should -Be $SecurityRequirements
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'accepts a post-release of the baseline and fails closed on an invalid version' {
+            $req = Join-Path $FakeWin.Root 'requirements-win.txt'
+            Set-Content -LiteralPath $req -Value @('mitmproxy==12.3.0 --hash=sha256:aa', 'Brotli==1.2.1.post1 --hash=sha256:bb')
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ RequirementsFile = $req })).ExitCode | Should -Be 0
+            Set-Content -LiteralPath $req -Value @('mitmproxy==12.3.0 --hash=sha256:aa', 'Brotli==1.2.1-local-build --hash=sha256:bb')
+            { & $Installer @Base -RequirementsFile $req } | Should -Throw '*does not meet the security baseline*InvalidVersion*'
+        }
+
+        It 'tolerates pip check conflicts of an override reported under another spelling (PEP 503)' {
+            $req = Join-Path $FakeWin.Root 'requirements-win.txt'
+            $source = Join-Path $FakeWin.Root 'source'
+            foreach ($file in @('aegis_addon.py', 'aegis_dp\__init__.py', 'aegis_dp\addon.py')) {
+                New-Item -ItemType File -Path (Join-Path $source $file) -Force | Out-Null
+            }
+            Set-Content -LiteralPath (Join-Path $source 'requirements-security.txt') -Value 'typing_extensions==4.15.0'
+            Set-Content -LiteralPath $req -Value @('mitmproxy==12.3.0 --hash=sha256:aa', 'typing-extensions==4.15.0 --hash=sha256:bb')
+            $FakeWin.Python.PipCheck = @('mitmproxy 12.3.0 has requirement typing-extensions<4.14, but you have typing.extensions 4.15.0.')
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ RequirementsFile = $req; SourceDir = $source })).ExitCode | Should -Be 0
         }
 
         It 'appends -PipArgs to both pip runs' {
@@ -413,6 +481,105 @@ Describe 'Install-AegisDataPlane.ps1' {
             $FakeWin.Services.Count | Should -Be 0
             Test-Path -LiteralPath $InstallDir | Should -BeFalse
             Test-Path -LiteralPath $DataRoot | Should -BeFalse
+        }
+
+        It 'installs the copy whose hash it verified, not a -WinSWExe that changed after the early check' {
+            # Stands in for any change of the (user-writable) source between the early check and the copy.
+            $global:SwapWinSW = $WinSW
+            Set-Item -LiteralPath 'Function:\global:FakePythonSwap' -Value {
+                if ($args[0] -eq '-m' -and $args[1] -eq 'pip' -and $args[2] -eq 'install') { [System.IO.File]::WriteAllBytes($global:SwapWinSW, [byte[]](0x4D, 0x5A, 0x21)) }
+                FakePython @args
+            }
+            Register-FakeExecutable -Path $VenvPython -Function FakePythonSwap
+            try { { & $Installer @Base } | Should -Throw "*SHA-256 of the copied wrapper is*expected $WinSWHash*changed after it was verified*" }
+            finally { Remove-Item -LiteralPath 'Function:\FakePythonSwap' -ErrorAction SilentlyContinue }
+            Test-Path -LiteralPath $WrapperExe | Should -BeFalse
+            Test-Path -LiteralPath "$WrapperExe.new" | Should -BeFalse
+            @(Get-FakeCall 'winsw').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'keeps the installed service when the new wrapper copy does not verify on an upgrade' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            Mock Get-FileHash -ParameterFilter { "$LiteralPath" -like '*.new' } { [pscustomobject]@{ Hash = '0' * 64 } }
+            { & $Installer @Base } | Should -Throw '*SHA-256 of the copied wrapper*'
+            $FakeWin.Services.ContainsKey('AegisDataPlane') | Should -BeTrue
+            (Get-FileHash -LiteralPath $WrapperExe -Algorithm SHA256).Hash | Should -Be $WinSWHash
+        }
+    }
+
+    Context 'directories that existed before the first installation' {
+        BeforeEach {
+            # A local user created the data and program directories in advance, owns them and granted
+            # Authenticated Users modify explicitly.
+            $script:Planter = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+            foreach ($d in @($ConfDir, $SecretsDir, $LogsDir, $InstallDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+            foreach ($d in @($DataRoot, $ConfDir, $InstallDir)) {
+                $FakeWin.Acl[(Get-FakeFullPath $d)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-11' = '(OI)(CI)M' } }
+            }
+            Set-FakeOwner -Path $DataRoot -Sid $Planter
+            Set-FakeOwner -Path $InstallDir -Sid $Planter
+        }
+
+        It 'refuses a pre-seeded <Name> on a first installation and changes nothing' -TestCases @(
+            @{ Name = 'mitmdump configuration'; PlantIn = 'ConfDir'; PlantFile = 'config.yaml' },
+            @{ Name = 'staged CA'; PlantIn = 'ConfDir'; PlantFile = 'mitmproxy-ca.pem' },
+            @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' },
+            @{ Name = 'venv'; PlantIn = 'VenvDir'; PlantFile = 'Lib\site-packages\evil.pth' },
+            @{ Name = '.NET extraction cache'; PlantIn = 'RuntimeDir'; PlantFile = 'aegis-dataplane\x\hostfxr.dll' }
+        ) {
+            $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
+            New-Item -ItemType Directory -Path (Split-Path -Parent $planted) -Force | Out-Null
+            Set-Content -LiteralPath $planted -Value 'planted'
+            $err = { & $Installer @Base } | Should -Throw '*Refusing to adopt 1 file(s)*service AegisDataPlane is not installed*-AdoptExistingSecrets*' -PassThru
+            "$err" | Should -Match ([regex]::Escape((Split-Path -Leaf $planted)))
+            $FakeWin.Services.Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            (Get-FakeCall 'python').Count | Should -Be 1 -Because 'only the version probe of the base interpreter ran'
+        }
+
+        It 'adopts files with -AdoptExistingSecrets, but takes ownership and removes the planted ACEs' {
+            $bundle = Join-Path $SecretsDir 'control-plane-ca.pem'
+            Set-Content -LiteralPath $bundle -Value 'restored bundle'
+            Set-FakeOwner -Path $DataRoot -Sid $Planter
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ AdoptExistingSecrets = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'AdoptExistingSecrets: keeping 1 pre-existing file'
+            (Get-RenderedService).Env['AEGIS_CONTROL_PLANE_CA_FILE'] | Should -Be $bundle
+            foreach ($path in @($InstallDir, $DataRoot, $ConfDir, $SecretsDir, $bundle)) {
+                (Get-Acl -LiteralPath $path).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $path
+                (Get-FakeAccess $path).ContainsKey('*S-1-5-11') | Should -BeFalse -Because $path
+            }
+            Get-PrincipalList $bundle | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'NT SERVICE\AegisDataPlane')
+        }
+
+        It 'takes over the empty pre-existing directories (and old logs) without -AdoptExistingSecrets' {
+            Set-Content -LiteralPath (Join-Path $LogsDir 'aegisdataplane.out.log') -Value 'old log'
+            $run = Invoke-Installer -Path $Installer -Parameters $Base
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'ACLs verified'
+            foreach ($path in @($InstallDir, $VenvPython, $WrapperExe, $DataRoot, $ConfDir, $LogsDir, (Join-Path $LogsDir 'aegisdataplane.out.log'))) {
+                Test-FakeWritable -Path $path -Principals @('*S-1-5-11', '*S-1-5-32-545') | Should -BeFalse -Because $path
+            }
+            foreach ($path in @($InstallDir, $DataRoot, $ConfDir)) { (Get-Acl -LiteralPath $path).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $path }
+            Get-PrincipalList $InstallDir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545', 'NT SERVICE\AegisDataPlane')
+        }
+
+        It 'aborts before starting the service when the resulting ACL cannot be verified' {
+            $FakeWin.IcaclsIgnore = @('/remove')
+            { & $Installer @Base } | Should -Throw '*ACL verification failed*: access for S-1-5-11 is not expected*'
+            $FakeWin.Services['AegisDataPlane'].Status | Should -Be 'Stopped'
+            @(Get-FakeCall 'Start-Service').Count | Should -Be 0
+        }
+
+        It 'refuses a junction below the program or data directory and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
+            New-Item -ItemType SymbolicLink -Path (Join-Path $LogsDir 'link') -Target $target | Out-Null
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed*link*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
         }
     }
 
@@ -489,6 +656,20 @@ Describe 'Install-AegisDataPlane.ps1' {
             $run = Invoke-Installer -Path $Installer -Parameters @{ Uninstall = $true; Confirm = $false }
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Match 'is not installed'
+        }
+
+        It 'never recurses through a junction below the staged copies or the program files' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $outside = Join-Path $FakeWin.Root 'outside'
+            New-Item -ItemType Directory -Path (Join-Path $outside 'sub') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $outside 'sub\keep.txt') -Value 'x'
+            New-Item -ItemType SymbolicLink -Path (Join-Path $SecretsDir 'link') -Target $outside | Out-Null
+            New-Item -ItemType SymbolicLink -Path (Join-Path $AppDir 'aegis_dp\link') -Target $outside | Out-Null
+            # Windows PowerShell 5.1's Remove-Item -Recurse deletes the content of junction targets.
+            Mock Remove-Item -ParameterFilter { $Recurse -and "$LiteralPath$Path" -notlike 'HKLM:*' } { throw 'Remove-Item -Recurse follows junctions in Windows PowerShell 5.1' }
+            (Invoke-Installer -Path $Installer -Parameters @{ Uninstall = $true; Confirm = $false }).ExitCode | Should -Be 0
+            foreach ($path in @($InstallDir, $SecretsDir, $ConfDir, $RuntimeDir)) { Test-Path -LiteralPath $path | Should -BeFalse -Because $path }
+            Test-Path -LiteralPath (Join-Path $outside 'sub\keep.txt') | Should -BeTrue
         }
     }
 
