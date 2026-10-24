@@ -510,6 +510,8 @@ export interface PolicyRule {
   path_pattern: string;
   methods: string[] | null;
   follow_redirects: boolean;
+  /** Hosts redirect grants of this rule may target (patterns); absent/empty = any public host. */
+  redirect_hosts?: string[] | null;
   companion_rules: string[] | null;
   /** Only set on compiled (effective) rules; rules inside a set carry no scope. */
   group_ids: string[] | null;
@@ -537,6 +539,7 @@ export type RuleInput = Pick<
   id?: string;
   methods: string[];
   companion_rules: string[];
+  redirect_hosts?: string[] | null;
   expires_at?: string;
 } & Partial<Omit<PolicyRule, 'methods' | 'companion_rules'>>;
 
@@ -1149,6 +1152,8 @@ export interface SecurityPolicy {
   av_oversize_action: 'allow' | 'block';
   dlp_mode: ThreatMode;
   dlp_max_scan_bytes: number;
+  /** Uploads above the DLP / ICAP REQMOD scan limit (absent in older responses = allow). */
+  dlp_oversize_action?: 'allow' | 'block';
   dlp_detectors: string[];
   blocked_file_types: string[];
   group_blocked_file_types?: Record<string, string[]>;

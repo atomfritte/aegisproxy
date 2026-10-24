@@ -7,6 +7,8 @@ import socket
 from dataclasses import dataclass, field
 from typing import List
 
+from .buffering import parse_size
+
 KNOWN_LEAKED_KEYS = {"aegis-dp-internal-key-2026-v1"}
 
 
@@ -57,6 +59,7 @@ class Config:
     access_log_format: str = "squid"  # squid | combined | json
     access_log_rotate_mb: int = 0  # > 0: the worker rotates a file destination itself (default on Windows)
     access_log_keep: int = 10
+    buffer_budget: int = 0  # bytes of bodies buffered for inspection at once; 0 = min(512 MiB, body_size_limit)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -82,6 +85,12 @@ class Config:
         if not 0 <= rotate_mb <= 1_048_576 or not 1 <= keep <= 1000:
             raise ConfigError("AEGIS_ACCESS_LOG_ROTATE_MB must be 0-1048576 and AEGIS_ACCESS_LOG_KEEP 1-1000")
         magic = [h.strip().lower() for h in os.environ.get("AEGIS_MAGIC_HOSTS", "aegis.ca,mitm.it").split(",") if h.strip()]
+        try:
+            budget = parse_size(os.environ.get("AEGIS_BUFFER_BUDGET", "")) or 0
+        except ValueError as exc:
+            raise ConfigError("AEGIS_BUFFER_BUDGET must be a size such as 512m or 1g") from exc
+        if budget and budget < 1 << 20:
+            raise ConfigError("AEGIS_BUFFER_BUDGET must be at least 1m")
         return cls(
             control_plane_url=os.environ.get("CONTROL_PLANE_URL", "http://localhost:8081").rstrip("/"),
             dataplane_key=key,
@@ -101,4 +110,5 @@ class Config:
             access_log_format=access_format,
             access_log_rotate_mb=rotate_mb,
             access_log_keep=keep,
+            buffer_budget=budget,
         )

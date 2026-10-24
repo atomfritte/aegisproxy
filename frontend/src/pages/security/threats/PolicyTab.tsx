@@ -44,6 +44,7 @@ interface Draft {
   av_oversize_action: 'allow' | 'block';
   dlp_mode: ThreatMode;
   dlp_max_scan_kib: string;
+  dlp_oversize_action: 'allow' | 'block';
   dlp_detectors: string[];
   blocked_file_types: string[];
   group_blocked_file_types: Record<string, string[]>;
@@ -78,6 +79,7 @@ const toDraft = (p: SecurityPolicy): Draft => ({
   av_oversize_action: p.av_oversize_action,
   dlp_mode: p.dlp_mode,
   dlp_max_scan_kib: round((p.dlp_max_scan_bytes || 0) / KIB),
+  dlp_oversize_action: p.dlp_oversize_action === 'block' ? 'block' : 'allow',
   dlp_detectors: [...(p.dlp_detectors ?? [])],
   blocked_file_types: [...(p.blocked_file_types ?? [])],
   group_blocked_file_types: Object.fromEntries(Object.entries(p.group_blocked_file_types ?? {}).map(([k, v]) => [k, [...(v ?? [])]])),
@@ -140,6 +142,7 @@ function fromDraft(d: Draft): SecurityPolicy {
     av_oversize_action: d.av_oversize_action,
     dlp_mode: d.dlp_mode,
     dlp_max_scan_bytes: Math.round(Number(d.dlp_max_scan_kib) * KIB),
+    dlp_oversize_action: d.dlp_oversize_action,
     dlp_detectors: [...d.dlp_detectors],
     blocked_file_types: [...d.blocked_file_types],
     group_blocked_file_types: Object.keys(groups).length ? groups : undefined,
@@ -530,9 +533,21 @@ export const PolicyTab: React.FC = () => {
             onChange={(v) => set({ dlp_mode: v })}
             options={modeOptions('Deny requests that contain secrets')}
           />
-          <Field label="Largest request body to scan" error={err('dlp_max_scan_kib')} hint={err('dlp_max_scan_kib') ? undefined : '4 KiB to 64 MiB (65536 KiB).'} className="sm:max-w-[280px]">
-            <Input type="number" min={4} max={65536} step="any" value={draft.dlp_max_scan_kib} onChange={(e) => set({ dlp_max_scan_kib: e.target.value })} trailing={unit('KiB')} />
-          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Largest request body to scan" error={err('dlp_max_scan_kib')} hint={err('dlp_max_scan_kib') ? undefined : 'Scanned completely up to this size; 4 KiB to 64 MiB (65536 KiB).'}>
+              <Input type="number" min={4} max={65536} step="any" value={draft.dlp_max_scan_kib} onChange={(e) => set({ dlp_max_scan_kib: e.target.value })} trailing={unit('KiB')} />
+            </Field>
+            <Field label="Uploads above the limit" hint="Also applies to the ICAP REQMOD size limit.">
+              <Select
+                value={draft.dlp_oversize_action}
+                onChange={(e) => set({ dlp_oversize_action: e.target.value as 'allow' | 'block' })}
+                options={[
+                  { value: 'allow', label: 'Forward unscanned (flagged)' },
+                  { value: 'block', label: 'Block (413)' },
+                ]}
+              />
+            </Field>
+          </div>
           <div>
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <span className="label">

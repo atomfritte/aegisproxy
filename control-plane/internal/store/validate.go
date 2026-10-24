@@ -39,6 +39,7 @@ func DefaultSecurityPolicy() models.SecurityPolicy {
 		AVOversizeAction:         "allow",
 		DLPMode:                  "monitor",
 		DLPMaxScanBytes:          1 << 20,
+		DLPOversizeAction:        "allow",
 		DLPDetectors:             append([]string(nil), DLPDetectors...),
 		BlockedFileTypes:         []string{},
 		BlockIPLiterals:          true,
@@ -165,6 +166,30 @@ func validateCompanion(c string) (string, error) {
 	return h + p, nil
 }
 
+// validateRedirectHosts normalizes the optional redirect target allowlist of a rule (nil when empty).
+func validateRedirectHosts(list []string) ([]string, error) {
+	if len(list) > 20 {
+		return nil, errors.New("at most 20 redirect hosts are allowed")
+	}
+	var out []string
+	for _, raw := range list {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		h, err := ValidateHostPattern(raw)
+		if err != nil {
+			return nil, fmt.Errorf("redirect host: %w", err)
+		}
+		if h == "*" {
+			return nil, errors.New("redirect host: '*' is the default (leave the list empty)")
+		}
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
 // normalizeAndValidateRuleLocked validates a policy rule against the current fleet.
 func (s *Store) normalizeAndValidateRuleLocked(r *models.PolicyRule, actorRole models.Role) error {
 	if err := checkText("name", r.Name, 200, true); err != nil {
@@ -220,6 +245,9 @@ func (s *Store) normalizeAndValidateRuleLocked(r *models.PolicyRule, actorRole m
 		comps = append(comps, v)
 	}
 	r.CompanionRules = comps
+	if r.RedirectHosts, err = validateRedirectHosts(r.RedirectHosts); err != nil {
+		return err
+	}
 	if err := s.validateScopeLocked(r.GroupIDs, r.ServerIDs); err != nil {
 		return err
 	}
@@ -316,6 +344,12 @@ func validateSecurityPolicy(p *models.SecurityPolicy, groups []models.ServerGrou
 		return err
 	}
 	if err := validateMode("dlp_mode", p.DLPMode, "off", "monitor", "block"); err != nil {
+		return err
+	}
+	if p.DLPOversizeAction == "" {
+		p.DLPOversizeAction = "allow" // clients that predate the field
+	}
+	if err := validateMode("dlp_oversize_action", p.DLPOversizeAction, "allow", "block"); err != nil {
 		return err
 	}
 	if err := validateMode("punycode_mode", p.PunycodeMode, "off", "monitor", "block"); err != nil {

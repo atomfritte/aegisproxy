@@ -1,0 +1,329 @@
+{
+ "_comment": "Shared vectors for engine.NormalizeHost/engine.CanonicalizePath (control-plane, Go) and normalize_host/canonicalize_path (data-plane, Python). Both test suites read this file; change it only together with both implementations.",
+ "hosts": [
+  {
+   "in": "GitHub.com",
+   "out": "github.com"
+  },
+  {
+   "in": "github.com.",
+   "out": "github.com"
+  },
+  {
+   "in": "github.com:443",
+   "out": "github.com"
+  },
+  {
+   "in": "GitHub.COM.:8443",
+   "out": "github.com"
+  },
+  {
+   "in": " github.com ",
+   "out": "github.com"
+  },
+  {
+   "in": "\tgithub.com\r\n",
+   "out": "github.com"
+  },
+  {
+   "in": "[::1]",
+   "out": "::1"
+  },
+  {
+   "in": "[::1]:443",
+   "out": "::1"
+  },
+  {
+   "in": "[2001:DB8::1]:8080",
+   "out": "2001:db8::1"
+  },
+  {
+   "in": "2001:db8::1",
+   "out": "2001:db8::1"
+  },
+  {
+   "in": "2001:DB8::1",
+   "out": "2001:db8::1"
+  },
+  {
+   "in": "::1",
+   "out": "::1"
+  },
+  {
+   "in": "a:b:c",
+   "out": "a:b:c"
+  },
+  {
+   "in": "[::1",
+   "out": "[::1"
+  },
+  {
+   "in": "",
+   "out": ""
+  },
+  {
+   "in": "   ",
+   "out": ""
+  },
+  {
+   "in": "example.com..",
+   "out": "example.com"
+  },
+  {
+   "in": "localhost:",
+   "out": "localhost"
+  },
+  {
+   "in": ":443",
+   "out": ""
+  },
+  {
+   "in": "xn--Pple-43D.com",
+   "out": "xn--pple-43d.com"
+  },
+  {
+   "in": "10.0.0.1:80",
+   "out": "10.0.0.1"
+  },
+  {
+   "in": "ex ample.com",
+   "out": "ex ample.com"
+  },
+  {
+   "in": "\u00a0github.com",
+   "out": "\u00a0github.com"
+  },
+  {
+   "in": "G\u0130THUB.com",
+   "out": "g\u0130thub.com"
+  },
+  {
+   "in": "\u00c4BC.example",
+   "out": "\u00c4bc.example"
+  },
+  {
+   "in": "*.GitHub.com",
+   "out": "*.github.com"
+  },
+  {
+   "in": "*",
+   "out": "*"
+  },
+  {
+   "in": "host:abc",
+   "out": "host"
+  }
+ ],
+ "paths": [
+  {
+   "in": "",
+   "out": "/",
+   "ok": true
+  },
+  {
+   "in": "/",
+   "out": "/",
+   "ok": true
+  },
+  {
+   "in": "/a/b",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "/A/B",
+   "out": "/A/B",
+   "ok": true
+  },
+  {
+   "in": "/a/../b",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/%2e%2e/b",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/%252e%252e/b",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/%25252e%25252e/b",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/%2525252e%2525252e/b",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "//a",
+   "out": "/a",
+   "ok": true
+  },
+  {
+   "in": "///a//b/",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "//a/../b",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/./b/",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "a/b",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "/..",
+   "out": "/",
+   "ok": true
+  },
+  {
+   "in": "/../..",
+   "out": "/",
+   "ok": true
+  },
+  {
+   "in": "/a?x=1",
+   "out": "/a",
+   "ok": true
+  },
+  {
+   "in": "/a#frag",
+   "out": "/a",
+   "ok": true
+  },
+  {
+   "in": "/a?x=/../#y",
+   "out": "/a",
+   "ok": true
+  },
+  {
+   "in": "/a%00b",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a%2500",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a\\b",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a%5cb",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a%255Cb",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/%zz",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/100%",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a%2",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/x%252",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/%u002e",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/%ff",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/a%ed%a0%80",
+   "out": "",
+   "ok": false
+  },
+  {
+   "in": "/%C3%A4",
+   "out": "/\u00e4",
+   "ok": true
+  },
+  {
+   "in": "/\u00e4",
+   "out": "/\u00e4",
+   "ok": true
+  },
+  {
+   "in": "/a%2Fb",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "/a%2f..%2fb",
+   "out": "/b",
+   "ok": true
+  },
+  {
+   "in": "/a/b/..",
+   "out": "/a",
+   "ok": true
+  },
+  {
+   "in": "/./",
+   "out": "/",
+   "ok": true
+  },
+  {
+   "in": "/a/%2e/b",
+   "out": "/a/b",
+   "ok": true
+  },
+  {
+   "in": "/%2e%2e%2f%2e%2e%2fetc/passwd",
+   "out": "/etc/passwd",
+   "ok": true
+  },
+  {
+   "in": "/a+b",
+   "out": "/a+b",
+   "ok": true
+  },
+  {
+   "in": "/a%20b",
+   "out": "/a b",
+   "ok": true
+  },
+  {
+   "in": "/a/%2e%2e%2f%2e%2e%2fb",
+   "out": "/b",
+   "ok": true
+  }
+ ]
+}

@@ -55,7 +55,8 @@ topology or add integrations.
 | Unreviewed policy change | Drafts, impact simulation, optional four-eyes review (author and last editor cannot approve), immutable versions, rollback |
 | Privilege escalation through configuration | User management, SSO mapping, service accounts, log export and Defender settings are Super Admin only; Team Leads cannot create BLOCK rules, catch-all hosts or baseline sets, nor change other roles' BLOCK guardrails |
 | Manipulated audit history | SHA-256 hash chain that is never recomputed, append-only JSONL sink and database table, verification endpoint, real-time SIEM forwarding |
-| Request smuggling past the policy (`Host`/SNI mismatch, domain fronting) | Destination = real connection target; mismatching `Host`/SNI blocked |
+| Request smuggling past the policy (`Host`/SNI mismatch, domain fronting) | Destination = real connection target; mismatching `Host`/SNI blocked; HTTP/2 and HTTP/3: a `Host` header that differs from `:authority` is blocked (it would be forwarded, and becomes the `Host` of an HTTP/1.1 upstream request) |
+| Policy bypass through protocol upgrades | A WebSocket upgrade is an ordinary HTTP request: host, path, method, identity and `Host`/SNI binding are evaluated before the upgrade; frames after it are relayed without content inspection (no DLP/AV on WebSocket messages). Non-HTTP payloads inside tunnels are refused (`block_raw_tcp`) |
 | Tampering with stored secrets | AES-256-GCM with authenticated key id; tampered values fail to decrypt and stop the start-up |
 | Injection into block pages, notifications or CSV exports | Contextual escaping (`html/template`), single-pass placeholder substitution, nonce CSP; Slack/Teams markup escaped; CSV formula injection defused |
 
@@ -84,7 +85,7 @@ topology or add integrations.
 | Threat | Mitigation |
 |---|---|
 | Flooding public endpoints (access requests, CA downloads) | Per-IP rate limits, body size limits, duplicate-request detection, cap on pending requests |
-| Memory exhaustion through large bodies | `AEGIS_BODY_SIZE_LIMIT`, scan limits (`av_max_scan_bytes`, `icap_max_bytes`, `yara_max_bytes`), streaming of oversize downloads |
+| Memory exhaustion through large bodies | Bodies are streamed unless an inspection needs them; buffered bodies are capped per flow (scan limits) and per worker (`AEGIS_BUFFER_BUDGET`), also without `Content-Length` (chunked); uploads of blocked requests are discarded; `AEGIS_BODY_SIZE_LIMIT` caps any single message |
 | Control-plane outage stops egress | Workers enforce the last known policy; fail-closed only before the first sync; active-active control-plane on PostgreSQL |
 | Slow or failing scan engines | Timeouts per engine, `icap_fail_mode` / `av_fail_mode` per policy, health status in heartbeats |
 | SIEM outage blocks the control-plane | Durable spool per export destination, bounded queues, drops counted in metrics |
@@ -97,6 +98,7 @@ topology or add integrations.
 | Team Lead widens scope | Scope checks on every policy, request and session operation (effective groups incl. label-selected); no catch-all or TLD wildcard hosts; permanent grants not allowed |
 | Automation obtains admin rights | Service accounts cannot be Super Admin, cannot manage identities or integrations |
 | Learning session opens a zero-internet tier | `record_and_allow` refused for strict-isolation groups; internal destinations never opened by learning or redirect grants |
+| Allowed site redirects to an arbitrary host (open redirect, user-controlled links) | Redirect grants only for rules with *Follow redirects* (and learning sessions); one object (exact path), GET/HEAD, two minutes, single hop, same source IP, never internal destinations; optional per-rule `redirect_hosts` allowlist |
 | Compromised server keeps communicating | Quarantine overrides every allow rule, TLS exception and learning session; Defender risk/isolation and SOAR playbooks can quarantine automatically |
 
 ## Residual risks and operator responsibilities
@@ -107,6 +109,11 @@ topology or add integrations.
   the host name). Keep exceptions few, scoped and reviewed.
 - **Allowed destinations can be abused** (e.g. a whitelisted code-hosting or storage service used for
   exfiltration). Prefer path-level rules, enable DLP and ICAP REQMOD, and monitor traffic volumes.
+- **Follow redirects trusts the allowed site's redirects**: without `redirect_hosts`, a rule with *Follow
+  redirects* lets the allowed site (or anyone who can make it redirect — open redirects, user-supplied links)
+  grant the requesting server one public object anywhere for two minutes (GET/HEAD only; threat intelligence, file
+  type, AV and DLP checks still apply; never internal destinations). Enable it only where needed and list the
+  expected CDN hosts in `redirect_hosts` for sites whose redirects third parties can steer.
 - **CA key compromise** is critical: protect `CERTS_DIR` / the CA secret, prefer a subordinate CA with path length
   0 from the corporate PKI, and have a revocation and re-issuance plan.
 - **Shared secrets**: `AEGIS_DATAPLANE_KEY`, `AEGIS_JWT_SECRET` and `AEGIS_ENCRYPTION_KEY` must come from a secret

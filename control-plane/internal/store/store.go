@@ -557,6 +557,9 @@ func (s *Store) migrateLocked() {
 		p.ICAPMode, p.ICAPFailMode, p.ICAPTimeoutSeconds, p.ICAPMaxBytes, p.ICAPAllowModified = def.ICAPMode, def.ICAPFailMode, def.ICAPTimeoutSeconds, def.ICAPMaxBytes, def.ICAPAllowModified
 		p.YARAMode, p.YARAMaxBytes = def.YARAMode, def.YARAMaxBytes
 	}
+	if s.state.SecurityPolicy.DLPOversizeAction == "" {
+		s.state.SecurityPolicy.DLPOversizeAction = "allow"
+	}
 	s.mergeBuiltinFeedsLocked()
 	if s.state.Users == nil {
 		s.state.Users = []models.User{}
@@ -829,6 +832,7 @@ func (s *Store) GetSnapshot() StateSnapshot {
 func cloneRule(r models.PolicyRule) models.PolicyRule {
 	r.Methods = append([]string(nil), r.Methods...)
 	r.CompanionRules = append([]string(nil), r.CompanionRules...)
+	r.RedirectHosts = append([]string(nil), r.RedirectHosts...)
 	r.GroupIDs = append([]string(nil), r.GroupIDs...)
 	r.ServerIDs = append([]string(nil), r.ServerIDs...)
 	return r

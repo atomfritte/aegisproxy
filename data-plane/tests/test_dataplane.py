@@ -21,12 +21,13 @@ from aegis_dp import clamav  # noqa: E402
 from aegis_dp.content import detect_file_type, scan_dlp  # noqa: E402
 from aegis_dp.controlplane import sign_block_token  # noqa: E402
 from aegis_dp.policy import (  # noqa: E402
-    Policy, RedirectGrants, canonicalize_path, hash_token, match_path, VERDICT_ALLOWED, VERDICT_BLOCKED,
+    Policy, RedirectGrants, canonicalize_path, hash_token, match_path, normalize_host, VERDICT_ALLOWED, VERDICT_BLOCKED,
     VERDICT_POLICY, VERDICT_THREAT, VERDICT_TLS_BYPASS, VERDICT_LEARNING, VERDICT_REDIRECT, VERDICT_QUARANTINED,
 )
 from aegis_dp.threatintel import ThreatSnapshot, normalize_url  # noqa: E402
 
 FUTURE = "2099-01-01T00:00:00.123456789Z"
+VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "testdata", "normalization_vectors.json")
 
 BUNDLE = {
     "revision": 7,
@@ -80,6 +81,17 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(match_path("/microsoft/**", "/microsoftx/vscode"))
         self.assertFalse(match_path("/microsoft/**", "/microsoft/../torvalds/linux"))
 
+    def test_normalization_vectors_shared_with_control_plane(self):
+        # The same file drives engine.NormalizeHost/CanonicalizePath tests in the control-plane.
+        with open(VECTORS, encoding="utf-8") as fh:
+            vectors = json.load(fh)
+        self.assertTrue(vectors["hosts"] and vectors["paths"])
+        for v in vectors["hosts"]:
+            self.assertEqual(normalize_host(v["in"]), v["out"], repr(v["in"]))
+        for v in vectors["paths"]:
+            self.assertEqual(canonicalize_path(v["in"]), (v["out"], v["ok"]), repr(v["in"]))
+        self.assertFalse(canonicalize_path("/a\udcffb")[1], "undecodable path bytes (surrogateescape)")
+
     def test_evaluation_order_matches_control_plane(self):
         cases = [
             ("github.com", "/microsoft/vscode", 443, VERDICT_ALLOWED, ""),
@@ -125,6 +137,13 @@ class PolicyTests(unittest.TestCase):
         r = p.evaluate("10.1.0.5", "", "POST", "objects.example", 443, "/asset.tgz", "", self.t, self.g)
         self.assertEqual(r.verdict, VERDICT_BLOCKED)  # grants are read-only
         self.assertFalse(self.g.register("10.1.0.5", "http://127.0.0.1/x", "https://github.com/", "r", "n"))
+        # rule.redirect_hosts limits the targets that receive a grant
+        limited = Policy({**BUNDLE, "rules": [{**BUNDLE["rules"][0], "redirect_hosts": ["*.cdn.example"]}]})
+        hosts = limited.evaluate("10.1.0.5", "", "GET", "github.com", 443, "/microsoft/x", "", self.t, self.g).redirect_hosts
+        self.assertEqual(hosts, ["*.cdn.example"])
+        self.assertFalse(self.g.register("10.1.0.5", "https://evil.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
+        self.assertTrue(self.g.register("10.1.0.5", "https://eu.cdn.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
+        self.assertIsNone(self.g.check("10.1.0.5", "evil.example", "/x", "GET"))
         sess = {**BUNDLE, "rules": [], "sessions": [{"id": "s1", "server_id": "srv-ci-1", "mode": "record_and_allow",
                                                     "status": "active", "expires_at": FUTURE, "name": "rec"}]}
         r = Policy(sess).evaluate("10.1.0.5", "", "GET", "pypi.org", 443, "/simple/", "", self.t, self.g)
@@ -353,6 +372,49 @@ class AccessLogTest(unittest.TestCase):
             self.assertEqual(newest[-1], "flow-11")
             self.assertFalse(al.enabled)
 
+    def test_write_and_rotation_failures_are_counted(self):
+        import tempfile
+        from aegis_dp.accesslog import AccessLog
+
+        class Broken:
+            def write(self, _data):
+                raise OSError("No space left on device")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "access.log")
+            al = AccessLog(path, "json")
+            handler = al.logger.handlers[0]
+            real, handler.stream = handler.stream, Broken()
+            with self.assertLogs("aegis.dataplane", "WARNING") as warned:
+                al.write(self.REC)
+                al.flush()
+            self.assertEqual(al.dropped, 1, "a failed write is a dropped line, not a silent stderr traceback")
+            self.assertIn("No space left on device", warned.output[0])
+            handler.stream = real
+            al.close()
+
+            def refuse(_src, _dst):
+                raise PermissionError("the file is in use by another process")
+            al = AccessLog(path, "json", rotate_bytes=200, keep=2)
+            al.logger.handlers[0].rotator = refuse
+            with self.assertLogs("aegis.dataplane", "WARNING"):
+                for i in range(5):
+                    al.write(dict(self.REC, id=f"r-{i}"))
+                al.flush()
+            for h in al.logger.handlers:
+                h.flush()
+            self.assertEqual((al.rotation_failures, al.dropped), (1, 0), "retried after a minute, lines keep going to the file")
+            with open(path, encoding="utf-8") as f:
+                ids = [json.loads(line)["id"] for line in f.read().splitlines() if line.startswith("{")]
+            self.assertEqual(ids[-5:], [f"r-{i}" for i in range(5)])
+            al.close()
+
     def test_access_log_rotation_config(self):
         from aegis_dp.config import Config, ConfigError
         base = {"AEGIS_DATAPLANE_KEY": "k" * 40}
@@ -385,8 +447,9 @@ class AccessLogTest(unittest.TestCase):
         port = srv.getsockname()[1]
         srv.close()  # nothing listens here
         al = AccessLog(f"syslog+tcp://127.0.0.1:{port}", "squid")
-        al.write(self.REC)
-        al.flush()
+        with self.assertLogs("aegis.dataplane", "WARNING"):
+            al.write(self.REC)
+            al.flush()
         self.assertEqual(al.dropped, 1)
         lsock = s.socket()
         lsock.bind(("127.0.0.1", 0))
@@ -678,6 +741,47 @@ class DestinationBindingTest(unittest.TestCase):
         for i in range(50):
             small.remember(f"h{i}.example", [parse_ip("198.51.100.1")])
         self.assertLessEqual(len(small._entries), 8)
+
+
+class BufferingTest(unittest.TestCase):
+    def test_budget_and_guard(self):
+        from aegis_dp.buffering import BLOCK, BodyGuard, BufferBudget, parse_size
+        self.assertEqual([parse_size(v) for v in ("1g", "512m", "64k", "1048576", "")], [1 << 30, 512 << 20, 64 << 10, 1 << 20, None])
+        for bad in ("1.5g", "lots", "-1m", "10mb"):
+            with self.assertRaises(ValueError):
+                parse_size(bad)
+        budget = BufferBudget(1000)
+        seen = []
+        a = BodyGuard(budget, 800, lambda reason, size: seen.append((reason, size)) or BLOCK)
+        b = BodyGuard(budget, 800, lambda reason, size: seen.append((reason, size)) or BLOCK)
+        self.assertIsNone(a.admit(600))
+        self.assertEqual(a.admit(801), "oversize")
+        self.assertEqual(b.admit(500), "busy", "600 + 500 exceed the worker budget")
+        self.assertEqual(b.exceed("busy", 500), BLOCK)
+        self.assertEqual(seen, [("busy", 500)])
+        self.assertTrue(a.hold(300))  # decoded copy beyond the cap, still within the budget
+        self.assertFalse(b.hold(200))
+        self.assertEqual((budget.used, budget.peak), (900, 900))
+        a.release()
+        a.release()
+        self.assertEqual(budget.used, 0)
+
+    def test_buffer_budget_config(self):
+        from aegis_dp.config import Config, ConfigError
+        old = dict(os.environ)
+        try:
+            os.environ["AEGIS_DATAPLANE_KEY"] = "k" * 40
+            os.environ.pop("AEGIS_BUFFER_BUDGET", None)
+            self.assertEqual(Config.from_env().buffer_budget, 0, "default: derived from body_size_limit")
+            os.environ["AEGIS_BUFFER_BUDGET"] = "768m"
+            self.assertEqual(Config.from_env().buffer_budget, 768 << 20)
+            for bad in ("lots", "512k"):
+                os.environ["AEGIS_BUFFER_BUDGET"] = bad
+                with self.assertRaises(ConfigError):
+                    Config.from_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
 
 
 class IcapHardeningTest(unittest.TestCase):
@@ -1134,6 +1238,222 @@ class AddonSecurityTest(unittest.TestCase):
         f = self.flow("dl.example", headers=[("Host", "dl.example")])
         resp, body = self.exchange(d, f, [("Content-Type", "application/octet-stream")], b"harmless")
         self.assertEqual(resp.status_code, 503)
+
+    # -- bounded buffering (memory) --------------------------------------------
+    def layer(self, f, request=False):
+        """A mitmproxy HttpStream that is buffering f's request or response body: its check_body_size is the one
+        buffering.install() wrapped, exactly as in the proxy."""
+        from mitmproxy.addons.proxyserver import Proxyserver
+        from mitmproxy.proxy.layers import http as lhttp
+        opts = moptions.Options()
+        Proxyserver().load(opts)  # body_size_limit, stream_large_bodies, ... with mitmproxy's defaults
+        cx = mcontext.Context(f.client_conn, opts)
+        cx.server = f.server_conn
+        st = lhttp.HttpStream(cx, 1)
+        st.flow = f
+        if request:
+            st.client_state = st.state_consume_request_body
+        else:
+            st.client_state, st.server_state = st.state_done, st.state_consume_response_body
+        return st
+
+    @staticmethod
+    def feed(st, chunks, request=False):
+        from mitmproxy.proxy.layers import http as lhttp
+        cmds = []
+        for c in chunks:
+            cmds.extend(st.handle_event((lhttp.RequestData if request else lhttp.ResponseData)(1, c)))
+        return cmds
+
+    @staticmethod
+    def sent(cmds, kind):
+        from mitmproxy.proxy.layers import http as lhttp
+        return [c.event for c in cmds if isinstance(c, lhttp.SendHttp) and type(c.event).__name__ == kind]
+
+    def buffered_response(self, a, headers=()):
+        f = self.flow("dl.example", headers=[("Host", "dl.example")])
+        for hook in ("requestheaders", "request"):
+            self.call(a, hook, f)
+        f.response = tutils.tresp(headers=mhttp.Headers([(k.encode(), v.encode()) for k, v in headers]), content=b"")
+        self.call(a, "responseheaders", f)
+        return f
+
+    def test_unknown_length_bodies_are_bounded(self):
+        from aegis_dp import buffering
+        self.assertTrue(buffering.install())
+        # without inspection a response of unknown length is relayed, never accumulated
+        n = self.addon(blocked_file_types=[], threat_intel_mode="off")
+        f = self.buffered_response(n)
+        self.assertTrue(f.response.stream)
+        f = self.buffered_response(n, [("Content-Length", "100")])
+        self.assertFalse(f.response.stream, "small bodies of known size may still be buffered")
+        self.assertEqual(n.budget.used, 100)
+        self.call(n, "response", f)
+        self.assertEqual(n.budget.used, 0)
+        # inspected, no Content-Length: buffered up to av_max_scan_bytes (1 MiB here), then av_oversize_action=allow
+        a = self.addon()
+        f = self.buffered_response(a)
+        self.assertFalse(f.response.stream)
+        st = self.layer(f)
+        self.assertEqual(self.sent(self.feed(st, [b"a" * (512 << 10)]), "ResponseHeaders"), [])
+        self.assertEqual(a.budget.used, 512 << 10)
+        cmds = self.feed(st, [b"b" * (600 << 10)])
+        self.assertTrue(f.response.stream, "switched to streaming at the scan limit")
+        self.assertEqual(len(self.sent(cmds, "ResponseHeaders")), 1)
+        self.assertEqual(sum(len(e.data) for e in self.sent(cmds, "ResponseData")), 1112 << 10, "buffered prefix flushed")
+        self.assertEqual(len(st.response_body_buf), 0)
+        self.assertEqual(a.budget.used, 0)
+        self.assertIn("AV_UNSCANNED:oversize", f.metadata["aegis"]["res"].security_flags)
+        self.assertEqual(sum(len(e.data) for e in self.sent(self.feed(st, [b"c" * 1000]), "ResponseData")), 1000)
+        # av_oversize_action=block: the client gets the block message, the rest of the upstream body is discarded
+        b = self.addon(av_oversize_action="block")
+        f = self.buffered_response(b)
+        st = self.layer(f)
+        cmds = self.feed(st, [b"EVIL" * (300 << 10)])
+        self.assertEqual(f.response.status_code, 403)
+        self.assertEqual([e.response.status_code for e in self.sent(cmds, "ResponseHeaders")], [403])
+        self.assertIn(b"antivirus scan limit", b"".join(e.data for e in self.sent(cmds, "ResponseData")))
+        self.assertNotIn(b"EVIL", b"".join(e.data for e in self.sent(self.feed(st, [b"EVIL" * 10]), "ResponseData")))
+        self.assertEqual(self.records(b)[-1]["block_reason"], "av_oversize")
+        self.call(b, "response", f)
+        self.assertEqual(b.budget.used, 0)
+
+    def test_worker_budget(self):
+        # concurrent downloads share the budget; when it is exhausted av_oversize_action decides
+        a = self.addon()
+        a.budget.total = 300 << 10
+        f1, f2 = self.buffered_response(a), self.buffered_response(a)
+        s1, s2 = self.layer(f1), self.layer(f2)
+        self.feed(s1, [b"x" * (200 << 10)])
+        cmds = self.feed(s2, [b"y" * (200 << 10)])
+        self.assertTrue(f2.response.stream)
+        self.assertEqual(len(self.sent(cmds, "ResponseHeaders")), 1)
+        self.assertIn("AV_UNSCANNED:busy", f2.metadata["aegis"]["res"].security_flags)
+        self.assertFalse(f1.response.stream)
+        self.assertEqual(a.budget.used, 200 << 10)
+        self.call(a, "error", f1)  # aborted flows return their share
+        self.assertEqual(a.budget.used, 0)
+        b = self.addon(av_oversize_action="block")
+        b.budget.total = 1000
+        f = self.flow("dl.example", headers=[("Host", "dl.example")])
+        resp, body = self.exchange(b, f, [("Content-Length", "5000"), ("Content-Type", "application/octet-stream")], b"y" * 5000)
+        self.assertEqual((resp.status_code, self.records(b)[-1]["block_reason"]), (503, "inspection_busy"))
+        self.assertNotIn(b"yyyy", body)
+        # a decoded copy that does not fit the budget: scan engines are skipped, the file type check still runs
+        c = self.addon()
+        c.budget.total = 4096
+        f = self.flow("dl.example", headers=[("Host", "dl.example")])
+        resp, body = self.exchange(c, f, [("Content-Encoding", "gzip")], gzip.compress(PE + b"\0" * 20000))
+        self.assertEqual((resp.status_code, self.records(c)[-1]["verdict"]), (403, "FILETYPE_BLOCKED"))
+        self.assertIn("AV_UNSCANNED:busy", self.records(c)[-1]["security_flags"])
+        self.assertEqual(c.budget.used, 0)
+
+    def test_upload_buffering(self):
+        # nothing needs the body: streamed
+        n = self.addon(dlp_mode="off")
+        f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example"), ("Content-Length", "10")], body=b"0123456789")
+        self.call(n, "requestheaders", f)
+        self.assertTrue(f.request.stream)
+        # DLP on, chunked upload beyond the buffer cap (8 MiB): streamed and flagged (allow) ...
+        a = self.addon()
+        f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example")])
+        self.call(a, "requestheaders", f)
+        self.assertFalse(f.request.stream)
+        st = self.layer(f, request=True)
+        cmds = self.feed(st, [b"z" * (4 << 20), b"z" * (5 << 20)], request=True)
+        self.assertTrue(f.request.stream)
+        self.assertTrue(any(type(c).__name__ == "GetHttpConnection" for c in cmds), "connects upstream to stream the rest")
+        self.assertIn("DLP_UNSCANNED:oversize", f.metadata["aegis"]["res"].security_flags)
+        self.assertEqual(a.budget.used, 0)
+        # ... or blocked with dlp_oversize_action=block: the client gets the block page, nothing is kept
+        b = self.addon(dlp_oversize_action="block")
+        f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example")])
+        self.call(b, "requestheaders", f)
+        st = self.layer(f, request=True)
+        self.feed(st, [b"z" * (9 << 20), b"z" * (1 << 20)], request=True)
+        self.assertEqual((f.response.status_code, self.records(b)[-1]["block_reason"]), (413, "dlp_oversize"))
+        self.assertEqual(len(st.request_body_buf), 0)
+        # known Content-Length beyond the cap: decided before the body arrives
+        f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example"), ("Content-Length", str(64 << 20))])
+        self.call(b, "requestheaders", f)
+        self.assertEqual(f.response.status_code, 413)
+        f = self.flow("dl.example", "/up?k=AKIAIOSFODNN7EXAMPLE", method="POST", headers=[("Host", "dl.example"), ("Content-Length", str(64 << 20))])
+        self.call(a, "requestheaders", f)
+        self.assertEqual((f.response.status_code, self.records(a)[-1]["verdict"]), (403, "DLP_BLOCKED"), "query scanned before streaming")
+        # max_upload_bytes with a chunked upload: buffered up to the limit, then 413
+        m = self.addon(dlp_mode="off", max_upload_bytes=10 << 20)
+        f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example")])
+        self.call(m, "requestheaders", f)
+        self.assertFalse(f.request.stream)
+        self.feed(self.layer(f, request=True), [b"u" * (6 << 20), b"u" * (6 << 20)], request=True)
+        self.assertEqual((f.response.status_code, self.records(m)[-1]["block_reason"]), (413, "upload_too_large"))
+        # uploads of blocked requests are discarded as they arrive
+        f = self.flow("blocked.example", method="POST", headers=[("Host", "blocked.example")])
+        self.call(a, "requestheaders", f)
+        self.assertEqual(f.response.status_code, 403)
+        st = self.layer(f, request=True)
+        self.feed(st, [b"q" * (1 << 20)] * 3, request=True)
+        self.assertEqual(len(st.request_body_buf), 0)
+
+    def test_dlp_scans_whole_body_and_flags_oversize(self):
+        secret = b"\nAKIAIOSFODNN7EXAMPLE"
+        cases = [  # (policy, body, headers, expected status, verdict or flag)
+            ({"dlp_max_scan_bytes": 8192}, b"x" * 5000 + secret, [], 403, "DLP_BLOCKED"),
+            ({"dlp_max_scan_bytes": 4096}, b"x" * 5000 + secret, [], None, "DLP_UNSCANNED:oversize"),
+            ({"dlp_max_scan_bytes": 4096, "dlp_oversize_action": "block"}, b"x" * 5000, [], 413, "dlp_oversize"),
+            ({"dlp_max_scan_bytes": 4096, "dlp_oversize_action": "block"}, gzip.compress(b"a" * 100000),
+             [("Content-Encoding", "gzip")], 413, "dlp_oversize"),
+            ({"dlp_max_scan_bytes": 4096, "dlp_mode": "off", "icap_reqmod_url": "icap://icap.example/dlp", "icap_max_bytes": 1 << 20,
+              "dlp_oversize_action": "block"}, gzip.compress(b"a" * (2 << 20)), [("Content-Encoding", "gzip")], 413, "dlp_oversize"),
+        ]
+        for security, body, headers, status, expect in cases:
+            a = self.addon(**security)
+            f = self.flow("dl.example", method="POST", headers=[("Host", "dl.example")] + headers, body=body)
+            self.call(a, "requestheaders", f)
+            self.call(a, "request", f)
+            if status is None:
+                self.assertIsNone(f.response, security)
+                self.assertIn(expect, f.metadata["aegis"]["res"].security_flags, security)
+                continue
+            self.assertEqual(f.response.status_code, status, security)
+            rec = self.records(a)[-1]
+            self.assertIn(expect, (rec["verdict"], rec["block_reason"]), security)
+
+    # -- HTTP/2, WebSocket, redirect targets --------------------------------------
+    def test_http2_host_header_must_match_authority(self):
+        a = self.addon()
+        for host_hdr, blocked in (("evil.example", True), ("dl.example:443", False), (None, False), ("dl.example, evil.example", True)):
+            f = self.flow("dl.example", headers=[("Host", host_hdr)] if host_hdr else [])
+            f.request.http_version = "HTTP/2.0"
+            f.request.authority = "dl.example"
+            self.call(a, "requestheaders", f)
+            self.assertEqual(f.response is not None, blocked, host_hdr)
+            if blocked:
+                self.assertIn(self.records(a)[-1]["block_reason"], ("host_mismatch", "malformed_host"))
+
+    def test_websocket_upgrade_follows_policy(self):
+        a = self.addon()
+        ws = [("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Version", "13"), ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")]
+        f = self.flow("blocked.example", "/ws", headers=[("Host", "blocked.example")] + ws)
+        self.call(a, "requestheaders", f)
+        self.assertEqual((f.response.status_code, self.records(a)[-1]["block_reason"]), (403, "default_deny"))
+        f = self.flow("dl.example", "/ws", headers=[("Host", "evil.example")] + ws)
+        self.call(a, "requestheaders", f)
+        self.assertEqual(self.records(a)[-1]["block_reason"], "host_mismatch")
+        f = self.flow("dl.example", "/ws", headers=[("Host", "dl.example")] + ws)
+        resp, _ = self.exchange(a, f, [("Upgrade", "websocket"), ("Connection", "Upgrade")], b"", status=101)
+        self.assertEqual((resp.status_code, self.records(a)[-1]["verdict"]), (101, "ALLOWED"))
+
+    def test_redirect_grants_follow_rule_redirect_hosts(self):
+        a = self.addon()
+        bundle = json.loads(json.dumps(ADDON_BUNDLE))
+        bundle["rules"][0].update(follow_redirects=True, redirect_hosts=["objects.example"])
+        a.cp.policy = Policy(bundle)
+        for loc, granted in (("https://other.example/a.bin", False), ("https://objects.example/a.bin", True)):
+            f = self.flow("dl.example", headers=[("Host", "dl.example")])
+            self.exchange(a, f, [("Location", loc)], b"", status=302)
+            host = loc.split("/")[2]
+            self.assertEqual(a.grants.check("10.1.0.5", host, "/a.bin", "GET") is not None, granted, loc)
 
     def test_bounded_connection_state(self):
         from aegis_dp import addon as addon_mod

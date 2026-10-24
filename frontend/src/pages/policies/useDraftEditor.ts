@@ -13,10 +13,15 @@ export type DraftMeta = Omit<PolicySetSpecInput, 'rules'>;
 let keySeq = 0;
 const newKey = () => `row-${++keySeq}`;
 
-const RULE_FIELDS = ['name', 'description', 'action', 'host_pattern', 'path_pattern', 'methods', 'follow_redirects', 'companion_rules', 'enabled', 'expires_at'] as const;
+const RULE_FIELDS = ['name', 'description', 'action', 'host_pattern', 'path_pattern', 'methods', 'follow_redirects', 'redirect_hosts', 'companion_rules', 'enabled', 'expires_at'] as const;
 
 function sameRule(a: RuleInput | PolicyRule, b: RuleInput | PolicyRule): boolean {
-  return RULE_FIELDS.every((f) => JSON.stringify((a as any)[f] ?? null) === JSON.stringify((b as any)[f] ?? null));
+  // redirect_hosts is omitted by the server when empty: [] and absent are the same
+  const val = (r: RuleInput | PolicyRule, f: (typeof RULE_FIELDS)[number]) => {
+    const v = (r as any)[f];
+    return f === 'redirect_hosts' && Array.isArray(v) && v.length === 0 ? null : v ?? null;
+  };
+  return RULE_FIELDS.every((f) => JSON.stringify(val(a, f)) === JSON.stringify(val(b, f)));
 }
 
 /**

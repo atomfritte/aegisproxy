@@ -127,9 +127,13 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 
 	s.mu.RLock()
 	ruleFollowMap := make(map[string]bool, len(s.state.Rules))
+	redirectHosts := make(map[string][]string)
 	for _, r := range s.state.Rules {
 		if r.Enabled && strings.EqualFold(r.Action, "ALLOW") {
 			ruleFollowMap[r.ID] = r.FollowRedirects
+			if len(r.RedirectHosts) > 0 {
+				redirectHosts[r.ID] = slices.Clone(r.RedirectHosts)
+			}
 		}
 	}
 	burstThreshold := s.state.SecurityPolicy.BlockedBurstThreshold
@@ -149,10 +153,11 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 		// Only mint a 302 redirect grant from LEARNING_ALLOWED or from ALLOWED flows whose rule has
 		// FollowRedirects. Never chain from REDIRECT_OBJECT_ALLOWED (single-hop cap).
 		if flow.RedirectLocation != "" {
-			allowRedir := flow.Verdict == models.VerdictLearningAllowed ||
-				(flow.Verdict == models.VerdictAllowed && ruleFollowMap[flow.MatchedRuleID])
-			if allowRedir {
-				s.engine.RegisterRedirectGrant(flow.ServerIP, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName)
+			if flow.Verdict == models.VerdictLearningAllowed {
+				s.engine.RegisterRedirectGrant(flow.ServerIP, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName, nil)
+			} else if flow.Verdict == models.VerdictAllowed && ruleFollowMap[flow.MatchedRuleID] {
+				s.engine.RegisterRedirectGrant(flow.ServerIP, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName,
+					redirectHosts[flow.MatchedRuleID])
 			}
 		}
 		if flow.SessionID != "" {

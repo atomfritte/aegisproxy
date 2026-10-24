@@ -207,6 +207,7 @@ type PolicyRule struct {
 	PathPattern     string     `json:"path_pattern"`
 	Methods         []string   `json:"methods"`
 	FollowRedirects bool       `json:"follow_redirects"`
+	RedirectHosts   []string   `json:"redirect_hosts,omitempty"` // host patterns redirect grants may target; empty = any public host
 	CompanionRules  []string   `json:"companion_rules"`
 	GroupIDs        []string   `json:"group_ids"`
 	ServerIDs       []string   `json:"server_ids"`
@@ -805,9 +806,10 @@ type SecurityPolicy struct {
 	AVOversizeAction string `json:"av_oversize_action"` // allow | block (bodies too large to scan)
 
 	// Data loss prevention: detect credentials/secrets in outbound request URLs, headers and bodies.
-	DLPMode         string   `json:"dlp_mode"` // off | monitor | block
-	DLPMaxScanBytes int64    `json:"dlp_max_scan_bytes"`
-	DLPDetectors    []string `json:"dlp_detectors"`
+	DLPMode           string   `json:"dlp_mode"` // off | monitor | block
+	DLPMaxScanBytes   int64    `json:"dlp_max_scan_bytes"`
+	DLPOversizeAction string   `json:"dlp_oversize_action"` // allow | block (uploads above the DLP/ICAP scan limit)
+	DLPDetectors      []string `json:"dlp_detectors"`
 
 	// Download control: block executable / script / archive types detected by magic bytes.
 	BlockedFileTypes      []string            `json:"blocked_file_types"`

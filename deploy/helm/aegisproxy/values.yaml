@@ -148,8 +148,13 @@ dataPlane:
   accessLog: ""
   accessLogFormat: squid
   failMode: closed
+  # Largest request/response body a worker relays at all (mitmproxy body_size_limit). Not a memory figure:
+  # bodies are streamed unless an inspection needs them, and buffered bodies share the worker's inspection
+  # buffer budget (AEGIS_BUFFER_BUDGET, default min(512m, bodySizeLimit); set it through extraEnv). Keep
+  # resources.limits.memory at about 2 x budget + 256Mi (docs/configuration.md, "Data-plane memory sizing").
   bodySizeLimit: 1g
   clamdTimeoutSeconds: 60
+  # e.g. [{ name: AEGIS_BUFFER_BUDGET, value: "768m" }] together with a higher memory limit
   extraEnv: []
   service:
     type: LoadBalancer
