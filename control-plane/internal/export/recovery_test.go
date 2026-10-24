@@ -751,3 +751,34 @@ func TestDeadLetterRotationAndSymlink(t *testing.T) {
 		t.Fatalf("symlink target created: %v", err)
 	}
 }
+
+// Audit checkpoint records travel on the audit stream but are not trail events: the cursor must stay on
+// the last trail event, or the next start could not find it in the trail and would fall back to time.
+func TestAuditCheckpointRecordDoesNotMoveCursor(t *testing.T) {
+	var got webhookEvents
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got.add(r) }))
+	defer srv.Close()
+	spoolDir := filepath.Join(t.TempDir(), "export-spool")
+	sink := models.ExportSink{ID: "exp-ckpt", Name: "hook", Type: "webhook", Enabled: true, Streams: []string{"audit"},
+		Endpoint: srv.URL, BatchSize: 10, FlushSeconds: 1}
+	if err := Validate(&sink); err != nil {
+		t.Fatal(err)
+	}
+	sinkDir := filepath.Join(spoolDir, sink.ID)
+	trail := &fakeTrail{}
+	trail.add(models.AuditEvent{ID: "e0", Timestamp: time.Now().UTC().Add(-time.Minute)})
+	m := New(Options{SpoolDir: spoolDir, Node: "n1", Version: "t", AuditReplay: true})
+	defer m.Close()
+	m.SetAuditSource(trail)
+	m.Configure([]models.ExportSink{sink})
+	waitFor(t, "cursor initialized", func() bool { return cursorID(sinkDir) == "e0" })
+	ev := models.AuditEvent{ID: "e1", Timestamp: time.Now().UTC(), Action: "X"}
+	trail.add(ev)
+	m.Publish(AuditEvent(ev))
+	m.Publish(AuditCheckpointEvent(models.AuditEvent{ID: "ckpt-2-abc", Timestamp: time.Now().UTC(), Action: "AUDIT_CHECKPOINT"}))
+	waitFor(t, "both records delivered", func() bool { return len(got.list()) == 2 })
+	time.Sleep(1200 * time.Millisecond)
+	if c := cursorID(sinkDir); c != "e1" {
+		t.Fatalf("cursor %q, want the last trail event e1", c)
+	}
+}

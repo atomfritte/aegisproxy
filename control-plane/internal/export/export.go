@@ -614,7 +614,7 @@ func (rt *runtime) open() {
 // add encodes an event into the batch.
 func (rt *runtime) add(ev Event, live bool) {
 	ev = redacted(ev, &rt.cfg)
-	r := record{ev: ev, track: rt.cursorOn && ev.Stream == models.StreamAudit}
+	r := record{ev: ev, track: rt.cursorOn && ev.Stream == models.StreamAudit && !ev.OffTrail}
 	if live && rt.replayed != nil && ev.Stream == models.StreamAudit {
 		if _, dup := rt.replayed[ev.ID]; dup { // already replayed from the audit trail
 			delete(rt.replayed, ev.ID)

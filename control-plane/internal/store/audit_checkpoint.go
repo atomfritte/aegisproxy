@@ -209,7 +209,7 @@ func (s *Store) exportAuditCheckpointLocked() {
 		return
 	}
 	detail, _ := json.Marshal(cp)
-	s.opts.Exporter.Publish(export.AuditEvent(models.AuditEvent{
+	s.opts.Exporter.Publish(export.AuditCheckpointEvent(models.AuditEvent{
 		ID: fmt.Sprintf("ckpt-%d-%s", cp.Events, cp.Head[:min(len(cp.Head), 16)]), Revision: cp.StateRevision, Timestamp: time.Now().UTC(),
 		Actor: "system", ActorRole: "SYSTEM", Action: "AUDIT_CHECKPOINT", Category: "SYSTEM",
 		EntityType: "audit_trail", EntityID: "audit", EntityName: "Audit trail",

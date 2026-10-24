@@ -20,11 +20,21 @@ type Event struct {
 	Audit    *models.AuditEvent    `json:"audit,omitempty"`
 	Flow     *models.TrafficFlow   `json:"flow,omitempty"`
 	Security *models.SecurityEvent `json:"security,omitempty"`
+	// OffTrail marks audit-stream records that are not events of the audit trail (AUDIT_CHECKPOINT): they
+	// never move the audit cursor, which must name an event the trail can be replayed from.
+	OffTrail bool `json:"off_trail,omitempty"`
 }
 
 // AuditEvent, FlowEvent and SecurityEvent build exporter events from the domain models.
 func AuditEvent(ev models.AuditEvent) Event {
 	return Event{Stream: models.StreamAudit, Time: ev.Timestamp, ID: ev.ID, Severity: "info", Audit: &ev}
+}
+
+// AuditCheckpointEvent builds an audit-stream record that is not part of the audit trail.
+func AuditCheckpointEvent(ev models.AuditEvent) Event {
+	e := AuditEvent(ev)
+	e.OffTrail = true
+	return e
 }
 
 func FlowEvent(f models.TrafficFlow) Event {
