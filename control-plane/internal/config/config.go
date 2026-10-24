@@ -49,6 +49,10 @@ type Config struct {
 	EncryptionKey          string
 	EncryptionKeyPrevious  string
 	EncryptionKeyGenerated bool
+	// EncryptionKeyInDataDir is true when the key is read from the data directory (the auto-generated
+	// secrets/encryption.key, or an AEGIS_ENCRYPTION_KEY_FILE inside DATA_DIR): whoever can read the
+	// data directory can then decrypt the secrets and the audit chain key stored there.
+	EncryptionKeyInDataDir bool
 	DataPlaneKey           string
 	// DataPlaneKeyGenerated is true when the key was auto-generated (single-host / dev setups).
 	DataPlaneKeyGenerated bool
@@ -348,6 +352,13 @@ func Load() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("generate encryption key: %w", err)
 		}
+		c.EncryptionKeyInDataDir = true
+	} else if p := strings.TrimSpace(os.Getenv("AEGIS_ENCRYPTION_KEY_FILE")); p != "" && strings.TrimSpace(os.Getenv("AEGIS_ENCRYPTION_KEY")) == "" {
+		c.EncryptionKeyInDataDir = pathInside(p, c.DataDir)
+	}
+	if c.EncryptionKeyInDataDir {
+		slog.Warn("the encryption key for secrets at rest is stored in the data directory: anyone who can read DATA_DIR can decrypt the stored secrets and the audit chain key; provide AEGIS_ENCRYPTION_KEY or AEGIS_ENCRYPTION_KEY_FILE from a secret store outside DATA_DIR",
+			"data_dir", c.DataDir)
 	}
 	if len(c.EncryptionKey) < minSecretLen || isKnownLeakedSecret(c.EncryptionKey) {
 		return nil, fmt.Errorf("AEGIS_ENCRYPTION_KEY must be a random secret of at least %d characters", minSecretLen)
@@ -375,6 +386,21 @@ func Load() (*Config, error) {
 	c.ExportDir = env("AEGIS_EXPORT_DIR", filepath.Join(c.DataDir, "export"))
 	c.ExportSpoolDir = env("AEGIS_EXPORT_SPOOL_DIR", filepath.Join(c.DataDir, "export-spool"))
 	return c, nil
+}
+
+// pathInside reports whether path lies in dir (after resolving symbolic links where possible).
+func pathInside(path, dir string) bool {
+	resolve := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			p = real
+		}
+		return p
+	}
+	rel, err := filepath.Rel(resolve(dir), resolve(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // validProxyHost accepts DNS host names (letters, digits, hyphens, dots), no addresses or ports.

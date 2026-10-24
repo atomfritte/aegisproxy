@@ -571,9 +571,43 @@ func (s *Server) handleVerifyAudit(w http.ResponseWriter, r *http.Request, claim
 	if !res.OK {
 		s.log.Error("audit trail verification failed", "error", res.Error, "events", res.Events)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"valid": res.OK, "events_checked": res.Events, "error": res.Error,
+	writeJSON(w, http.StatusOK, auditVerificationJSON(res))
+}
+
+func auditVerificationJSON(res store.AuditVerification) map[string]any {
+	out := map[string]any{"valid": res.OK, "events_checked": res.Events, "error": res.Error,
 		"first_id": res.FirstID, "last_id": res.LastID, "legacy_events": res.Legacy, "scope": "complete",
-		"starts_at_genesis": res.StartsAtGenesis, "head_matches": res.HeadMatches})
+		"starts_at_genesis": res.StartsAtGenesis, "head_matches": res.HeadMatches,
+		"checkpoint_matches": res.CheckpointMatches, "checkpoint_events": res.CheckpointEvents,
+		"legacy_pending": res.LegacyPending}
+	if res.LegacyPending {
+		out["legacy_head"] = res.LegacyHead
+	}
+	return out
+}
+
+// handleAcceptLegacyAudit trusts the unkeyed (pre-2.1) prefix sealed as pending at the upgrade, after
+// a Super Admin compared it with an independent copy: the request repeats the number of legacy
+// events and the hash of the last one. Audited, and raises a high-severity alert.
+func (s *Server) handleAcceptLegacyAudit(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	var body struct {
+		LegacyEvents *int   `json:"legacy_events"`
+		LegacyHead   string `json:"legacy_head"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.LegacyEvents == nil || body.LegacyHead == "" {
+		writeError(w, http.StatusBadRequest, "legacy_events and legacy_head (the event hash of the last legacy event) are required")
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	res, err := s.store.AcceptLegacyAudit(r.Context(), s.cfg.AuditLogPath, *body.LegacyEvents, body.LegacyHead, claims)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, auditVerificationJSON(res))
 }
 
 // handleAuditRetention re-seals the start of the trail after the operator removed old generations

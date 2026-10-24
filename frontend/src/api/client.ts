@@ -318,6 +318,9 @@ export const api = {
   audit: {
     verify: () => apiJSON<AuditVerifyResult>('/api/audit/verify'),
     exportUrl: () => apiUrl('/api/audit/export'),
+    /** Super Admin: accepts the pending pre-2.1 prefix; count and last hash must match exactly (audited, raises an alert). */
+    acceptLegacy: (legacyEvents: number, legacyHead: string) =>
+      apiPost<AuditVerifyResult>('/api/audit/anchor/accept-legacy', { legacy_events: legacyEvents, legacy_head: legacyHead }),
   },
   users: {
     /** Super Admin. A temporary password is returned once for new local users. */

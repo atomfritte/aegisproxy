@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Download, History, ShieldCheck } from 'lucide-react';
 import { api } from '../../api';
-import { useConsoleState } from '../../data/AppData';
+import { useConsoleState, usePermissions } from '../../data/AppData';
 import { useLookups } from '../../data/lookups';
 import { cn } from '../../lib/cn';
 import { formatDateTime, formatNumber, pluralize, toTime } from '../../lib/format';
@@ -16,8 +16,11 @@ import {
   buttonClass,
   Callout,
   Column,
+  ConfirmDialog,
   DataTable,
   EmptyState,
+  Field,
+  Input,
   PageHeader,
   RelativeTime,
   SegmentedControl,
@@ -62,6 +65,10 @@ export const AuditTrailPage: React.FC = () => {
   const [verifying, setVerifying] = useState(false);
   const [verify, setVerify] = useState<(AuditVerifyResult & { at: string }) | null>(null);
   const legacyEvents = verify?.legacy_events ?? 0;
+  const perms = usePermissions();
+  const [accepting, setAccepting] = useState(false);
+  const [acceptCount, setAcceptCount] = useState('');
+  const [acceptHead, setAcceptHead] = useState('');
 
   const events = state.audit_events ?? [];
   const rules = state.rules ?? [];
@@ -95,6 +102,22 @@ export const AuditTrailPage: React.FC = () => {
     } finally {
       setVerifying(false);
     }
+  };
+
+  const openAccept = () => {
+    setAcceptCount('');
+    setAcceptHead('');
+    setAccepting(true);
+  };
+
+  // The values come from the operator's archived copy (export taken before the upgrade, SIEM); the
+  // server accepts only an exact match with the sealed prefix.
+  const acceptLegacy = async () => {
+    const n = Number(acceptCount.trim());
+    if (acceptCount.trim() === '' || !Number.isInteger(n) || n < 0) throw new Error('Enter the number of legacy events in your archived copy.');
+    if (!/^[0-9a-f]{64}$/i.test(acceptHead.trim())) throw new Error('Enter the event_hash of the last legacy event (64 hex characters).');
+    const r = await api.audit.acceptLegacy(n, acceptHead.trim().toLowerCase());
+    setVerify({ ...r, at: new Date().toISOString() });
   };
 
   const catFilter = f.values.category;
@@ -206,26 +229,70 @@ export const AuditTrailPage: React.FC = () => {
 
       {verify && (
         <Callout
-          tone={!verify.valid ? 'danger' : legacyEvents > 0 ? 'warning' : 'success'}
+          tone={verify.legacy_pending ? 'warning' : !verify.valid ? 'danger' : legacyEvents > 0 ? 'warning' : 'success'}
           className="mb-5"
-          title={verify.valid ? 'Hash chain intact' : 'Hash chain broken'}
+          title={verify.legacy_pending ? 'Legacy events await acceptance' : verify.valid ? 'Hash chain intact' : 'Hash chain broken'}
           action={
-            <Button size="sm" variant="ghost" onClick={() => setVerify(null)}>
-              Dismiss
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              {verify.legacy_pending && perms.isSuperAdmin && (
+                <Button size="sm" variant="secondary" onClick={openAccept}>
+                  Review and accept…
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => setVerify(null)}>
+                Dismiss
+              </Button>
+            </div>
           }
         >
-          {verify.valid
-            ? `All ${formatNumber(verify.events_checked)} events link to their predecessor${
-                verify.starts_at_genesis === false ? ', starting at the sealed retention point' : ' from the first event'
-              } up to the newest one. Checked ${formatDateTime(verify.at)}.${
-                legacyEvents > 0
-                  ? ` ${formatNumber(legacyEvents)} legacy events from before 2.1 use the unkeyed hash, which anyone can recompute: they are accepted only before the sealed cutover — keep an archived copy as independent evidence.`
-                  : ''
-              }`
-            : `The chain breaks after ${formatNumber(verify.events_checked)} events${verify.error ? `: ${verify.error}` : ''}. Export the ledger and compare it with your archived copy.`}
+          {verify.legacy_pending ? (
+            <>
+              {formatNumber(legacyEvents)} events at the start of the trail use the unkeyed hash from before 2.1, which anyone with access to the data can
+              recompute. The trail is not trusted — verification and the security posture fail — until a Super Admin compares these events with an independent
+              copy (the trail exported before the upgrade, your SIEM) and accepts them. Last legacy event:{' '}
+              <code className="break-all font-mono text-[12px]">{verify.legacy_head}</code>.
+              {!perms.isSuperAdmin && ' Ask a Super Admin to review them.'} If no such copy exists or it differs, restore the data from a backup instead.
+            </>
+          ) : verify.valid ? (
+            `All ${formatNumber(verify.events_checked)} events link to their predecessor${
+              verify.starts_at_genesis === false ? ', starting at the sealed retention point' : ' from the first event'
+            } up to the newest one${
+              verify.checkpoint_matches ? ', which matches the sealed head checkpoint (event count and configuration revision)' : ''
+            }. Checked ${formatDateTime(verify.at)}.${
+              legacyEvents > 0
+                ? ` ${formatNumber(legacyEvents)} legacy events from before 2.1 use the unkeyed hash, which anyone can recompute: a Super Admin accepted them after comparing them with an independent copy — keep that copy as evidence.`
+                : ''
+            }`
+          ) : (
+            `The chain breaks after ${formatNumber(verify.events_checked)} events${verify.error ? `: ${verify.error}` : ''}. Export the ledger and compare it with your archived copy; a recorded integrity violation stays until the data is restored from a backup.`
+          )}
         </Callout>
       )}
+
+      <ConfirmDialog
+        open={accepting}
+        onClose={() => setAccepting(false)}
+        tone="danger"
+        title="Accept the legacy audit events?"
+        description="Only accept events you compared with an independent copy. The acceptance is recorded in the audit trail and raises a high-severity security alert."
+        body={
+          <>
+            <div className="rounded-md border border-border bg-surface-2 p-3 text-[12.5px] leading-5 text-fg-muted">
+              The control-plane holds <strong className="text-fg">{formatNumber(legacyEvents)}</strong> legacy events; the last one has the hash
+              <code className="mt-1 block break-all font-mono text-[12px] text-fg">{verify?.legacy_head}</code>
+            </div>
+            <Field label="Number of legacy events in your copy" required>
+              <Input value={acceptCount} onChange={(e) => setAcceptCount(e.target.value)} inputMode="numeric" autoComplete="off" data-autofocus />
+            </Field>
+            <Field label="event_hash of the last legacy event in your copy" required>
+              <Input value={acceptHead} onChange={(e) => setAcceptHead(e.target.value)} mono autoComplete="off" spellCheck={false} />
+            </Field>
+          </>
+        }
+        confirmLabel="Accept legacy events"
+        onConfirm={acceptLegacy}
+        onDone={() => toast.success('Legacy events accepted', { description: 'Recorded in the audit trail and raised as a security alert.' })}
+      />
 
       <div className="scroll-thin -mx-1 mb-4 overflow-x-auto px-1 pb-1" role="group" aria-label="Filter by category">
         <div className="flex min-w-max gap-1.5">

@@ -132,14 +132,17 @@ func TestCompleteAuditVerificationDetectsForgery(t *testing.T) {
 	// A pre-2.1 (unkeyed) event at the start of the trail stays verifiable after the upgrade.
 	legacy := writeLegacyInstallation(t, dir, path)
 	st, _ := openAuditStore(t, dir, path)
+	if _, err := st.AcceptLegacyAudit(context.Background(), path, 1, legacy.EventHash, adminClaims); err != nil {
+		t.Fatal(err)
+	}
 	for _, g := range []string{"grp-1", "grp-2", "grp-3"} {
 		if _, err := st.UpsertGroup(models.ServerGroup{ID: g, Name: g}, adminClaims); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// legacy + AUDIT_ANCHOR_SEALED + 3 changes
+	// legacy + AUDIT_ANCHOR_SEALED + AUDIT_LEGACY_ACCEPTED + 3 changes
 	res := st.VerifyCompleteAudit(context.Background(), path)
-	if !res.OK || res.Events != 5 || res.Legacy != 1 || res.FirstID != legacy.ID || !res.StartsAtGenesis || !res.HeadMatches {
+	if !res.OK || res.Events != 6 || res.Legacy != 1 || res.FirstID != legacy.ID || !res.StartsAtGenesis || !res.HeadMatches {
 		t.Fatalf("verification of an intact trail: %+v", res)
 	}
 	raw, _ := os.ReadFile(path)
@@ -162,7 +165,7 @@ func TestCompleteAuditVerificationDetectsForgery(t *testing.T) {
 	}
 	// Dropping an event breaks the chain.
 	lines[2] = orig
-	os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3], lines[4]}, []byte("\n")), '\n'), 0o600)
+	os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3], lines[4], lines[5]}, []byte("\n")), '\n'), 0o600)
 	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "chain broken") {
 		t.Fatalf("missing event not detected: %+v", res)
 	}

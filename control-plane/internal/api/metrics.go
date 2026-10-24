@@ -105,11 +105,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	gauge("aegis_access_requests_pending", "Access requests awaiting review.", float64(pending))
 	gauge("aegis_security_events_open", "Unacknowledged security events.", float64(open))
-	writable := 0.0
-	if s.store.AuditStatus().Writable {
+	audit := s.store.AuditStatus()
+	writable, intact, pendingLegacy := 0.0, 0.0, 0.0
+	if audit.Writable {
 		writable = 1
 	}
+	if audit.Integrity == "" {
+		intact = 1
+	}
+	if audit.LegacyPending {
+		pendingLegacy = 1
+	}
 	gauge("aegis_audit_log_writable", "1 while the audit log can be written (file storage refuses changes otherwise).", writable)
+	gauge("aegis_audit_trail_intact", "0 after an audit trail integrity violation (missing or invalid anchor or checkpoint, diverged trail).", intact)
+	gauge("aegis_audit_legacy_pending", "1 while unkeyed pre-2.1 audit events await acceptance by a Super Admin.", pendingLegacy)
 	if ti := s.store.ThreatIntel(); ti != nil {
 		st := ti.Snapshot().Status()
 		gauge("aegis_threatintel_indicators", "Compiled threat-intel indicators.", float64(st.Domains+st.URLs+st.IPs+st.CIDRs+st.Hashes))

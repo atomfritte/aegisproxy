@@ -73,6 +73,7 @@ func (s *Store) withWrite(fn func() error) error {
 			return err
 		}
 		s.state.AuditEvents = audits
+		s.checkClusterAuditLocked() // anchor and checkpoint against the trail read in this transaction
 	}
 	before, err := s.configDocLocked()
 	if err != nil {
@@ -81,6 +82,7 @@ func (s *Store) withWrite(fn func() error) error {
 	startRev := s.state.Revision
 	s.pendingAudit = nil
 	s.dirty = false
+	s.reportAuditViolationsLocked() // committed with this write
 
 	fnErr := fn()
 	changed := s.state.Revision != startRev || len(s.pendingAudit) > 0 || s.dirty
@@ -126,6 +128,8 @@ func (s *Store) dropPendingAuditLocked() {
 func (s *Store) configDocLocked() ([]byte, error) {
 	cfg := s.state
 	cfg.Flows, cfg.AuditEvents, cfg.SecurityEvents, cfg.RuleStats = nil, nil, nil, nil
+	// Committed in the same transaction as the audit rows it seals.
+	cfg.AuditCheckpoint = s.sealedCheckpointLocked()
 	sessions := make([]models.LearningSession, len(cfg.Sessions))
 	for i, sess := range cfg.Sessions {
 		sess.CompiledCandidates = nil // recomputed from replicated flows on every node
@@ -260,6 +264,7 @@ func (s *Store) initCluster(seed func() error) error {
 		s.log.Info("initialized empty cluster storage", "backend", s.cluster.Name(), "node", s.cluster.NodeID())
 	}
 	fresh := tx.StoredDoc() == nil
+	s.pendingAudit = nil
 	switch {
 	case !fresh:
 		audits, err := tx.RecentAudit(ctx, maxAuditEvents)
@@ -267,8 +272,14 @@ func (s *Store) initCluster(seed func() error) error {
 			return err
 		}
 		s.state.AuditEvents = audits
+		s.noteAuditLoadedLocked()
+		// A missing anchor is left to ensureClusterAuditAnchor (it scans the trail outside the lock).
+		s.checkClusterAuditLocked()
 	case s.importedFileState:
-		// Migration from file storage: the complete audit trail, not only the in-memory window.
+		// Migration from file storage: the complete audit trail, not only the in-memory window. The
+		// checkpoint of the file state is checked against the window saved with it first.
+		s.noteAuditLoadedLocked()
+		s.checkAuditCheckpointLocked()
 		sc, err := s.importFileAuditTrailLocked(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("import the audit trail of the file storage: %w", err)
@@ -278,18 +289,29 @@ func (s *Store) initCluster(seed func() error) error {
 			return err
 		}
 		s.state.AuditEvents = audits
+		n, _ := countThrough(audits, sc.last, sc.events)
+		if c, ok := tx.(auditCounter); ok {
+			if total, err := c.CountAudit(ctx); err == nil {
+				n = total
+			}
+		}
 		if s.state.AuditAnchor == "" {
-			s.establishAuditAnchorLocked(sc, false)
+			s.establishAuditAnchorLocked(sc, true, n)
+		} else {
+			if _, err := s.auditAnchorLocked(); err != nil {
+				s.auditViolationLocked(err.Error())
+			}
+			s.auditCheckpointLocked().Events = n
 		}
 	default:
 		var sc anchorScan
 		for i := len(s.state.AuditEvents) - 1; i >= 0; i-- {
 			_ = sc.add(s.state.AuditEvents[i])
 		}
-		s.establishAuditAnchorLocked(sc, false)
+		s.establishAuditAnchorLocked(sc, false, sc.events)
 	}
 	before, _ := s.configDocLocked()
-	s.pendingAudit = nil
+	s.reportAuditViolationsLocked()
 	s.migrateLocked()
 	if err := s.ensureBootstrapAdminLocked(); err != nil {
 		return err
@@ -481,6 +503,7 @@ func (s *Store) clusterLoops() {
 				}
 			}
 			s.pullRuleStats(ctx)
+			s.exportAuditCheckpointIfDue()
 		case <-prune.C:
 			if err := s.cluster.Prune(ctx, s.opts.FlowRetention, s.opts.EventRetention); err != nil {
 				s.log.Warn("telemetry retention pruning failed", "error", err)

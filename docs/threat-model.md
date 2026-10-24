@@ -54,7 +54,7 @@ topology or add integrations.
 |---|---|
 | Unreviewed policy change | Drafts, impact simulation, optional four-eyes review (author and last editor cannot approve), immutable versions, rollback |
 | Privilege escalation through configuration | User management, SSO mapping, service accounts, log export and Defender settings are Super Admin only; Team Leads cannot create BLOCK rules, catch-all hosts or baseline sets, nor change other roles' BLOCK guardrails |
-| Manipulated audit history | SHA-256 hash chain that is never recomputed, append-only JSONL sink and database table, verification endpoint, real-time SIEM forwarding |
+| Manipulated audit history | Keyed hash chain (HMAC-SHA256, audit chain key encrypted with `AEGIS_ENCRYPTION_KEY`) that is never recomputed; sealed anchor (start, pre-2.1 prefix) and head checkpoint (newest event, event count, configuration revision) saved atomically with the configuration; append-only JSONL sink and database table; verification endpoint; removed seals, cut-off starts or ends and hash downgrades are sticky integrity violations with high-severity alerts; unkeyed prefixes stay untrusted until a Super Admin accepts them; real-time SIEM forwarding with checkpoint records ([details](#audit-trail-against-insiders)) |
 | Request smuggling past the policy (`Host`/SNI mismatch, domain fronting) | Destination = real connection target; mismatching `Host`/SNI blocked; HTTP/2 and HTTP/3: a `Host` header that differs from `:authority` is blocked (it would be forwarded, and becomes the `Host` of an HTTP/1.1 upstream request) |
 | Policy bypass through protocol upgrades | A WebSocket upgrade is an ordinary HTTP request: host, path, method, identity and `Host`/SNI binding are evaluated before the upgrade; frames after it are relayed without content inspection (no DLP/AV on WebSocket messages). Non-HTTP payloads inside tunnels are refused (`block_raw_tcp`) |
 | Tampering with stored secrets | AES-256-GCM with authenticated key id; tampered values fail to decrypt and stop the start-up |
@@ -65,7 +65,8 @@ topology or add integrations.
 | Threat | Mitigation |
 |---|---|
 | Administrator denies a change | Every change audited with actor, role, before/after state; service accounts audited as `sa:<name>`; integrations as `microsoft-defender` |
-| Emergency access used silently | `BREAK_GLASS_LOGIN` audit event and high-severity alert; emergency publishes flagged with justification |
+| Emergency access used silently | `BREAK_GLASS_LOGIN` audit event and high-severity alert — the sign-in is refused (503) when the event cannot be written; emergency publishes flagged with justification |
+| Audit trail quietly reset or re-based | Retention points, anchors sealed for existing installations and acceptances of legacy events are audited and raise high-severity alerts |
 | Server owner denies traffic | Traffic records with server identity, URL, verdict, rule and trace id; data-plane access logs |
 
 ### Information disclosure
@@ -101,6 +102,23 @@ topology or add integrations.
 | Allowed site redirects to an arbitrary host (open redirect, user-controlled links) | Redirect grants only for rules with *Follow redirects* (and learning sessions); one object (exact path), GET/HEAD, two minutes, single hop, same source IP, never internal destinations; optional per-rule `redirect_hosts` allowlist |
 | Compromised server keeps communicating | Quarantine overrides every allow rule, TLS exception and learning session; Defender risk/isolation and SOAR playbooks can quarantine automatically |
 
+### Audit trail against insiders
+
+The audit trail has to hold up against people with access to the storage (`DATA_DIR`, the database, backups),
+not only against console users.
+
+| Attacker | Can | Cannot |
+|---|---|---|
+| Write access to `DATA_DIR` or the database, **without** the encryption key | destroy or corrupt the data (detected, restore from backup); roll state and trail back together to an older consistent copy; discard key, seals and trail and present a re-hashed unkeyed trail | change, insert, reorder or delete events (also at the start or the end), remove or forge the anchor or checkpoint, hide a recorded violation, or make a re-hashed trail trusted — each is an integrity violation or a pending legacy prefix, with a high-severity alert and a failing posture check |
+| The same **with** the encryption key (key stored in `DATA_DIR`, root on the host, database plus secret store) | recompute the keyed chain and all seals: any change is undetectable locally | change what the SIEM already received |
+| Super Admin (console/API) | accept a pending legacy prefix (count and last hash must match), apply a retention point — both audited and alerted | delete or change events, clear a violation |
+
+Residual risk: a complete rollback, and anything done with the encryption key, can only be detected against an
+independent copy. Keep the encryption key outside `DATA_DIR` (posture check warns otherwise), forward the audit
+stream including its `AUDIT_CHECKPOINT` records to a SIEM in real time (the posture check fails in production
+otherwise), alert there when checkpoints stop or their event count decreases, and accept a legacy prefix only after
+comparing it with an archived copy ([operations.md](operations.md#audit-trail)).
+
 ## Residual risks and operator responsibilities
 
 - **Bypass of the proxy**: AegisProxy only controls traffic that passes through it. Block direct egress at the
@@ -127,5 +145,8 @@ topology or add integrations.
   to your legal requirements.
 - **Availability**: run at least two data-plane workers and two control-plane replicas for production; monitor
   the metrics listed in [operations.md](operations.md#monitoring).
+- **Audit trail rollback**: state and audit trail replaced together by an older consistent copy, or rewritten by
+  somebody holding the encryption key, verify locally; only the SIEM copy reveals it
+  ([above](#audit-trail-against-insiders)).
 - **Monitoring**: mitigations that alert (break-glass logins, emergency publishes, quarantines, security events)
   only help when someone reviews them — forward them to the SIEM and define response procedures.

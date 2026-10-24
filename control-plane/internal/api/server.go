@@ -208,6 +208,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/audit/verify", s.authed(s.handleVerifyAudit))
 	s.mux.HandleFunc("GET /api/audit/export", s.authed(s.handleExportAudit))
 	s.mux.HandleFunc("POST /api/audit/retention", s.authed(s.handleAuditRetention))
+	s.mux.HandleFunc("POST /api/audit/anchor/accept-legacy", s.authed(s.handleAcceptLegacyAudit))
 
 	// Identity administration
 	s.mux.HandleFunc("POST /api/users", s.authed(s.handleUpsertUser))
