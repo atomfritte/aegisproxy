@@ -254,8 +254,50 @@ Describe 'Install-AegisConsole-IIS.ps1' {
             New-Item -ItemType Directory -Path $target | Out-Null
             Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
             New-Item -ItemType SymbolicLink -Path (Join-Path $Site 'static') -Target $target | Out-Null
-            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links are not allowed in the site directory*static*'
+            { & $Installer @Base } | Should -Throw '*Junctions/symbolic links and hard-linked files are not allowed in the site directory*static*'
             (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
+        }
+
+        It 'refuses a hard-linked file in the site directory' {
+            $outside = Join-Path $FakeWin.Root 'outside.js'
+            Set-Content -LiteralPath $outside -Value 'x'
+            New-Item -ItemType HardLink -Path (Join-Path $Site 'assets\old.js') -Target $outside | Out-Null
+            { & $Installer @Base } | Should -Throw '*hard-linked files are not allowed in the site directory*old.js (hard link)*'
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+        }
+
+        It 'takes the directory over top-down with /L and without /T' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $calls = @(Get-FakeCall 'icacls.exe')
+            @($calls | Where-Object { $_.Args -notcontains '/L' }).Count | Should -Be 0
+            @($calls | Where-Object { $_.Args -contains '/T' }).Count | Should -Be 0 -Because 'icacls /T follows junctions'
+            $order = @($calls | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $assets = Join-Path $Site 'assets'
+            $first = @($Site, $assets, (Join-Path $assets 'index-abc123.js')) | ForEach-Object { $order.IndexOf((Get-FakeFullPath $_)) }
+            $first | Should -Not -Contain -1
+            $first[0] | Should -BeLessThan $first[1]
+            $first[1] | Should -BeLessThan $first[2]
+        }
+
+        It 'refuses a symbolic link that the owner of a subdirectory swaps in while the installer runs, and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'victim'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'x'
+            # Everyone may still write to assets until the installer has taken it over.
+            $race = @{ Done = $false; Dir = (Get-FakeFullPath (Join-Path $Site 'assets')); Link = (Join-Path $Site 'assets\link'); Target = $target }
+            $FakeWin.IcaclsHook = {
+                param($a)
+                if (-not $race.Done -and (Get-FakeFullPath $a[0]) -eq $race.Dir) {
+                    $race.Done = $true
+                    New-Item -ItemType SymbolicLink -Path $race.Link -Target $race.Target | Out-Null
+                }
+            }.GetNewClosure()
+            { & $Installer @Base } | Should -Throw '*Junction/symbolic link in the site directory*link*'
+            $race.Done | Should -BeTrue
+            $FakeWin.Owner.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
+            $FakeWin.Acl.ContainsKey((Get-FakeFullPath $target)) | Should -BeFalse
             (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
             Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
         }

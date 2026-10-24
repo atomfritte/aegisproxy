@@ -176,8 +176,15 @@ jobs:
       - name: end to end through the Windows services
         run: |
           $ErrorActionPreference = 'Stop'
-          # Trust the enterprise CA with the product's own roll-out script (fingerprint-pinned download).
-          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/api/public/ca/install-windows.ps1 | Select-Object -ExpandProperty Content | Invoke-Expression
+          # Trust the enterprise CA with the product's own roll-out script, the documented way: download it, compare
+          # its SHA-256 with windows_script_sha256 of /api/public/ca/info, only then run it (never piped into iex).
+          $caScript = Join-Path $env:RUNNER_TEMP 'aegis-ca-install.ps1'
+          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/api/public/ca/install-windows.ps1 -OutFile $caScript
+          $expected = "$((Invoke-RestMethod http://127.0.0.1:8081/api/public/ca/info).windows_script_sha256)"
+          $actual = (Get-FileHash -LiteralPath $caScript -Algorithm SHA256).Hash
+          if ($expected -notmatch '^[0-9A-Fa-f]{64}$' -or $actual -ne $expected) { throw "CA installer SHA-256 $actual does not match windows_script_sha256 '$expected'" }
+          powershell -NoProfile -ExecutionPolicy Bypass -File $caScript
+          if ($LASTEXITCODE -ne 0) { throw "CA installer failed with exit code $LASTEXITCODE" }
           $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
           $h = @{ 'X-Requested-With' = 'aegis-ui' }
           Invoke-RestMethod -Method Post http://127.0.0.1:8081/api/auth/login -WebSession $s -Headers $h -ContentType application/json -Body '{"username":"admin","password":"Ci-Windows-Root-Pass-2026"}' | Out-Null
