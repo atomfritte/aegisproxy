@@ -137,3 +137,32 @@ func TestBlockPagePreviewAPI(t *testing.T) {
 		t.Errorf("rendered preview: %d %s", r.StatusCode, r.Header.Get("Content-Security-Policy"))
 	}
 }
+
+// A simulated request with invalid proxy credentials shows the data-plane's answer: 407 with the
+// credentials help, no self-service form and no block token.
+func TestSimulateInvalidProxyTokenAnswers407(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	r := h.do(t, "POST", "/api/simulate/request", map[string]any{"server_ip": "10.9.8.7", "proxy_auth_user": "web-01:not-a-token",
+		"method": "GET", "full_url": "https://pypi.org/simple/"}, map[string]string{"X-Requested-With": "aegis-ui"})
+	if r.StatusCode != 200 {
+		t.Fatalf("simulate: %d", r.StatusCode)
+	}
+	var out struct {
+		Flow struct {
+			Verdict    string `json:"verdict"`
+			StatusCode int    `json:"status_code"`
+		} `json:"flow"`
+		CLIOutput string `json:"cli_output"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Flow.Verdict != models.VerdictAuthFailed || out.Flow.StatusCode != 407 {
+		t.Errorf("flow: %+v", out.Flow)
+	}
+	if !strings.Contains(out.CLIOutput, "(HTTP 407)") || !strings.Contains(out.CLIOutput, "Proxy-Authorization") ||
+		strings.Contains(out.CLIOutput, "/api/public/requests") || strings.Contains(out.CLIOutput, "bt=") {
+		t.Errorf("cli output:\n%s", out.CLIOutput)
+	}
+}

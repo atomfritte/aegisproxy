@@ -85,7 +85,7 @@ JSON field names follow the Go models in `control-plane/internal/models/models.g
 |---|---|---|---|
 | GET | `/api/state[?exclude_flows=1]` | any | complete console state: `groups`, `servers` (with `effective_group_ids`, `labels`, quarantine fields), `rules` (effective, compiled from policy sets), `policy_sets`, `change_requests`, `governance`, `block_pages`, `requests`, `sessions`, `tls_bypass`, `users`, `audit_events`, `security`, `bandwidth`, `stats`, `overview` (work-queue counters), `data_planes`, `proxy_address`, `me` |
 | GET | `/api/flows/stream` | any | Server-Sent Events: live flows (Team Leads: their groups); the session and its role/groups are re-checked every minute, `event: session_expired` when it ends |
-| POST | `/api/simulate/request` | any | side-effect-free policy simulation `{server_ip, proxy_auth_user, method, full_url}`; Team Leads only for servers of their groups (other or unknown sources → 404) |
+| POST | `/api/simulate/request` | any | side-effect-free policy simulation `{server_ip, proxy_auth_user, method, full_url}` (`proxy_auth_user` as `user:token`, `token` or a bare username); invalid credentials give verdict `AUTH_FAILED` with status 407; Team Leads only for servers of their groups (other or unknown sources → 404) |
 
 `overview` counters: `pending_requests`, `overdue_requests`, `assigned_to_me`, `open_change_requests`,
 `changes_to_review`, `recertification_overdue`, `recertification_due_soon`, `drafts`, `quarantined_servers`,
@@ -104,8 +104,8 @@ the set's assignment applies. Editing happens in a **draft**; publishing creates
 | GET | `/api/rules` | any | effective (compiled) rules with `policy_set_id`, `policy_set_name`, `hit_count` |
 | GET | `/api/policy-sets` | any | all sets with computed `review_due_at`, `review_state` (`ok`/`due_soon`/`overdue`) |
 | POST | `/api/policy-sets` | scoped | create `{kind, spec}` → set whose content is in `draft` (version 0 = never published) |
-| GET | `/api/policy-sets/export[?id=…&id=…]` | any | policy-as-code bundle `{format: "aegisproxy.policy-sets/v1", exported_at, exported_by, policy_sets[{id, kind, …spec}]}` (published content) |
-| POST | `/api/policy-sets/import` | scoped | `{dry_run, bundle}` → `{results[{id, name, action: create|update|unchanged|skip|error, diff, error}]}`; sets are matched by id, then by name (sets the caller cannot see are never matched); rule attribution in the bundle is ignored; changes land in **drafts** (publish or submit them as usual); all-or-nothing (422 with per-set errors); approvals sets are skipped |
+| GET | `/api/policy-sets/export[?id=…&id=…]` | any | policy-as-code bundle `{format: "aegisproxy.policy-sets/v1", path_syntax: 2, exported_at, exported_by, policy_sets[{id, kind, …spec}]}` (published content) |
+| POST | `/api/policy-sets/import` | scoped | `{dry_run, bundle}` → `{results[{id, name, action: create|update|unchanged|skip|error, diff, error}]}`; sets are matched by id, then by name (sets the caller cannot see are never matched); rule attribution in the bundle is ignored; changes land in **drafts** (publish or submit them as usual); all-or-nothing (422 with per-set errors); approvals sets are skipped. A bundle without `path_syntax` (before 2.1) has its trailing `*` path patterns rewritten to `**`; a newer `path_syntax` is rejected |
 | GET | `/api/policy-sets/{id}` | any | `{policy_set, versions, change_requests, draft_diff}` |
 | DELETE | `/api/policy-sets/{id}?reason=` | InfoSec | delete (versions are kept) |
 | PUT | `/api/policy-sets/{id}/draft` | scoped | replace the draft `{spec}`; 400 while the draft is in review. `created_by`, `created_at`, `approved_by`, `access_request_id` and `source_session_id` of rules are set by the server (client values are ignored) |
@@ -122,6 +122,9 @@ the set's assignment applies. Editing happens in a **draft**; publishing creates
 `spec` = `{name, description, owner_team, tags[], priority, enabled, group_ids[], server_ids[], review_interval_days, rules[]}`;
 a rule = `{id?, name, description, action: ALLOW|BLOCK, host_pattern, path_pattern, methods[], follow_redirects, redirect_hosts[]?, companion_rules[], enabled, expires_at?}`
 (`redirect_hosts`: optional host patterns redirect grants of the rule may target; omitted/empty = any public host).
+In `path_pattern`, `*` matches within one path segment and `**` any number of segments (`/acme/*` matches `/acme/x`
+but not `/acme/x/y`; `/acme/**` matches both). Stored patterns of earlier versions are migrated once (trailing `*` → `**`,
+audit event `POLICY_PATH_PATTERNS_MIGRATED`).
 Rule ids are kept across edits (send them back unchanged); new rules get an id on save. `review_interval_days: 0` disables recertification
 for the set (the console pre-fills the governance default).
 
@@ -177,7 +180,7 @@ Team Leads may start sessions on servers whose effective groups (static or label
 | GET | `/api/servers/discovered` | any | unregistered sources seen in traffic with suggested ids, matched CIDR groups, top hosts |
 | POST | `/api/servers/import` | InfoSec | `{dry_run, csv}` or `{dry_run, servers[]}` → `{results[{row, id, hostname, action: create|update|error, error}]}`; all-or-nothing (422 with per-row errors) |
 | GET | `/api/servers/export?format=csv|json` | any | CSV columns: `id,hostname,ip,subnet_cidr,proxy_auth_user,group_ids,labels,os,department,owner_team,description` (`group_ids` `;`-separated, `labels` `k=v;k=v`) |
-| POST · DELETE | `/api/groups`, `/api/groups/{id}` | InfoSec | groups incl. `match_labels` (dynamic membership; value `*` = any value) and `block_page_template_id` |
+| POST · DELETE | `/api/groups`, `/api/groups/{id}` | InfoSec | groups incl. `match_labels` (dynamic membership; value `*` = any value), `block_page_template_id` and `require_proxy_token` (members are identified only by their proxy token: no address or bare-username identification, missing or wrong credentials get 407 `AUTH_FAILED`; cannot be combined with `cidrs`) |
 
 ### Block pages
 

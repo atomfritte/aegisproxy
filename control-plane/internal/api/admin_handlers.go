@@ -438,7 +438,9 @@ func (s *Server) handleSimulateProxyRequest(w http.ResponseWriter, r *http.Reque
 
 	statusCode := 200
 	redirectLoc := ""
-	if !res.Allowed {
+	if res.Verdict == models.VerdictAuthFailed {
+		statusCode = 407
+	} else if !res.Allowed {
 		statusCode = 403
 	} else if body.SimulateRedir && res.FollowRedirects && strings.EqualFold(parsed.Hostname(), "github.com") {
 		statusCode = 302
@@ -510,12 +512,12 @@ func (s *Server) handleSimulateProxyRequest(w http.ResponseWriter, r *http.Reque
 		// Only a demo-mode simulation by someone who may act for the server gets a real (verifiable)
 		// block token; otherwise anyone could mint "verified" access requests for any server.
 		blockToken := "simulated-block-token"
-		if mutate {
+		if mutate && res.Verdict != models.VerdictAuthFailed {
 			blockToken, _ = auth.SignBlockToken(s.cfg.DataPlaneKey, auth.BlockClaims{
 				ServerIP: body.ServerIP, ServerID: res.ServerID, URL: body.FullURL, Method: body.Method, TraceID: flow.ID, Verdict: res.Verdict,
 			})
 		}
-		cliOutput = renderCLIBlock(s.cfg.PublicURL, s.cfg.DashboardURL, res, body.ServerIP, body.Method, body.FullURL, flow.ID, blockToken)
+		cliOutput = renderCLIBlock(s.cfg.PublicURL, s.cfg.DashboardURL, res, statusCode, body.ServerIP, body.Method, body.FullURL, flow.ID, blockToken)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -528,7 +530,7 @@ func (s *Server) handleSimulateProxyRequest(w http.ResponseWriter, r *http.Reque
 }
 
 // renderCLIBlock mirrors the terminal block message produced by the data-plane.
-func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult, serverIP, method, fullURL, traceID, blockToken string) string {
+func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult, status int, serverIP, method, fullURL, traceID, blockToken string) string {
 	payload, _ := json.Marshal(map[string]string{
 		"block_token":     blockToken,
 		"requester":       "admin@" + res.ServerHostname,
@@ -548,11 +550,13 @@ func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult,
       -H "Content-Type: application/json" \
       -d %s
 `, dashboardURL, url.QueryEscape(blockToken), publicURL, shellQuoteSingle(string(payload)))
-	if models.IsSecurityVerdict(res.Verdict) && res.Verdict != models.VerdictPolicyBlocked {
+	if res.Verdict == models.VerdictAuthFailed {
+		selfService = " 🔑 " + authFailedHelp + "\n"
+	} else if models.IsSecurityVerdict(res.Verdict) && res.Verdict != models.VerdictPolicyBlocked {
 		selfService = " ⛔ This destination was blocked by threat protection. Self-service requests are disabled;\n    contact InfoSec with the Trace ID above if you believe this is a false positive.\n"
 	}
 	return fmt.Sprintf(`================================================================================
- 🛡️  AEGISPROXY ENTERPRISE ZERO-TRUST GATEWAY — ACCESS BLOCKED (HTTP 403)
+ 🛡️  AEGISPROXY ENTERPRISE ZERO-TRUST GATEWAY — ACCESS BLOCKED (HTTP %d)
 ================================================================================
  Server Hostname : %s (%s)
  Server Groups   : %s
@@ -566,9 +570,17 @@ func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult,
     curl -fsSLo aegis-ca-install.sh %s/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
     sudo bash aegis-ca-install.sh
 ================================================================================`,
-		res.ServerHostname, serverIP, strings.Join(res.GroupIDs, ", "), method, fullURL, traceID,
+		status, res.ServerHostname, serverIP, strings.Join(res.GroupIDs, ", "), method, fullURL, traceID,
 		res.Verdict, reason, selfService, publicURL)
 }
+
+// authFailedHelp is the data-plane's AUTH_FAILED_HELP (data-plane/aegis_dp/blockpage.py).
+const authFailedHelp = `The proxy credentials sent by this client (Proxy-Authorization) are not valid: the token is unknown, was
+    rotated or is mistyped, the username does not belong to it, or this server's group requires the proxy
+    token. The request was not attributed to the source address. Set the proxy URL of this server to
+    http://<proxy-user>:<proxy-token>@<proxy-host>:<port> with the token shown when the server was onboarded
+    (console: Servers -> server -> Rotate token issues a new one), or remove the credentials if this server
+    is identified by its address.`
 
 // handleVerifyAudit checks every hash and link of the complete audit trail (not only the window
 // kept in memory). Evidence for auditors; may take a while on large trails.
