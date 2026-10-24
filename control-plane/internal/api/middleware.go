@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"aegisproxy/control-plane/internal/auth"
 )
 
 type statusRecorder struct {
@@ -223,7 +225,16 @@ func newRateLimiter(limit int, window time.Duration) *rateLimiter {
 	return &rateLimiter{limit: limit, window: window, hits: make(map[string]*rlEntry)}
 }
 
-func (l *rateLimiter) Allow(key string) bool {
+func (l *rateLimiter) Allow(key string) bool { return l.allow(key, l.limit) }
+
+// allowSource limits one client. Behind a forwarding proxy that is not trusted, the key is the proxy and the
+// client it claims (one client cannot use up the limit of everybody behind the proxy), and everything behind
+// that proxy shares auth.FactorProxy times the limit (inventing client addresses does not lift it).
+func (l *rateLimiter) allowSource(src throttleSource) bool {
+	return l.allow(src.label, l.limit) && (src.proxy == "" || l.allow("proxy|"+src.proxy, l.limit*auth.FactorProxy))
+}
+
+func (l *rateLimiter) allow(key string, limit int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -239,7 +250,7 @@ func (l *rateLimiter) Allow(key string) bool {
 		l.hits[key] = &rlEntry{start: now, count: 1}
 		return true
 	}
-	if e.count >= l.limit {
+	if e.count >= limit {
 		return false
 	}
 	e.count++

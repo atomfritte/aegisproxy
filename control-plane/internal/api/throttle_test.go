@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	"aegisproxy/control-plane/internal/auth"
 	"aegisproxy/control-plane/internal/config"
@@ -162,5 +163,37 @@ func TestThrottleSourceKeys(t *testing.T) {
 		if c.proxy != "" && (keys[1].Name != "proxy:"+c.proxy || keys[1].Factor != auth.FactorProxy) {
 			t.Errorf("%s: proxy ceiling key %+v", c.name, keys[1])
 		}
+	}
+}
+
+// Public endpoints (CA download, self-service requests) behind a proxy that is not trusted: one client cannot
+// use up the limit of everybody behind it, and invented client addresses share the proxy's ceiling.
+func TestPublicRateLimitBehindUntrustedProxy(t *testing.T) {
+	l := newRateLimiter(3, time.Minute)
+	proxied := func(client string) throttleSource {
+		return throttleSource{label: "10.20.1.15|" + client, proxy: "10.20.1.15"}
+	}
+	for i := 0; i < 3; i++ {
+		if !l.allowSource(proxied("203.0.113.5")) {
+			t.Fatalf("request %d refused", i)
+		}
+	}
+	if l.allowSource(proxied("203.0.113.5")) {
+		t.Fatal("the client behind the proxy exceeded its limit")
+	}
+	if !l.allowSource(proxied("203.0.113.6")) {
+		t.Fatal("another client behind the same proxy was refused")
+	}
+	allowed := 4 // 3 + 1 above
+	for i := 0; i < 10*auth.FactorProxy; i++ {
+		if l.allowSource(proxied(fmt.Sprintf("198.51.100.%d", i))) {
+			allowed++
+		}
+	}
+	if allowed != 3*auth.FactorProxy {
+		t.Fatalf("%d requests behind one untrusted proxy, want the ceiling %d", allowed, 3*auth.FactorProxy)
+	}
+	if !l.allowSource(throttleSource{label: "198.51.100.200"}) {
+		t.Fatal("a direct client was refused")
 	}
 }

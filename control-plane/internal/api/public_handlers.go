@@ -58,7 +58,7 @@ func (s *Server) handlePublicMeta(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) allowCA(w http.ResponseWriter, r *http.Request) bool {
-	if !s.caLimit.Allow(s.clientIP(r)) {
+	if !s.caLimit.allowSource(s.throttleSource(r)) {
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return false
 	}
@@ -373,7 +373,7 @@ func (s *Server) handlePublicPreflight(w http.ResponseWriter, r *http.Request) {
 // otherwise the TCP source address is used and the request is flagged as unverified.
 func (s *Server) handlePublicCreateRequest(w http.ResponseWriter, r *http.Request) {
 	remoteIP := s.clientIP(r)
-	if !s.publicLimit.Allow(remoteIP) {
+	if !s.publicLimit.allowSource(s.throttleSource(r)) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "Rate limit exceeded for access requests (max 20/min per IP)")
 		return
@@ -469,7 +469,7 @@ func (s *Server) handlePublicCreateRequest(w http.ResponseWriter, r *http.Reques
 // that was blocked (scopes and durations of its block page template).
 func (s *Server) handlePublicRequestOptions(w http.ResponseWriter, r *http.Request) {
 	remoteIP := s.clientIP(r)
-	if !s.publicLimit.Allow(remoteIP) {
+	if !s.publicLimit.allowSource(s.throttleSource(r)) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
