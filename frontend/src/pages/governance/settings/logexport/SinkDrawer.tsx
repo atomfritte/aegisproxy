@@ -20,7 +20,7 @@ import {
   useToast,
 } from '../../../../ui';
 import { endpointLabel, FACILITIES, FORMAT_LABELS, SECRET_REQUIRED, SEVERITIES, STREAMS, TRAFFIC_FILTERS, TYPE_HELP, TYPE_ICONS, TYPE_SHORT, typeId } from './catalog';
-import { fromSink, newForm, toPayload, usesSecret, usesTLS, validateForm, type HeaderRow, type SinkForm } from './form';
+import { destinationChanged, fromSink, newForm, toPayload, usesSecret, usesTLS, validateForm, type HeaderRow, type SinkForm } from './form';
 
 type TestResult = { ok: boolean; error?: string; at: number } | null;
 
@@ -234,7 +234,7 @@ export const SinkDrawer: React.FC<{
 
   const catalog = useMemo(() => (form ? types.find((t) => typeId(t) === form.type) : undefined), [types, form?.type]); // eslint-disable-line react-hooks/exhaustive-deps
   const fields = catalog?.fields ?? [];
-  const errors = useMemo(() => (form ? validateForm(form, catalog) : {}), [form, catalog]);
+  const errors = useMemo(() => (form ? validateForm(form, catalog, sink) : {}), [form, catalog, sink]);
   const shown = attempted ? errors : Object.fromEntries(Object.entries(errors).filter(([k]) => !['name', 'endpoint', 'secret', 'tenant_id', 'client_id', 'dcr_immutable_id'].includes(k) || form?.[k as keyof SinkForm]));
   const ro = !canEdit;
   const dirty = !!form && JSON.stringify(form) !== initialKey;
@@ -297,8 +297,14 @@ export const SinkDrawer: React.FC<{
     }
   };
 
-  // Testing a changed destination never reuses stored credentials (they stay with the saved host).
-  const credentialsError = test && !test.ok && /enter the credentials again/i.test(test.error || '') ? 'The destination changed — enter the secret again to test it.' : null;
+  // A changed destination never reuses stored credentials (they stay with the saved host), neither
+  // for a test nor when saving; validateForm flags the fields that need a new value.
+  const credentialsError =
+    form && form.secretMode === 'keep' && destinationChanged(form, sink)
+      ? errors.secret
+      : test && !test.ok && /enter the credentials again/i.test(test.error || '')
+        ? 'The destination changed — enter the secret again to test it.'
+        : null;
   const typeLabel = form ? TYPE_SHORT[form.type] ?? catalog?.label ?? form.type : '';
   const Icon = form ? TYPE_ICONS[form.type] ?? Send : Send;
   const ep = form ? endpointLabel(form.type) : { label: '', hint: '' };

@@ -90,7 +90,11 @@ Prometheus metrics: `aegis_export_records_sent_total`, `aegis_export_records_fai
 - Only **Super Admins** can create, change or delete destinations (they decide where all logs go); InfoSec can
   view and test them. Every change is audited.
 - Secrets (tokens, API keys, passwords, client secrets, TLS client keys, header values) are write-only: the API
-  never returns them, empty values on update keep the stored ones.
+  never returns them, empty values on update keep the stored ones — but only for the saved destination. A save or
+  connection test that changes the destination (endpoint, transport, username, tenant, client ID, authority,
+  Azure authentication, TLS settings or client certificate) and relies on a stored secret, header value or client
+  key is refused (*the destination changed: enter the credentials again*); enter them again or clear them. The
+  console flags the affected fields before saving.
 - TLS certificate validation is on by default; a private CA can be pasted per destination, mutual TLS is
   supported for syslog/TLS and HTTPS destinations. `tls_skip_verify` exists for lab setups only.
 - Destinations in link-local ranges (cloud metadata endpoints) are refused. Private and loopback addresses are
@@ -98,11 +102,15 @@ Prometheus metrics: `aegis_export_records_sent_total`, `aegis_export_records_fai
 - Microsoft Sentinel with **managed identity** or **workload identity** sends tokens of the platform's identity,
   which the destination's author does not hold: the endpoint must be an Azure Monitor data collection endpoint
   (`*.monitor.azure.com`, `.us`, `.cn`, also via Private Link) and `authority_url` an Entra ID authority
-  (`login.microsoftonline.com`, `.us`, `login.chinacloudapi.cn`). Loopback addresses stay allowed for local test
-  doubles. Client-secret authentication is not restricted (the author supplies the secret).
+  (`login.microsoftonline.com`, `.us`, `login.chinacloudapi.cn`). Both must be DNS names: IP literals (also with
+  an IPv6 zone such as `[::ffff:10.0.0.1%25.monitor.azure.com]`) are refused. The pin is only as strong as the
+  certificate check behind it, so these identities also refuse `tls_skip_verify` and `ca_cert_pem` (system trust
+  store only). Loopback addresses stay allowed for local test doubles (endpoint, and for workload identity also
+  the authority, on loopback). Client-secret authentication is not restricted (the author supplies the secret).
 - Endpoint URLs can carry credentials: query values are always masked in API responses and delivery errors,
-  and webhook destinations show only scheme and host (`https://hooks.example/••••••`); sending the masked value
-  back keeps the stored URL. Delivery errors never quote the full request URL. InfoSec Approvers see delivery
+  and webhook destinations show only scheme and host (`https://hooks.example/••••••`), in API responses as well as
+  in the `EXPORT_SINK_*` audit summaries; sending the masked value back keeps the stored URL. Delivery errors never
+  quote the full request URL. InfoSec Approvers see delivery
   errors without the destination's response body.
 - `file` sinks can only write plain file names inside `AEGIS_EXPORT_DIR`.
 

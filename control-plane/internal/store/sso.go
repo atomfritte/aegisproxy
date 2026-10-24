@@ -126,7 +126,7 @@ func (s *Store) UpdateEntraConfig(cfg models.EntraIDConfig, actor *auth.TokenCla
 		return errors.New("too many group mappings")
 	}
 	for g, r := range cfg.GroupRoleMap {
-		if !r.Valid() || g == "" || len(g) > 256 || hasCtl(g) {
+		if !r.Valid() || !validMappingKey(g) {
 			return fmt.Errorf("invalid group role mapping %q -> %q", g, r)
 		}
 	}
@@ -136,11 +136,22 @@ func (s *Store) UpdateEntraConfig(cfg models.EntraIDConfig, actor *auth.TokenCla
 	return s.withWrite(func() error {
 		cur := s.state.EntraConfig
 		if cfg.ClientSecret == "" || strings.Contains(string(cfg.ClientSecret), models.MaskedSecretMarker) {
-			cfg.ClientSecret = cur.ClientSecret
+			// The stored secret belongs to one client at one IdP: it never follows a changed issuer or
+			// client ID to a new token endpoint.
+			newIssuer := normalizeSSO(cfg, "").IssuerURL
+			if cur.ClientSecret != "" && (newIssuer != normalizeSSO(cur, "").IssuerURL || cfg.ClientID != cur.ClientID) {
+				// Without an issuer or client the secret has nowhere to go: dropping it is the clean-up case.
+				if cfg.TokenAuthMethod != oidc.TokenAuthPrivateKeyJWT && newIssuer != "" && cfg.ClientID != "" {
+					return errors.New("the issuer or client ID changed: re-enter the client secret for the new identity provider")
+				}
+				cfg.ClientSecret = ""
+			} else {
+				cfg.ClientSecret = cur.ClientSecret
+			}
 		}
 		cfg.HasClientSecret = false
 		for g, groups := range cfg.GroupScopeMap {
-			if g == "" || len(g) > 256 {
+			if !validMappingKey(g) {
 				return fmt.Errorf("invalid group scope mapping %q", g)
 			}
 			if err := s.validateScopeLocked(groups, nil); err != nil {
@@ -196,17 +207,118 @@ type SSOIdentity struct {
 	Groups      []string
 }
 
-// mapIdPGroups applies group_role_map and group_scope_map: the most privileged role wins, Team
-// Leads get the union of the mapped server groups.
-func mapIdPGroups(cfg models.EntraIDConfig, idpGroups []string) (models.Role, []string) {
+// Group mapping keys. A group_role_map / group_scope_map key matches an immutable group identifier
+// (a value of the ID token's groups claim, a SCIM group's externalId) unless it carries the prefix
+// "name:", which also matches a SCIM group's displayName. Group owners can rename their groups in
+// some IdPs (Entra ID), so a display name never matches an unprefixed key such as an object ID;
+// "id:" is the explicit form of the default.
+const (
+	groupKeyID   = "id:"
+	groupKeyName = "name:"
+)
+
+// mappingKey is the membership key that a group_role_map / group_scope_map key matches.
+func mappingKey(k string) string {
+	if strings.HasPrefix(k, groupKeyID) || strings.HasPrefix(k, groupKeyName) {
+		return k
+	}
+	return groupKeyID + k
+}
+
+func validMappingKey(k string) bool {
+	v := strings.TrimPrefix(strings.TrimPrefix(mappingKey(k), groupKeyID), groupKeyName)
+	return v != "" && len(k) <= 256 && !hasCtl(k)
+}
+
+// claimGroupKeys are the membership keys of an ID token's groups claim. Claim values are what the
+// IdP was configured to send (object IDs, app role values or names), so they match both forms.
+func claimGroupKeys(groups []string) []string {
+	out := make([]string, 0, 2*len(groups))
+	for _, g := range groups {
+		out = append(out, groupKeyID+g, groupKeyName+g)
+	}
+	return out
+}
+
+// scimGroupKeys are the membership keys of a SCIM group: its externalId as identifier, its
+// displayName only for "name:" mappings.
+func scimGroupKeys(g models.SCIMGroup) []string {
+	keys := []string{groupKeyName + g.DisplayName}
+	if g.ExternalID != "" {
+		keys = append(keys, groupKeyID+g.ExternalID)
+	}
+	return keys
+}
+
+// migrateGroupMappingKeysLocked runs once when a pre-2.1 state is loaded: unprefixed mapping keys
+// that matched a SCIM group only by its display name become explicit "name:" keys, so name-based
+// mappings (Okta pushes groups without an externalId) keep working. Keys shaped like object IDs are
+// never converted: they were meant as identifiers, and matching them against display names let a
+// group owner take over a mapped role by renaming the group.
+func (s *Store) migrateGroupMappingKeysLocked() {
+	if s.state.GroupMapKeysTyped {
+		return
+	}
+	s.state.GroupMapKeysTyped = true
+	names, ids := map[string]bool{}, map[string]bool{}
+	for _, g := range s.state.SCIMGroups {
+		names[g.DisplayName] = true
+		if g.ExternalID != "" {
+			ids[g.ExternalID] = true
+		}
+	}
+	byName := func(k string) bool {
+		return mappingKey(k) == groupKeyID+k && names[k] && !ids[k] && !guidRe.MatchString(k)
+	}
+	var converted []string
+	cfg := &s.state.EntraConfig
+	for k, r := range cfg.GroupRoleMap {
+		if byName(k) {
+			delete(cfg.GroupRoleMap, k)
+			cfg.GroupRoleMap[groupKeyName+k] = r
+			converted = append(converted, k)
+		}
+	}
+	for k, sgs := range cfg.GroupScopeMap {
+		if byName(k) {
+			delete(cfg.GroupScopeMap, k)
+			cfg.GroupScopeMap[groupKeyName+k] = sgs
+			if !slices.Contains(converted, k) {
+				converted = append(converted, k)
+			}
+		}
+	}
+	if len(converted) == 0 {
+		return
+	}
+	slices.Sort(converted)
+	s.log.Warn("group mappings now match SCIM display names explicitly (name:); group owners may be able to rename groups in the IdP — prefer group object IDs", "keys", converted)
+	s.appendAuditLocked(models.AuditEvent{
+		Actor: "system", ActorRole: "SYSTEM", Action: "SSO_GROUP_MAPPING_MIGRATED", Category: "IDENTITY",
+		EntityType: "sso_config", EntityID: firstNonEmpty(cfg.Provider, "entra"), EntityName: "Single sign-on group mapping",
+		Summary: fmt.Sprintf("Group mappings %s matched SCIM groups by display name and were converted to explicit name: mappings; display names can be changed in the IdP, prefer group object IDs", strings.Join(converted, ", ")),
+	})
+}
+
+// mapIdPGroups applies group_role_map and group_scope_map to membership keys (claimGroupKeys,
+// scimGroupKeys): the most privileged role wins, Team Leads get the union of the mapped server groups.
+func mapIdPGroups(cfg models.EntraIDConfig, memberKeys []string) (models.Role, []string) {
 	var role models.Role
 	allowed := map[string]bool{}
-	for _, g := range idpGroups {
-		if r, ok := cfg.GroupRoleMap[g]; ok && rolePriority[r] > rolePriority[role] {
+	have := make(map[string]bool, len(memberKeys))
+	for _, k := range memberKeys {
+		have[k] = true
+	}
+	for k, r := range cfg.GroupRoleMap {
+		if have[mappingKey(k)] && rolePriority[r] > rolePriority[role] {
 			role = r
 		}
-		for _, sg := range cfg.GroupScopeMap[g] {
-			allowed[sg] = true
+	}
+	for k, sgs := range cfg.GroupScopeMap {
+		if have[mappingKey(k)] {
+			for _, sg := range sgs {
+				allowed[sg] = true
+			}
 		}
 	}
 	groups := slices.Sorted(maps.Keys(allowed))
@@ -285,7 +397,7 @@ func (s *Store) ProvisionSSOUser(id SSOIdentity) (*models.User, error) {
 		// SCIM is authoritative for the accounts it manages: their role comes from the SCIM group
 		// memberships, not from the groups claim of the ID token.
 		scimManaged := i >= 0 && s.state.Users[i].SCIM != nil && s.state.SCIM.Enabled
-		roleGroups := id.Groups
+		roleGroups := claimGroupKeys(id.Groups)
 		if scimManaged {
 			roleGroups = s.scimMembershipsLocked()[s.state.Users[i].ID]
 		}

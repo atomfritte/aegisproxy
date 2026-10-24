@@ -161,10 +161,22 @@ const Defender: React.FC = () => {
   };
 
   const mins = Number(f.sync_minutes);
+  // The stored secret belongs to one app registration, authority and API (the server refuses to reuse it).
+  const [pf, pb] = [toPayload(f), toPayload(base)];
+  const secretMoved =
+    !!cfg?.has_client_secret &&
+    !f.client_secret &&
+    !!pf.tenant_id &&
+    !!pf.client_id &&
+    (pf.tenant_id !== pb.tenant_id || pf.client_id !== pb.client_id || pf.api_base_url !== pb.api_base_url || pf.authority_url !== pb.authority_url);
   const errors = {
     tenant_id: f.tenant_id.trim() && !TENANT_RE.test(f.tenant_id.trim()) ? 'Use the directory (tenant) ID.' : f.enabled && !f.tenant_id.trim() ? 'Required when the integration is enabled.' : null,
     client_id: f.enabled && !f.client_id.trim() ? 'Required when the integration is enabled.' : null,
-    client_secret: f.enabled && !cfg?.has_client_secret && !f.client_secret ? 'Required when the integration is enabled.' : null,
+    client_secret: secretMoved
+      ? 'The tenant, application or endpoints changed — enter the client secret again.'
+      : f.enabled && !cfg?.has_client_secret && !f.client_secret
+        ? 'Required when the integration is enabled.'
+        : null,
     sync_minutes: !Number.isInteger(mins) || mins < 1 || mins > 1440 ? 'Between 1 and 1440 minutes.' : null,
     urls:
       f.cloud === 'custom' && (!/^https:\/\//i.test(f.api_base_url.trim()) || !/^https:\/\//i.test(f.authority_url.trim())) ? 'Both endpoints must be https:// URLs.' : null,
@@ -175,7 +187,7 @@ const Defender: React.FC = () => {
   const testMsg = test && !test.ok ? test.error || '' : '';
   const secretServerError = /enter the client secret/i.test(testMsg) ? 'The tenant, application or endpoints changed — enter the client secret again to test them.' : null;
   const urlServerError = serverError && /Microsoft cloud endpoints|must be an https URL/i.test(serverError) ? serverError : null;
-  const err = (k: keyof typeof errors) => (attempted || k === 'tenant_id' || k === 'sync_minutes' || k === 'urls' ? errors[k] : null);
+  const err = (k: keyof typeof errors) => (attempted || k === 'tenant_id' || k === 'sync_minutes' || k === 'urls' || (k === 'client_secret' && secretMoved) ? errors[k] : null);
 
   const save = async () => {
     setAttempted(true);
@@ -319,6 +331,7 @@ const Defender: React.FC = () => {
                     value={f.client_secret}
                     onChange={(v) => set({ client_secret: v })}
                     required={f.enabled && !cfg.has_client_secret}
+                    hint={cfg.has_client_secret ? 'Stored encrypted and never shown. A new tenant, application or endpoint needs the secret again.' : undefined}
                     error={err('client_secret') || secretServerError}
                     disabled={!canEdit}
                     resetKey={savedAt}

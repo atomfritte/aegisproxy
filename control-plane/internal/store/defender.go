@@ -94,11 +94,23 @@ func (s *Store) UpdateDefenderConfig(cfg models.DefenderConfig, actor *auth.Toke
 	var out models.DefenderConfig
 	err := s.withWrite(func() error {
 		cur := s.state.Defender
-		if cfg.ClientSecret == "" || strings.Contains(string(cfg.ClientSecret), models.MaskedSecretMarker) {
+		keep := cfg.ClientSecret == "" || strings.Contains(string(cfg.ClientSecret), models.MaskedSecretMarker)
+		if keep {
 			cfg.ClientSecret = cur.ClientSecret
 		}
 		if err := validateDefender(&cfg); err != nil {
 			return err
+		}
+		// The stored secret belongs to one app registration at one authority, and its tokens to one API:
+		// it never follows a changed tenant, client, authority or API endpoint (same rule as TestDefender).
+		saved := cur
+		_ = validateDefender(&saved) // fills endpoint defaults of older configurations
+		if keep && cur.ClientSecret != "" && (cfg.TenantID != saved.TenantID || cfg.ClientID != saved.ClientID ||
+			cfg.AuthorityURL != saved.AuthorityURL || cfg.APIBaseURL != saved.APIBaseURL) {
+			if cfg.TenantID != "" && cfg.ClientID != "" {
+				return errors.New("the tenant, client ID or endpoints changed: re-enter the client secret for the new destination")
+			}
+			cfg.ClientSecret = "" // cleared registration: the secret has nowhere to go
 		}
 		cfg.LastSyncAt, cfg.LastSyncError, cfg.LastSyncDevices, cfg.MatchedServers = cur.LastSyncAt, cur.LastSyncError, cur.LastSyncDevices, cur.MatchedServers
 		now := time.Now().UTC()

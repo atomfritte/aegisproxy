@@ -216,6 +216,12 @@ func Validate(s *models.ExportSink) error {
 			if s.AuthorityURL != "" && !netguard.HostInDomains(s.AuthorityURL, netguard.EntraAuthorityDomains...) {
 				return errors.New("with managed or workload identity authority_url must be an Entra ID authority (login.microsoftonline.com, .us or login.chinacloudapi.cn)")
 			}
+			// The host check is only as good as the certificate check behind it (local test doubles
+			// on loopback excepted).
+			local := netguard.LoopbackURL(s.Endpoint) && (s.AzureAuth == "managed_identity" || netguard.LoopbackURL(s.AuthorityURL))
+			if !local && (s.TLSSkipVerify || strings.TrimSpace(s.CACertPEM) != "") {
+				return errors.New("with managed or workload identity TLS verification must stay on and use the system trust store (no tls_skip_verify, no ca_cert_pem)")
+			}
 		}
 	default:
 		if err := httpURL("endpoint", s.Endpoint, false); err != nil {

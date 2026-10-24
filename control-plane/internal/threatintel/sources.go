@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 // Structured threat-intelligence sources. Collectors normalize indicators into the internal
@@ -155,26 +156,29 @@ func sourceClient(caPEM, proxy string, allowLoopback bool) (*http.Client, error)
 		}
 		tc.RootCAs = pool
 	}
+	blocked := func(a netip.Addr) bool {
+		a = a.Unmap()
+		return (a.IsLoopback() && !allowLoopback) || a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast()
+	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: func(network, address string, _ syscall.RawConn) error {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
 			return err
 		}
-		if a, err := netip.ParseAddr(host); err == nil {
-			a = a.Unmap()
-			if (a.IsLoopback() && !allowLoopback) || a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast() {
-				return fmt.Errorf("threat-intel source resolved to disallowed address %s", a)
-			}
+		if a, err := netip.ParseAddr(host); err == nil && blocked(a) {
+			return fmt.Errorf("threat-intel source resolved to disallowed address %s", a.Unmap())
 		}
 		return nil
 	}}
-	tr := &http.Transport{DialContext: dialer.DialContext, TLSClientConfig: tc, TLSHandshakeTimeout: 15 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second, Proxy: http.ProxyFromEnvironment}
+	// Through a proxy the source host is checked before it is handed over (the proxy resolves it).
+	guard := &netguard.ProxyGuard{Proxy: http.ProxyFromEnvironment, Blocked: blocked, What: "threat-intel source", Dialer: dialer}
 	if proxy != "" {
 		if pu, err := url.Parse(proxy); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
+			guard.Proxy = http.ProxyURL(pu)
 		}
 	}
+	tr := &http.Transport{DialContext: guard.DialContext, TLSClientConfig: tc, TLSHandshakeTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second, Proxy: guard.ProxyFunc}
 	return &http.Client{Transport: tr, Timeout: 5 * time.Minute,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }

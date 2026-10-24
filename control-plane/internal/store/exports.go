@@ -38,22 +38,34 @@ func (s *Store) MergeExportSecretsForTest(in models.ExportSink) (models.ExportSi
 	defer s.mu.RUnlock()
 	prev := s.exportSinkLocked(in.ID)
 	unmaskEndpoint(&in, prev)
+	if err := storedCredentialsStay(in, prev); err != nil {
+		return models.ExportSink{}, err
+	}
 	if prev != nil && !sameSinkDestination(in, *prev) {
-		needs := in.Secret == "" && prev.Secret != ""
-		for k, v := range in.Headers {
-			if _, ok := prev.Headers[k]; ok && v == "" {
-				needs = true
-			}
-		}
-		if in.ClientCertPEM != "" && in.ClientKeyPEM == "" && prev.ClientKeyPEM != "" {
-			needs = true
-		}
-		if needs {
-			return models.ExportSink{}, errors.New("the destination changed: enter the credentials again (stored credentials are only used for the saved destination)")
-		}
 		prev = nil
 	}
 	return mergeSinkSecrets(in, prev), nil
+}
+
+// storedCredentialsStay refuses a configuration that changes the destination of a stored sink while
+// relying on its stored secret, header values or client key: they belong to the saved destination.
+func storedCredentialsStay(in models.ExportSink, prev *models.ExportSink) error {
+	if prev == nil || sameSinkDestination(in, *prev) {
+		return nil
+	}
+	needs := in.Secret == "" && !in.ClearSecret && prev.Secret != ""
+	for k, v := range in.Headers {
+		if _, ok := prev.Headers[k]; ok && v == "" {
+			needs = true
+		}
+	}
+	if in.ClientCertPEM != "" && in.ClientKeyPEM == "" && prev.ClientKeyPEM != "" {
+		needs = true
+	}
+	if needs {
+		return errors.New("the destination changed: enter the credentials again (stored credentials are only used for the saved destination)")
+	}
+	return nil
 }
 
 // ExportSinkWithSecrets returns a stored sink including its secrets.
@@ -71,9 +83,25 @@ func (s *Store) ExportSinkWithSecrets(id string) (models.ExportSink, bool) {
 
 // sameSinkDestination reports whether credentials of b may be used with configuration a.
 func sameSinkDestination(a, b models.ExportSink) bool {
+	a, b = destinationDefaults(a), destinationDefaults(b)
 	return a.Type == b.Type && a.Endpoint == b.Endpoint && a.Transport == b.Transport && a.Username == b.Username &&
 		a.TenantID == b.TenantID && a.ClientID == b.ClientID && a.AuthorityURL == b.AuthorityURL && a.AzureAuth == b.AzureAuth &&
 		a.TLSSkipVerify == b.TLSSkipVerify && a.CACertPEM == b.CACertPEM && a.ClientCertPEM == b.ClientCertPEM
+}
+
+// destinationDefaults fills the destination defaults export.Validate applies, so an update that omits
+// them compares equal to the stored (validated) sink.
+func destinationDefaults(s models.ExportSink) models.ExportSink {
+	s.Endpoint = strings.TrimSpace(s.Endpoint)
+	switch {
+	case s.Type == "syslog" && s.Transport == "":
+		s.Transport = "tcp"
+	case s.Type == "datadog" && s.Endpoint == "":
+		s.Endpoint = "https://http-intake.logs.datadoghq.com"
+	case s.Type == "sentinel" && s.AzureAuth == "":
+		s.AzureAuth = "client_secret"
+	}
+	return s
 }
 
 func (s *Store) exportSinkLocked(id string) *models.ExportSink {
@@ -99,6 +127,7 @@ func unmaskEndpoint(in *models.ExportSink, prev *models.ExportSink) {
 
 func mergeSinkSecrets(in models.ExportSink, prev *models.ExportSink) models.ExportSink {
 	unmaskEndpoint(&in, prev)
+	in.Headers = maps.Clone(in.Headers) // never write stored values into the caller's map
 	if prev != nil {
 		if in.Secret == "" && !in.ClearSecret {
 			in.Secret = prev.Secret
@@ -115,7 +144,6 @@ func mergeSinkSecrets(in models.ExportSink, prev *models.ExportSink) models.Expo
 		}
 	}
 	if in.Headers != nil {
-		in.Headers = maps.Clone(in.Headers)
 		for k, v := range in.Headers {
 			if v == "" {
 				delete(in.Headers, k)
@@ -136,6 +164,10 @@ func (s *Store) UpsertExportSink(in models.ExportSink, actor *auth.TokenClaims) 
 		prev := s.exportSinkLocked(in.ID)
 		if in.ID != "" && prev == nil {
 			return errors.New("export sink not found")
+		}
+		unmaskEndpoint(&in, prev)
+		if err := storedCredentialsStay(in, prev); err != nil {
+			return err
 		}
 		sink := mergeSinkSecrets(in, prev)
 		if err := export.Validate(&sink); err != nil {
@@ -166,7 +198,7 @@ func (s *Store) UpsertExportSink(in models.ExportSink, actor *auth.TokenClaims) 
 			Actor: actor.Username, ActorRole: string(actor.Role), Action: action, Category: "SYSTEM",
 			EntityType: "export_sink", EntityID: sink.ID, EntityName: sink.Name,
 			Summary: fmt.Sprintf("%s log export %q (%s → %s, streams %v, format %s, enabled=%v)", strings.ToLower(strings.TrimPrefix(action, "EXPORT_SINK_")),
-				sink.Name, sink.Type, redactEndpoint(sink.Endpoint), sink.Streams, sink.Format, sink.Enabled),
+				sink.Name, sink.Type, models.MaskSinkEndpoint(sink.Type, sink.Endpoint), sink.Streams, sink.Format, sink.Enabled),
 		})
 		s.markDirtyLocked()
 		s.syncExportLocked()
@@ -174,13 +206,6 @@ func (s *Store) UpsertExportSink(in models.ExportSink, actor *auth.TokenClaims) 
 		return nil
 	})
 	return out, err
-}
-
-func redactEndpoint(e string) string {
-	if i := strings.Index(e, "?"); i >= 0 {
-		return e[:i]
-	}
-	return e
 }
 
 func (s *Store) DeleteExportSink(id string, actor *auth.TokenClaims) error {
@@ -197,7 +222,7 @@ func (s *Store) DeleteExportSink(id string, actor *auth.TokenClaims) error {
 		s.appendAuditLocked(models.AuditEvent{
 			Actor: actor.Username, ActorRole: string(actor.Role), Action: "EXPORT_SINK_DELETED", Category: "SYSTEM",
 			EntityType: "export_sink", EntityID: sink.ID, EntityName: sink.Name,
-			Summary: fmt.Sprintf("Deleted log export %q (%s → %s)", sink.Name, sink.Type, redactEndpoint(sink.Endpoint)),
+			Summary: fmt.Sprintf("Deleted log export %q (%s → %s)", sink.Name, sink.Type, models.MaskSinkEndpoint(sink.Type, sink.Endpoint)),
 		})
 		s.markDirtyLocked()
 		s.syncExportLocked()
