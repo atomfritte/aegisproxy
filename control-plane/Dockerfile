@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # AegisProxy control-plane API only (no bundled console) — for deployments where the console is
 # hosted separately (frontend/Dockerfile, CDN, IIS, ...).
-#   docker build -t aegisproxy/control-plane-api:2.1.0 control-plane/
+#   docker build -t ghcr.io/atomfritte/aegisproxy-control-plane-api:v2.1.0 control-plane/   (or: make images)
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
 
 FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build

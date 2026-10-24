@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # AegisProxy control-plane + bundled web console ("all-in-one" image).
-#   docker build -t aegisproxy/control-plane:2.1.0 --build-arg VERSION=2.1.0 .
+#   docker build -t ghcr.io/atomfritte/aegisproxy-control-plane:v2.1.0 --build-arg VERSION=2.1.0 .   (or: make images)
 # For split deployments use control-plane/Dockerfile (API only) and frontend/Dockerfile (console only).
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
 

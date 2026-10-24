@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # AegisProxy web console as a standalone static site (nginx, non-root, read-only root fs capable).
-#   docker build -t aegisproxy/console:2.1.0 frontend/
+#   docker build -t ghcr.io/atomfritte/aegisproxy-console:v2.1.0 frontend/   (or: make images)
 # Runtime configuration (environment):
 #   AEGIS_API_BASE_URL   API origin when it differs from the console origin, e.g. https://aegis-api.corp.example
 #   AEGIS_API_UPSTREAM   alternatively: reverse-proxy /api/ to this upstream (same-origin), e.g. http://control-plane:8081
