@@ -52,9 +52,13 @@ const DecisionCallout: React.FC<{ flow: TrafficFlow }> = ({ flow }) => {
       DLP_BLOCKED: findings ? `Data loss prevention found ${findings} in the request body.` : 'Data loss prevention found sensitive data in the request body.',
       FILETYPE_BLOCKED: `Downloads of this file type${flow.file_type ? ` (${flow.file_type})` : ''} are blocked for this server's groups.`,
       QUARANTINED: 'The server is quarantined, so every destination is denied.',
+      AUTH_FAILED:
+        flow.block_reason === 'proxy_token_required'
+          ? "The client sent only a proxy user name, but the server's group requires its proxy token (HTTP 407)."
+          : 'The client sent proxy credentials that match no registered server (unknown, rotated or mistyped token). The proxy answered HTTP 407 and did not fall back to the source address.',
     };
     return (
-      <Callout tone="danger" icon={ShieldAlert} title="Stopped by threat protection">
+      <Callout tone="danger" icon={ShieldAlert} title={flow.verdict === 'AUTH_FAILED' ? 'Proxy authentication failed' : 'Stopped by threat protection'}>
         {what[flow.verdict] ?? (reasonLabel(flow) || 'A threat-protection guardrail blocked this request.')}
         {(flow.threat_category || flow.threat_source) && (
           <span className="mt-1 block">

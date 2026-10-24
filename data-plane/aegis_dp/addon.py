@@ -50,9 +50,9 @@ from .controlplane import ControlPlaneClient, sign_block_token
 from .icap import IcapClient, IcapResult
 from .yara_scan import YaraEngine
 from .policy import (
-    VERDICT_DLP, VERDICT_FILETYPE, VERDICT_LEARNING, VERDICT_MALWARE, VERDICT_POLICY, VERDICT_THREAT,
-    VERDICT_TLS_BYPASS, EvalResult, Policy, RedirectGrants, is_forbidden_addr, is_internal_addr, is_internal_host,
-    normalize_host, parse_ip, printable,
+    MALFORMED_PROXY_AUTH, VERDICT_AUTH_FAILED, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_LEARNING, VERDICT_MALWARE,
+    VERDICT_POLICY, VERDICT_THREAT, VERDICT_TLS_BYPASS, EvalResult, Policy, RedirectGrants, is_forbidden_addr,
+    is_internal_addr, is_internal_host, normalize_host, parse_ip, printable,
 )
 
 log = logging.getLogger("aegis.dataplane")
@@ -69,19 +69,22 @@ _BLOCKED_RESPONSE_HEADERS = ("Content-Encoding", "Transfer-Encoding", "Content-D
 
 
 def parse_proxy_auth(value: Optional[str]) -> str:
-    """Returns "user:token" (Basic) or the bearer token. Never logged or stored by the control-plane."""
-    if not value:
+    """Returns "user:token" (Basic) or the bearer token. Never logged or stored by the control-plane. A header that
+    is present but unusable (unknown scheme, bad Base64, empty credentials) yields MALFORMED_PROXY_AUTH, which fails
+    authentication (407) instead of falling back to the source address."""
+    if value is None:
         return ""
     scheme, _, cred = value.strip().partition(" ")
     if scheme.lower() == "basic" and cred:
         try:
             decoded = base64.b64decode(cred.strip(), validate=True).decode("utf-8", "ignore").strip()
         except (ValueError, UnicodeDecodeError):
-            return ""
-        return decoded[:-1] if decoded.endswith(":") else decoded
-    if scheme.lower() == "bearer" and cred:
+            return MALFORMED_PROXY_AUTH
+        decoded = decoded[:-1] if decoded.endswith(":") else decoded
+        return decoded or MALFORMED_PROXY_AUTH
+    if scheme.lower() == "bearer" and cred.strip():
         return cred.strip()
-    return ""
+    return MALFORMED_PROXY_AUTH
 
 
 def valid_host(host: str) -> bool:
@@ -469,6 +472,8 @@ class AegisAddon:
         headers = {"X-Aegis-Verdict": res.verdict, "X-Aegis-Trace-ID": trace, "Cache-Control": "no-store"}
         if status == 503:
             headers["Retry-After"] = "5"  # transient: inspection capacity or an inspection service unavailable
+        if status == 407:
+            headers["Proxy-Authenticate"] = 'Basic realm="AegisProxy"'
         cli = is_cli_client(flow.request.headers.get("User-Agent", ""), flow.request.headers.get("Accept", ""))
         branded = None
         if policy is not None:
@@ -508,7 +513,9 @@ class AegisAddon:
         flow.metadata["aegis_connect"] = res.verdict
         # Hard blocks are enforced before any TLS handshake; ordinary default-deny is decided per
         # request inside the tunnel so the user gets an explanatory block page.
-        if res.verdict in (VERDICT_THREAT, VERDICT_POLICY):
+        if res.verdict == VERDICT_AUTH_FAILED:
+            self._block(flow, res, peer, auth, status=407)
+        elif res.verdict in (VERDICT_THREAT, VERDICT_POLICY):
             self._block(flow, res, peer, auth)
 
     # ------------------------------------------------------------------ TLS
@@ -661,7 +668,7 @@ class AegisAddon:
             self._block(flow, res, peer, auth, status=413)
             return
         if not res.allowed:
-            self._block(flow, res, peer, auth)
+            self._block(flow, res, peer, auth, status=407 if res.verdict == VERDICT_AUTH_FAILED else 403)
             return
         inspect_on = self._inspection_enabled(policy, res.group_ids)
         if inspect_on:
@@ -1131,7 +1138,7 @@ class AegisAddon:
                 except ValueError:  # malformed Location: recorded as sent, no grant
                     extra["redirect_location"] = printable(loc, 4096)
                 if res.follow_redirects or res.verdict == VERDICT_LEARNING:
-                    self.grants.register(peer, loc, flow.request.pretty_url, res.matched_rule_id, res.matched_rule_name,
+                    self.grants.register(res.server_id, loc, flow.request.pretty_url, res.matched_rule_id, res.matched_rule_name,
                                          policy.internal_suffixes, res.redirect_hosts)
         self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, res.verdict, **extra))
 

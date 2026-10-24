@@ -44,12 +44,41 @@ A new set has version 0 until it is published for the first time.
 |---|---|
 | Action | `ALLOW` or `BLOCK`. BLOCK rules are guardrails and always take precedence. Team Leads cannot create, change (action, patterns, methods, enabled, expiry, scope of the set) or remove BLOCK rules — neither published ones nor guardrails InfoSec added to a draft — and cannot submit or approve change requests that do. They can still edit ALLOW rules in a set that contains InfoSec guardrails. |
 | Host pattern | `github.com`, `*.ubuntu.com`, an IP address. Catch-all `*` ALLOW rules require a Super Admin; Team Leads cannot use top-level wildcards (`*.com`). |
-| Path pattern | `/microsoft/**` (prefix with sub-paths), `/simple/*` (one level), exact paths. |
+| Path pattern | `/microsoft/**` (`/microsoft` and everything below), `/simple/*` (exactly one segment below `/simple`), `/repos/*/releases/**`, exact paths — see [Path patterns](#path-patterns). |
 | Methods | Default `GET, HEAD` (least privilege). |
-| Follow redirects | Authorizes the exact object a matching response redirects to (e.g. GitHub release assets on a CDN) for two minutes. |
+| Follow redirects | Authorizes the exact object a matching response redirects to (e.g. GitHub release assets on a CDN) for two minutes — for the server that made the request only (the grant belongs to its server identity, not to its source address), and never for members of strict-isolation groups. |
 | Redirect targets | Optional with *Follow redirects* (`redirect_hosts`): host patterns (`objects.githubusercontent.com`, `*.cdn.example`) the redirect may lead to. Empty = any public host; internal destinations never receive a grant. Set it for rules on sites whose redirects the destination operator (or its users) can steer. |
 | Companion rules | Additional `host/path` patterns that belong to the same purpose (`codeload.github.com/acme/**`). |
 | Expiry | Optional; expired rules are ignored by the engine. |
+
+### Path patterns
+
+The path of a request is canonicalized before matching: the query string and fragment are ignored,
+percent-encoding is decoded, dot-segments (`/a/../b`) and repeated slashes are resolved and a trailing slash is
+dropped; malformed paths (NUL bytes, backslashes, broken escapes) never match. The pattern is canonicalized the
+same way. Then:
+
+| Pattern element | Matches | Example |
+|---|---|---|
+| `/**` as a whole segment | zero or more segments | `/acme/**` matches `/acme`, `/acme/x`, `/acme/x/y`, not `/acmex`; `/a/**/b` matches `/a/b` and `/a/x/y/b` |
+| `*` as a whole segment | exactly one non-empty segment | `/simple/*` matches `/simple/requests` and `/simple/requests/`, not `/simple`, `/simple/` or `/simple/a/b` |
+| `*` inside a segment | any characters except `/` | `/v*.json` matches `/v1.json`, not `/v1/x.json` |
+| `**` inside a segment | any characters including `/` | `/release-asset-**` matches `/release-asset-2e65/9981/x.tar.gz` |
+| no wildcard | the exact path | `/simple` matches `/simple`, `/simple/` and `/simple?x=1` |
+
+`/**`, `*` and an empty pattern cover the whole host. Only such domain-wide BLOCK rules can block an HTTPS tunnel
+at `CONNECT`; path-specific BLOCK rules are enforced on the decrypted requests. Control-plane and data-plane run
+the same matcher (shared test vectors in `testdata/path_vectors.json`); matching takes linear time, so hostile
+request paths cannot slow it down.
+
+**Changed in 2.1.** Earlier releases treated a trailing `/*` like `/**` (the prefix and every deeper path) and a
+trailing `x*` as a plain prefix. The first start of 2.1 rewrites such patterns to `/**` and `x**`, which keeps
+every rule's meaning, in published sets, drafts, the version history (so a rollback restores the same meaning),
+change requests, pending access requests and learning-session candidates. The audit event
+`POLICY_PATH_PATTERNS_MIGRATED` lists every rewritten pattern (before → after). Patterns with a `*` elsewhere in
+the path (`/repos/*/releases`) were compared literally before and are wildcards now; they are listed with
+`review: true` in the same event — check them. The rule editor flags a pattern ending in `/*` with its one-segment
+meaning.
 
 ### Publishing and four-eyes review
 
@@ -125,6 +154,10 @@ Sets are matched by ID, then by name; the plan shows a rule-level diff per set (
 a name that is already taken is reported as an error without details). Imports are all-or-nothing and subject to the same validation and RBAC as edits in the console;
 with four-eyes review enabled a second person still approves every imported change.
 
+Bundles exported by 2.1 carry `"path_syntax": 2`. A bundle without it (exported by an earlier release) is treated
+as written for the old path syntax: patterns ending in `/*` or `x*` are rewritten to `/**` and `x**` on import, so
+they keep their meaning, and the plan diff shows the result. Add `"path_syntax": 2` to bundles you write by hand.
+
 ### Recertification
 
 Each set shows `review state`: **ok**, **due soon** (14 days) or **overdue**. Owners open the set and choose
@@ -189,6 +222,26 @@ copy-paste snippets for Linux (CA trust, `/etc/aegis-proxy.env`, apt/dnf proxy, 
 trust, machine-wide proxy variables, WinHTTP). Set `AEGIS_PROXY_ADDRESS` to the address servers use as their
 proxy so the snippets are correct. WinHTTP cannot send credentials — register the server IP for Windows
 services that rely on WinHTTP.
+
+### Proxy tokens and shared addresses
+
+A server is identified by its proxy token when the client sends one, otherwise by its registered IP address
+(details in [architecture.md](architecture.md#server-identity)). Proxy credentials that identify no server — an
+unknown, rotated or mistyped token, a token sent with another server's user name, a user name from an address that
+is not the server's — are refused with **HTTP 407** (`Proxy-Authenticate: Basic`, verdict `AUTH_FAILED`, block
+reason `invalid_proxy_token`) and a block page/CLI text explaining how to fix the proxy URL. The request is never
+attributed to the source address instead; the attempt is recorded as a medium security event.
+
+Learning sessions and redirect grants belong to the server ID. Servers behind one NAT address therefore cannot use
+each other's grants once they authenticate with their own tokens; a client behind that address **without** a
+token is still identified as the server registered for the address. Groups with **Require proxy token**
+(`require_proxy_token`) close that gap: their members are identified only by a valid token. A request from a
+member's address without a token is treated as unregistered (default deny), a proxy user name alone is refused
+with 407 (`proxy_token_required`), and the group cannot have CIDR ranges. Issue tokens (**Onboard** /
+**Rotate token**) before enabling it; the group form lists members that have none.
+
+Strict isolation also binds temporary grants: learning sessions and redirect grants never open anything for a
+member of a strict-isolation group, even a session started before the server joined the group.
 
 ### Discovery
 
@@ -265,3 +318,6 @@ On the first start, 2.1 converts the flat rule list into policy sets (schema ver
 
 Review the generated sets afterwards: rename them, merge sets with related purposes, set owners and tags.
 See [operations.md](operations.md#upgrading-from-20) for the upgrade procedure.
+
+Schema version 4 (2.1) then rewrites path patterns to the new wildcard syntax (`/x/*` → `/x/**`, `x*` → `x**`)
+and records `POLICY_PATH_PATTERNS_MIGRATED`; see [Path patterns](#path-patterns).

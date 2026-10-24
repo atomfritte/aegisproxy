@@ -141,7 +141,8 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 
 	for i, flow := range flows {
 		flow = sanitizeFlow(flow, now, i)
-		if flow.ServerID == "" || len(flow.GroupIDs) == 0 {
+		// A failed proxy authentication stays attributed to the unregistered source (the username is not proof).
+		if (flow.ServerID == "" || len(flow.GroupIDs) == 0) && flow.Verdict != models.VerdictAuthFailed {
 			srvID, srvHost, groups := s.ResolveServer(flow.ServerIP, flow.ProxyAuthUser)
 			flow.ServerID = srvID
 			flow.ServerHostname = srvHost
@@ -151,12 +152,13 @@ func (s *Store) RecordFlowBatch(flows []models.TrafficFlow) []models.TrafficFlow
 			flow.BytesSent, flow.BytesReceived = EstimateFlowBytes(flow)
 		}
 		// Only mint a 302 redirect grant from LEARNING_ALLOWED or from ALLOWED flows whose rule has
-		// FollowRedirects. Never chain from REDIRECT_OBJECT_ALLOWED (single-hop cap).
+		// FollowRedirects. Never chain from REDIRECT_OBJECT_ALLOWED (single-hop cap). Grants belong to the
+		// server identity, not to its (possibly shared NAT) address.
 		if flow.RedirectLocation != "" {
 			if flow.Verdict == models.VerdictLearningAllowed {
-				s.engine.RegisterRedirectGrant(flow.ServerIP, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName, nil)
+				s.engine.RegisterRedirectGrant(flow.ServerID, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName, nil)
 			} else if flow.Verdict == models.VerdictAllowed && ruleFollowMap[flow.MatchedRuleID] {
-				s.engine.RegisterRedirectGrant(flow.ServerIP, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName,
+				s.engine.RegisterRedirectGrant(flow.ServerID, flow.RedirectLocation, flow.FullURL, flow.MatchedRuleID, flow.MatchedRuleName,
 					redirectHosts[flow.MatchedRuleID])
 			}
 		}
@@ -289,6 +291,8 @@ func securityEventsForFlow(f models.TrafficFlow) []models.SecurityEvent {
 		add(models.SecurityEventFileType, "medium", "blocked", "Blocked download of file type "+f.FileType, f.ContentSHA256, "Download control")
 	case models.VerdictQuarantined:
 		add(models.SecurityEventQuarantine, "high", "blocked", "Egress attempt from a quarantined server", f.Host, "Quarantine")
+	case models.VerdictAuthFailed:
+		add(models.SecurityEventPolicy, "medium", "blocked", firstNonEmpty(f.MatchedRuleName, "Invalid proxy credentials ("+f.BlockReason+")"), "", "Proxy authentication")
 	case models.VerdictPolicyBlocked:
 		switch f.BlockReason {
 		case "malformed_path", "malformed_host", "host_mismatch", "sni_mismatch", "raw_tcp", "dns_rebinding", "forbidden_destination":

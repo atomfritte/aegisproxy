@@ -37,6 +37,7 @@ const (
 	VerdictFileTypeBlocked  = "FILETYPE_BLOCKED"
 	VerdictPolicyBlocked    = "POLICY_BLOCKED"
 	VerdictQuarantined      = "QUARANTINED"
+	VerdictAuthFailed       = "AUTH_FAILED" // invalid proxy credentials (HTTP 407), never an IP fallback
 	VerdictSimulatedDryRun  = "SIMULATED"
 	SecurityEventThreat     = "THREAT_INTEL"
 	SecurityEventMalware    = "MALWARE"
@@ -60,11 +61,12 @@ func IsAllowedVerdict(v string) bool {
 	return false
 }
 
-// IsSecurityVerdict reports whether a verdict was produced by a threat-protection engine
-// (as opposed to the default-deny whitelist).
+// IsSecurityVerdict reports whether a verdict was produced by a threat-protection engine or the proxy
+// authentication (as opposed to the default-deny whitelist).
 func IsSecurityVerdict(v string) bool {
 	switch v {
-	case VerdictThreatBlocked, VerdictMalwareBlocked, VerdictDLPBlocked, VerdictFileTypeBlocked, VerdictPolicyBlocked, VerdictQuarantined:
+	case VerdictThreatBlocked, VerdictMalwareBlocked, VerdictDLPBlocked, VerdictFileTypeBlocked, VerdictPolicyBlocked, VerdictQuarantined,
+		VerdictAuthFailed:
 		return true
 	}
 	return false
@@ -160,6 +162,9 @@ type ServerGroup struct {
 	// StrictIsolation marks zero-internet tiers: global (unscoped) TLS bypass rules never apply,
 	// and learning sessions cannot be started for its members.
 	StrictIsolation bool `json:"strict_isolation"`
+	// RequireProxyToken: members are identified only by a valid proxy token. A request from a member's IP address
+	// without one (or with only the proxy username) is treated as coming from an unregistered source.
+	RequireProxyToken bool `json:"require_proxy_token,omitempty"`
 	// MatchLabels adds every registered server whose labels contain all of these pairs (dynamic group).
 	MatchLabels map[string]string `json:"match_labels,omitempty"`
 	// BlockPageTemplateID selects the block page shown to servers of this group ("" = default).
@@ -1096,7 +1101,10 @@ type PolicySetDocument struct {
 
 // PolicySetBundle is the export/import file format.
 type PolicySetBundle struct {
-	Format     string              `json:"format"` // aegisproxy.policy-sets/v1
+	Format string `json:"format"` // aegisproxy.policy-sets/v1
+	// PathSyntax 2 (2.1+): '*' in a path pattern is exactly one segment. Bundles without it come from earlier
+	// releases: on import their trailing "/*" and "x*" patterns are rewritten to "/**" and "x**" (same meaning).
+	PathSyntax int                 `json:"path_syntax,omitempty"`
 	ExportedAt time.Time           `json:"exported_at"`
 	ExportedBy string              `json:"exported_by"`
 	PolicySets []PolicySetDocument `json:"policy_sets"`

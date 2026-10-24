@@ -1,0 +1,61 @@
+{
+ "_comment": "Shared vectors for server identification and temporary grants: store.Identify/Evaluate (control-plane, Go) and Policy.identify/evaluate (data-plane, Python). Servers a, e, b, f and q sit behind one NAT address (203.0.113.10, registered for a only); tokens are given in plain text and hashed by the tests. Sessions are active, grants are registered (server_id, location, parent_url, rule) before the cases run. Change this file only together with both implementations.",
+ "groups": [
+  {"id": "grp-web"},
+  {"id": "grp-other"},
+  {"id": "grp-vault", "strict_isolation": true},
+  {"id": "grp-pci", "require_proxy_token": true},
+  {"id": "grp-lab", "cidrs": ["10.80.0.0/16"]}
+ ],
+ "servers": [
+  {"id": "srv-a", "hostname": "a", "ip": "203.0.113.10", "proxy_auth_user": "svc-a", "token": "token-a", "group_ids": ["grp-web"]},
+  {"id": "srv-e", "hostname": "e", "ip": "192.168.10.5", "proxy_auth_user": "svc-e", "token": "token-e", "group_ids": ["grp-web"]},
+  {"id": "srv-b", "hostname": "b", "ip": "192.168.10.6", "proxy_auth_user": "svc-b", "token": "token-b", "group_ids": ["grp-vault"]},
+  {"id": "srv-f", "hostname": "f", "ip": "192.168.10.7", "proxy_auth_user": "svc-f", "token": "token-f", "group_ids": ["grp-other"]},
+  {"id": "srv-q", "hostname": "q", "ip": "192.168.10.8", "proxy_auth_user": "svc-q", "token": "token-q", "group_ids": ["grp-web"], "quarantined": true},
+  {"id": "srv-c", "hostname": "c", "ip": "10.70.0.30", "proxy_auth_user": "svc-c", "token": "token-c", "group_ids": ["grp-pci"]},
+  {"id": "srv-l", "hostname": "l", "ip": "10.80.0.40", "proxy_auth_user": "svc-l", "token": "token-l", "group_ids": ["grp-lab", "grp-pci"]}
+ ],
+ "rules": [
+  {"id": "r-gh", "name": "gh", "action": "ALLOW", "host_pattern": "github.com", "path_pattern": "/**", "follow_redirects": true, "group_ids": ["grp-web"]},
+  {"id": "r-pci", "name": "pci", "action": "ALLOW", "host_pattern": "pci.example", "path_pattern": "/**", "group_ids": ["grp-pci"]},
+  {"id": "r-lab", "name": "lab", "action": "ALLOW", "host_pattern": "lab.example", "path_pattern": "/**", "group_ids": ["grp-lab"]},
+  {"id": "r-no-objects", "name": "no objects for other", "action": "BLOCK", "host_pattern": "objects-f.example", "path_pattern": "/**", "group_ids": ["grp-other"]}
+ ],
+ "sessions": [
+  {"id": "sess-a", "name": "learn a", "server_id": "srv-a", "server_ip": "203.0.113.10", "mode": "record_and_allow"},
+  {"id": "sess-b", "name": "learn b (group became strict)", "server_id": "srv-b", "server_ip": "192.168.10.6", "mode": "record_and_allow"}
+ ],
+ "grants": [
+  {"server_id": "srv-e", "location": "https://objects.example/asset.tgz", "parent_url": "https://github.com/acme/x/releases/download/v1/asset.tgz", "rule_id": "r-gh", "rule_name": "gh"},
+  {"server_id": "srv-b", "location": "https://objects-b.example/asset.tgz", "parent_url": "https://github.com/acme/x", "rule_id": "r-gh", "rule_name": "gh"},
+  {"server_id": "srv-f", "location": "https://objects-f.example/asset.tgz", "parent_url": "https://github.com/acme/x", "rule_id": "r-gh", "rule_name": "gh"}
+ ],
+ "cases": [
+  {"name": "e uses its own redirect grant", "ip": "203.0.113.10", "auth": "svc-e:token-e", "method": "GET", "host": "objects.example", "path": "/asset.tgz", "verdict": "REDIRECT_OBJECT_ALLOWED", "server_id": "srv-e"},
+  {"name": "e tunnel to its grant target", "ip": "203.0.113.10", "auth": "token-e", "method": "CONNECT", "host": "objects.example", "path": "/", "verdict": "REDIRECT_OBJECT_ALLOWED", "server_id": "srv-e"},
+  {"name": "token-identified b behind the same NAT cannot use e's grant", "ip": "203.0.113.10", "auth": "svc-b:token-b", "method": "GET", "host": "objects.example", "path": "/asset.tgz", "verdict": "BLOCKED", "server_id": "srv-b", "block_reason": "default_deny"},
+  {"name": "token-identified f behind the same NAT cannot use e's grant", "ip": "203.0.113.10", "auth": "svc-f:token-f", "method": "GET", "host": "objects.example", "path": "/asset.tgz", "verdict": "BLOCKED", "server_id": "srv-f", "block_reason": "default_deny"},
+  {"name": "a's learning session does not admit strict b from the same address", "ip": "203.0.113.10", "auth": "svc-b:token-b", "method": "GET", "host": "pypi.org", "path": "/simple/requests/", "verdict": "BLOCKED", "server_id": "srv-b", "block_reason": "default_deny"},
+  {"name": "a's learning session does not admit f from the same address", "ip": "203.0.113.10", "auth": "token-f", "method": "GET", "host": "pypi.org", "path": "/simple/requests/", "verdict": "BLOCKED", "server_id": "srv-f", "block_reason": "default_deny"},
+  {"name": "a's learning session applies to a", "ip": "203.0.113.10", "auth": "svc-a:token-a", "method": "GET", "host": "pypi.org", "path": "/simple/requests/", "verdict": "LEARNING_ALLOWED", "server_id": "srv-a"},
+  {"name": "no credentials: the address identifies the one server registered for it", "ip": "203.0.113.10", "auth": "", "method": "GET", "host": "pypi.org", "path": "/simple/", "verdict": "LEARNING_ALLOWED", "server_id": "srv-a"},
+  {"name": "bare username bound to the registered address", "ip": "203.0.113.10", "auth": "svc-a", "method": "GET", "host": "pypi.org", "path": "/simple/", "verdict": "LEARNING_ALLOWED", "server_id": "srv-a"},
+  {"name": "quarantine of the current requester wins over a's session", "ip": "203.0.113.10", "auth": "svc-q:token-q", "method": "GET", "host": "pypi.org", "path": "/simple/", "verdict": "QUARANTINED", "server_id": "srv-q", "block_reason": "quarantined"},
+  {"name": "strict isolation binds b's own session", "ip": "192.168.10.6", "auth": "token-b", "method": "GET", "host": "pypi.org", "path": "/simple/", "verdict": "BLOCKED", "server_id": "srv-b", "block_reason": "default_deny"},
+  {"name": "strict isolation binds b's own redirect grant", "ip": "192.168.10.6", "auth": "token-b", "method": "GET", "host": "objects-b.example", "path": "/asset.tgz", "verdict": "BLOCKED", "server_id": "srv-b", "block_reason": "default_deny"},
+  {"name": "BLOCK rules of the current requester win over its grant", "ip": "203.0.113.10", "auth": "token-f", "method": "GET", "host": "objects-f.example", "path": "/asset.tgz", "verdict": "BLOCKED", "server_id": "srv-f", "block_reason": "block_rule"},
+  {"name": "wrong token is refused, not attributed to the address", "ip": "203.0.113.10", "auth": "svc-a:wrong", "method": "GET", "host": "pypi.org", "path": "/simple/", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-203.0.113.10", "block_reason": "invalid_proxy_token"},
+  {"name": "unknown bare token is refused", "ip": "203.0.113.10", "auth": "nope", "method": "CONNECT", "host": "github.com", "path": "/", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-203.0.113.10", "block_reason": "invalid_proxy_token"},
+  {"name": "token of another server's user is refused", "ip": "203.0.113.10", "auth": "svc-e:token-a", "method": "GET", "host": "github.com", "path": "/", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-203.0.113.10", "block_reason": "invalid_proxy_token"},
+  {"name": "username from a foreign address is refused", "ip": "198.51.100.7", "auth": "svc-a", "method": "GET", "host": "github.com", "path": "/", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-198.51.100.7", "block_reason": "invalid_proxy_token"},
+  {"name": "unparseable credentials are refused", "ip": "203.0.113.10", "auth": ":", "method": "GET", "host": "github.com", "path": "/", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-203.0.113.10", "block_reason": "invalid_proxy_token"},
+  {"name": "require_proxy_token: the address alone is unregistered", "ip": "10.70.0.30", "auth": "", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "BLOCKED", "server_id": "srv-unregistered-10.70.0.30", "block_reason": "default_deny"},
+  {"name": "require_proxy_token: username alone is refused", "ip": "10.70.0.30", "auth": "svc-c", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "AUTH_FAILED", "server_id": "srv-unregistered-10.70.0.30", "block_reason": "proxy_token_required"},
+  {"name": "require_proxy_token: valid token", "ip": "10.70.0.30", "auth": "svc-c:token-c", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-c"},
+  {"name": "require_proxy_token: valid bare token from any address", "ip": "198.51.100.7", "auth": "token-c", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-c"},
+  {"name": "require_proxy_token on one group: the address does not identify the server", "ip": "10.80.0.40", "auth": "", "method": "GET", "host": "lab.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-auto-10-80-0-40"},
+  {"name": "require_proxy_token on one group: CIDR membership cannot reach that group's rules", "ip": "10.80.0.40", "auth": "", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "BLOCKED", "server_id": "srv-auto-10-80-0-40", "block_reason": "default_deny"},
+  {"name": "require_proxy_token on one group: with its token", "ip": "10.80.0.40", "auth": "svc-l:token-l", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-l"}
+ ]
+}

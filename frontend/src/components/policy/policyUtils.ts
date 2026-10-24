@@ -187,6 +187,16 @@ export const PATTERN_EXAMPLES: Array<{ host: string; path: string; label: string
   { host: 'pastebin.com', path: '/**', label: 'Whole site (guardrail)' },
 ];
 
+/** Hint under a path pattern field; flags the one-segment meaning of a trailing `/*` (it covered the whole subtree before 2.1). */
+export function pathPatternHint(pattern: string): string {
+  const p = pattern.trim();
+  if (p.endsWith('/*') && !p.endsWith('/**')) {
+    const base = p.slice(0, -2) || '/';
+    return `${p} matches exactly one segment below ${base}, not ${base} itself or deeper paths. Use ${p}* for the whole subtree.`;
+  }
+  return '/acme/** for /acme and everything below, /simple/* for exactly one segment below /simple';
+}
+
 /** Human sentence describing what a rule does. */
 export function describeRule(r: Pick<RuleInput, 'action' | 'methods' | 'host_pattern' | 'path_pattern'>): string {
   const methods = (r.methods ?? []).includes('*') ? 'any method' : (r.methods ?? ['GET', 'HEAD']).join(', ');

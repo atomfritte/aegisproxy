@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useState } from 'react';
-import { Boxes, Lock, Network, Tag } from 'lucide-react';
+import { Boxes, KeyRound, Lock, Network, Tag } from 'lucide-react';
 import { api } from '../../api';
 import { useAction, useConsoleState } from '../../data/AppData';
 import { navigate } from '../../lib/router';
@@ -19,6 +19,7 @@ interface FormState {
   color: string;
   cidrs: string[];
   strict_isolation: boolean;
+  require_proxy_token: boolean;
   selector: SelectorRow[];
   block_page_template_id: string;
 }
@@ -44,6 +45,7 @@ function toForm(g?: ServerGroup | null, colorSeed = 0): FormState {
     color: g?.color || CALM_COLORS[colorSeed % CALM_COLORS.length],
     cidrs: [...(g?.cidrs ?? [])],
     strict_isolation: !!g?.strict_isolation,
+    require_proxy_token: !!g?.require_proxy_token,
     selector: selectorToRows(g?.match_labels),
     block_page_template_id: g?.block_page_template_id ?? '',
   };
@@ -77,6 +79,7 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
     id: editing ? null : validateGroupId(f.id) || (state.groups.some((g) => g.id === f.id.trim().toLowerCase()) ? 'A group with this id already exists.' : null),
     color: validateHexColor(f.color),
     selector: selErrs.some(Boolean) ? 'Fix the selector conditions.' : null,
+    cidrs: f.require_proxy_token && f.cidrs.length > 0 ? 'Remove the CIDR ranges: a group that requires a proxy token cannot identify sources by address.' : null,
   };
   const blocking = Object.values(errors).some(Boolean);
   const show = (e: string | null) => (touched ? e : null);
@@ -85,7 +88,8 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
     const matched = Object.keys(selector).length ? state.servers.filter((s) => labelsMatch(s.labels, selector)) : [];
     const statics = editing ? state.servers.filter((s) => staticGroups(s).includes(group!.id)) : [];
     const byCidr = f.cidrs.length ? state.servers.filter((s) => s.ip && f.cidrs.some((c) => cidrContains(c, s.ip))) : [];
-    return { matched, statics, byCidr };
+    const withoutToken = [...new Map([...statics, ...matched].filter((s) => !s.has_proxy_token).map((s) => [s.id, s])).values()];
+    return { matched, statics, byCidr, withoutToken };
   }, [selector, state.servers, editing, group, f.cidrs]);
 
   const templates = state.block_pages ?? [];
@@ -104,6 +108,7 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
       color: f.color.trim().toUpperCase(),
       cidrs: f.cidrs,
       strict_isolation: f.strict_isolation,
+      require_proxy_token: f.require_proxy_token,
       match_labels: selector,
       block_page_template_id: f.block_page_template_id,
       server_count: group?.server_count ?? 0,
@@ -200,7 +205,12 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
 
         <section className="space-y-4">
           <SectionTitle icon={Network}>Network</SectionTitle>
-          <Field label="CIDR ranges" optional hint="Unregistered sources in these ranges are attributed to the group. Registered servers join through static membership or labels.">
+          <Field
+            label="CIDR ranges"
+            optional
+            error={show(errors.cidrs)}
+            hint="Unregistered sources in these ranges are attributed to the group. Registered servers join through static membership or labels."
+          >
             <TagInput
               value={f.cidrs}
               onChange={(v) => set('cidrs', v)}
@@ -224,8 +234,31 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
                   Strict isolation (zero-internet tier)
                 </span>
               }
-              description="For zero-internet tiers: global TLS exceptions do not apply (only exceptions that name the group or server), and learning sessions in record & allow mode as well as learning-session access requests are refused."
+              description="For zero-internet tiers: global TLS exceptions do not apply (only exceptions that name the group or server), learning sessions in record & allow mode as well as learning-session access requests are refused, and temporary grants (learning sessions, redirect objects) never open anything for members."
             />
+          </div>
+          <div className="rounded-lg border border-border p-3.5">
+            <Switch
+              checked={f.require_proxy_token}
+              onChange={(v) => set('require_proxy_token', v)}
+              label={
+                <span className="inline-flex items-center gap-1.5">
+                  <KeyRound className="h-3.5 w-3.5 text-fg-subtle" aria-hidden />
+                  Require proxy token
+                </span>
+              }
+              description="Members are identified only by their proxy token. A request from a member's IP address without a token is treated as unregistered (default deny); a proxy user name alone or an invalid token is refused with HTTP 407. Use it for servers behind shared NAT addresses."
+            />
+            {f.require_proxy_token && preview.withoutToken.length > 0 && (
+              <p className="mt-2 text-[12px] text-warning">
+                {preview.withoutToken.length} member{preview.withoutToken.length === 1 ? ' has' : 's have'} no proxy token yet (
+                {preview.withoutToken
+                  .slice(0, 3)
+                  .map((s) => s.hostname)
+                  .join(', ')}
+                {preview.withoutToken.length > 3 ? ', …' : ''}) and will lose access until one is issued (Servers → Onboard).
+              </p>
+            )}
           </div>
         </section>
 

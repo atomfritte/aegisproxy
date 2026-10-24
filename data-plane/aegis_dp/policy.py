@@ -1,12 +1,13 @@
 """Local policy evaluation (mirror of control-plane/internal/store/evaluate.go and engine.go).
 
 The evaluation order is identical to the control-plane:
-  threat intelligence -> destination hygiene -> BLOCK rules -> TLS passthrough ->
-  learning sessions -> redirect-object grants -> ALLOW rules -> default deny.
+  proxy authentication -> quarantine -> threat intelligence -> destination hygiene -> BLOCK rules ->
+  TLS passthrough -> learning sessions -> redirect-object grants -> ALLOW rules -> default deny.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import ipaddress
 import posixpath
@@ -32,10 +33,21 @@ VERDICT_DLP = "DLP_BLOCKED"
 VERDICT_FILETYPE = "FILETYPE_BLOCKED"
 VERDICT_POLICY = "POLICY_BLOCKED"
 VERDICT_QUARANTINED = "QUARANTINED"
+VERDICT_AUTH_FAILED = "AUTH_FAILED"  # invalid proxy credentials: HTTP 407, never an IP fallback
 UNREGISTERED_PREFIX = "srv-unregistered-"
+# Proxy-Authorization header that is present but cannot be parsed: as "username:token" with an empty token it
+# matches no server and fails authentication like any other invalid credential.
+MALFORMED_PROXY_AUTH = ":"
 
 ALLOWED_VERDICTS = {VERDICT_ALLOWED, VERDICT_LEARNING, VERDICT_REDIRECT, VERDICT_TLS_BYPASS}
-SECURITY_VERDICTS = {VERDICT_THREAT, VERDICT_MALWARE, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_POLICY, VERDICT_QUARANTINED}
+SECURITY_VERDICTS = {VERDICT_THREAT, VERDICT_MALWARE, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_POLICY, VERDICT_QUARANTINED,
+                     VERDICT_AUTH_FAILED}
+AUTH_FAILED_MESSAGES = {
+    "invalid_proxy_token": "Proxy authentication failed: the presented proxy credentials match no registered server "
+                           "(unknown, rotated or mistyped token)",
+    "proxy_token_required": "Proxy authentication failed: this server's group requires its proxy token "
+                            "(a proxy username alone is not accepted)",
+}
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # Cloud platform endpoints outside the link-local range (169.254.0.0/16 is covered by is_link_local). Same list as
@@ -151,7 +163,83 @@ def match_host(pattern: str, host: str) -> bool:
 
 
 def is_domain_wide(pattern: str) -> bool:
-    return (pattern or "").strip() in ("", "*", "/*", "/**")
+    return (pattern or "").strip() in ("", "*", "/**")
+
+
+# Path pattern syntax, identical to engine.MatchPath (shared vectors in testdata/path_vectors.json). Pattern and
+# request path are canonicalized first (query ignored, dot-segments and repeated slashes resolved), then:
+#   *    a whole segment ("/simple/*"): exactly one non-empty segment; inside a segment ("/v*.json"): any characters
+#        except "/"
+#   /**  a whole segment: zero or more segments ("/acme/**" matches /acme, /acme/x, /acme/x/y)
+#   **   inside a segment ("/release-asset-**"): any characters including "/"
+# Matching runs a linear-time automaton (no backtracking regex), so hostile request paths cannot blow it up.
+_P_LIT, _P_SEGCHAR, _P_STAR, _P_ANY, _P_OPTSLASH = range(5)
+
+
+@functools.lru_cache(maxsize=4096)
+def _compile_path_pattern(p: str) -> Tuple[Tuple[int, str], ...]:
+    toks: List[Tuple[int, str]] = []
+    i = 0
+    while i < len(p):
+        if p.startswith("/**", i) and (i + 3 == len(p) or p[i + 3] == "/"):
+            toks += [(_P_OPTSLASH, ""), (_P_ANY, "")]
+            i += 3
+            continue
+        if p[i] != "*":
+            toks.append((_P_LIT, p[i]))
+            i += 1
+            continue
+        j = i
+        while j < len(p) and p[j] == "*":
+            j += 1
+        if j - i >= 2:
+            toks.append((_P_ANY, ""))
+        elif (i == 0 or p[i - 1] == "/") and (j == len(p) or p[j] == "/"):
+            toks += [(_P_SEGCHAR, ""), (_P_STAR, "")]
+        else:
+            toks.append((_P_STAR, ""))
+        i = j
+    return tuple(toks)
+
+
+def _match_path_tokens(toks: Tuple[Tuple[int, str], ...], s: str) -> bool:
+    n = len(toks)
+
+    def closure(states: set) -> set:
+        # Epsilon moves only go forward: one ascending pass suffices.
+        for k in range(n):
+            if k in states:
+                kind = toks[k][0]
+                if kind in (_P_STAR, _P_ANY):
+                    states.add(k + 1)
+                elif kind == _P_OPTSLASH:
+                    states.add(k + 2)
+        return states
+
+    cur = closure({0})
+    for ch in s:
+        nxt = set()
+        for k in cur:
+            if k == n:
+                continue
+            kind, c = toks[k]
+            if kind == _P_LIT:
+                if ch == c:
+                    nxt.add(k + 1)
+            elif kind == _P_SEGCHAR:
+                if ch != "/":
+                    nxt.add(k + 1)
+            elif kind == _P_STAR:
+                if ch != "/":
+                    nxt.add(k)
+            elif kind == _P_ANY:
+                nxt.add(k)
+            elif ch == "/":  # _P_OPTSLASH
+                nxt.add(k + 1)
+        if not nxt:
+            return False
+        cur = closure(nxt)
+    return n in cur
 
 
 def match_path(pattern: str, req_path: str) -> bool:
@@ -161,24 +249,12 @@ def match_path(pattern: str, req_path: str) -> bool:
         return False
     if is_domain_wide(pat):
         return True
-    for suffix in ("/**", "/*"):
-        if pat.endswith(suffix):
-            raw_prefix = pat[: -len(suffix)]
-            if not raw_prefix:
-                return True
-            prefix, ok_p = canonicalize_path(raw_prefix)
-            if not ok_p:
-                return False
-            return clean == prefix or clean.startswith(prefix + "/")
-    if pat.endswith("*"):
-        prefix = pat.rstrip("*")
-        if prefix in ("", "/"):
-            return True
-        if not prefix.startswith("/"):
-            prefix = "/" + prefix
-        return clean.startswith(prefix)
     clean_pat, ok_pat = canonicalize_path(pat)
-    return ok_pat and clean == clean_pat
+    if not ok_pat:
+        return False
+    if "*" not in clean_pat:
+        return clean == clean_pat
+    return _match_path_tokens(_compile_path_pattern(clean_pat), clean)
 
 
 def _split_companion(comp: str) -> Tuple[str, str]:
@@ -316,6 +392,26 @@ class EvalResult:
         return self
 
 
+@dataclass
+class Identity:
+    """Resolved requester. method: token | username (bare proxy username bound to the server's IP/subnet) | ip |
+    cidr | "" (unregistered). auth_error is set when presented credentials identify no server
+    (invalid_proxy_token, proxy_token_required): the request is refused, never attributed to its address."""
+    server_id: str
+    hostname: str
+    group_ids: List[str]
+    method: str = ""
+    auth_error: str = ""
+
+    @staticmethod
+    def of(srv: Dict[str, Any], method: str) -> "Identity":
+        return Identity(srv["id"], srv.get("hostname", ""), list(srv.get("group_ids") or []), method)
+
+    @staticmethod
+    def unregistered(ip: str, auth_error: str = "") -> "Identity":
+        return Identity(f"{UNREGISTERED_PREFIX}{ip}", f"unregistered-{ip}", [], "", auth_error)
+
+
 class Policy:
     """Immutable compiled view of one control-plane bundle."""
 
@@ -332,8 +428,11 @@ class Policy:
         self.block_rules = [r for r in rules if str(r.get("action", "ALLOW")).upper() == "BLOCK"]
         self.allow_rules = [r for r in rules if str(r.get("action", "ALLOW")).upper() != "BLOCK"]
         self.strict_groups = {g.get("id") for g in (bundle.get("groups") or []) if g.get("strict_isolation")}
+        self.token_groups = {g.get("id") for g in (bundle.get("groups") or []) if g.get("require_proxy_token")}
         self.cidrs: List[Tuple[str, Any]] = []
         for g in bundle.get("groups") or []:
+            if g.get("require_proxy_token"):
+                continue  # CIDR membership is an address match: never identifies sources for such a group
             for c in g.get("cidrs") or []:
                 try:
                     self.cidrs.append((g.get("id", ""), ipaddress.ip_network(c.strip(), strict=False)))
@@ -345,9 +444,14 @@ class Policy:
         self.by_ip: Dict[str, Dict[str, Any]] = {}
         self.by_user: Dict[str, Dict[str, Any]] = {}
         self.by_token: Dict[str, Dict[str, Any]] = {}
+        shared_ips = set()
         for srv in bundle.get("servers") or []:
-            if srv.get("ip"):
-                self.by_ip[srv["ip"].strip()] = srv
+            ip = (srv.get("ip") or "").strip()
+            if ip in self.by_ip or ip in shared_ips:
+                self.by_ip.pop(ip, None)  # an address registered for several servers identifies none of them
+                shared_ips.add(ip)
+            elif ip:
+                self.by_ip[ip] = srv
             if srv.get("proxy_auth_user"):
                 self.by_user[srv["proxy_auth_user"].strip().lower()] = srv
             if srv.get("proxy_auth_token_hash"):
@@ -358,7 +462,15 @@ class Policy:
         return default if v is None else v
 
     # -- identity -----------------------------------------------------------
-    def resolve_server(self, peer_ip: str, proxy_auth: str) -> Tuple[str, str, List[str]]:
+    def _token_required(self, srv: Dict[str, Any]) -> bool:
+        return any(g in self.token_groups for g in srv.get("group_ids") or [])
+
+    def identify(self, peer_ip: str, proxy_auth: str) -> Identity:
+        """Presented credentials decide alone: a proxy token ("username:token" or a bare token) or a bare proxy
+        username bound to the server's IP/subnet; anything else is an authentication failure. Without credentials
+        the source address identifies the server it is registered for (only when exactly one server has it and none
+        of its groups requires a proxy token), then group CIDRs (except groups requiring a token). Same as
+        store.Identify in the control-plane."""
         clean_ip = (peer_ip or "").strip()
         if clean_ip.startswith("::ffff:"):
             clean_ip = clean_ip[7:]
@@ -368,24 +480,27 @@ class Policy:
                 user, tok = auth.split(":", 1)
                 srv = self.by_token.get(hash_token(tok))
                 if srv and (not user or user.lower() == (srv.get("proxy_auth_user") or "").lower()):
-                    return srv["id"], srv.get("hostname", ""), list(srv.get("group_ids") or [])
-            else:
-                srv = self.by_token.get(hash_token(auth))
-                if srv:
-                    return srv["id"], srv.get("hostname", ""), list(srv.get("group_ids") or [])
-                srv = self.by_user.get(auth.lower())
-                if srv:
-                    ok = srv.get("ip") == clean_ip
-                    if not ok and srv.get("subnet_cidr"):
-                        try:
-                            ok = ipaddress.ip_address(clean_ip) in ipaddress.ip_network(srv["subnet_cidr"], strict=False)
-                        except ValueError:
-                            ok = False
-                    if ok:
-                        return srv["id"], srv.get("hostname", ""), list(srv.get("group_ids") or [])
+                    return Identity.of(srv, "token")
+                return Identity.unregistered(clean_ip, "invalid_proxy_token")
+            srv = self.by_token.get(hash_token(auth))
+            if srv:
+                return Identity.of(srv, "token")
+            srv = self.by_user.get(auth.lower())
+            if srv:
+                ok = srv.get("ip") == clean_ip
+                if not ok and srv.get("subnet_cidr"):
+                    try:
+                        ok = ipaddress.ip_address(clean_ip) in ipaddress.ip_network(srv["subnet_cidr"], strict=False)
+                    except ValueError:
+                        ok = False
+                if ok:
+                    if self._token_required(srv):
+                        return Identity.unregistered(clean_ip, "proxy_token_required")
+                    return Identity.of(srv, "username")
+            return Identity.unregistered(clean_ip, "invalid_proxy_token")
         srv = self.by_ip.get(clean_ip)
-        if srv:
-            return srv["id"], srv.get("hostname", ""), list(srv.get("group_ids") or [])
+        if srv and not self._token_required(srv):
+            return Identity.of(srv, "ip")
         try:
             addr = ipaddress.ip_address(clean_ip)
             matched: List[str] = []
@@ -394,10 +509,14 @@ class Policy:
                     matched.append(gid)
             if matched:
                 octets = clean_ip.replace(".", "-").replace(":", "-")
-                return f"srv-auto-{octets}", f"node-{octets}", matched
+                return Identity(f"srv-auto-{octets}", f"node-{octets}", matched, "cidr")
         except ValueError:
             pass
-        return f"srv-unregistered-{clean_ip}", f"unregistered-{clean_ip}", []
+        return Identity.unregistered(clean_ip)
+
+    def resolve_server(self, peer_ip: str, proxy_auth: str) -> Tuple[str, str, List[str]]:
+        i = self.identify(peer_ip, proxy_auth)
+        return i.server_id, i.hostname, i.group_ids
 
     def _tls_scope_ok(self, b: Dict[str, Any], srv_id: str, groups: List[str]) -> bool:
         b_servers = b.get("server_ids") or []
@@ -418,10 +537,13 @@ class Policy:
     # -- evaluation ---------------------------------------------------------
     def evaluate(self, peer_ip: str, proxy_auth: str, method: str, host: str, port: int, path: str,
                  full_url: str, threat: ThreatSnapshot, grants: "RedirectGrants") -> EvalResult:
-        srv_id, srv_host, groups = self.resolve_server(peer_ip, proxy_auth)
+        ident = self.identify(peer_ip, proxy_auth)
+        srv_id, srv_host, groups = ident.server_id, ident.hostname, ident.group_ids
         method = (method or "GET").upper()
         host = normalize_host(host)
         res = EvalResult(server_id=srv_id, server_hostname=srv_host, group_ids=groups, suggested_host=host)
+        if ident.auth_error:
+            return res.block(VERDICT_AUTH_FAILED, ident.auth_error, AUTH_FAILED_MESSAGES[ident.auth_error])
         if srv_id in self.quarantined:
             return res.block(VERDICT_QUARANTINED, "quarantined",
                              "Incident response: this server is quarantined — all outbound access is blocked")
@@ -485,21 +607,23 @@ class Policy:
 
         ip_needs_explicit = addr is not None and bool(self.policy_value("block_ip_literals", True))
         implicit_ok = not internal and not ip_needs_explicit
+        # Temporary grants (learning sessions, redirect objects) never open anything for strict-isolation tiers.
+        strict = any(g in self.strict_groups for g in groups)
 
         if implicit_ok:
-            # 5. Learning session
-            clean_ip = (peer_ip or "").replace("::ffff:", "", 1)
+            # 5. Learning session, bound to the resolved server identity (the source address only counts where
+            # identify() accepted it: no credentials and registered for exactly this server)
             for sess in self.sessions:
                 if sess.get("status") != "active" or is_expired(sess.get("expires_at"), now):
                     continue
-                if sess.get("server_id") == srv_id or sess.get("server_ip") == clean_ip:
+                if sess.get("server_id") == srv_id:
                     res.session_id = sess.get("id", "")
-                    if sess.get("mode") == "record_and_allow":
+                    if sess.get("mode") == "record_and_allow" and not strict:
                         res.allowed, res.verdict, res.follow_redirects = True, VERDICT_LEARNING, True
                         res.matched_rule_id, res.matched_rule_name = sess.get("id", ""), f"Learning Session: {sess.get('name', '')}"
                         return res
-            # 6. Redirect-object grant
-            grant = grants.check(peer_ip, host, clean_path, method)
+            # 6. Redirect-object grant of this server
+            grant = None if strict else grants.check(srv_id, host, clean_path, method)
             if grant:
                 res.allowed, res.verdict = True, VERDICT_REDIRECT
                 res.matched_rule_id, res.matched_rule_name = grant[1], f"{grant[2]} (Object Redirect)"
@@ -527,7 +651,9 @@ class Policy:
 
 
 class RedirectGrants:
-    """Short-lived (2 min) single-hop grants for objects reached through an allowed redirect."""
+    """Short-lived (2 min) single-hop grants for objects reached through an allowed redirect. Grants belong to the
+    resolved server identity (server ID), never to the source address: servers behind one NAT address must not
+    share each other's grants."""
 
     TTL = 120.0
     MAX = 8192
@@ -536,15 +662,12 @@ class RedirectGrants:
         self._lock = threading.Lock()
         self._grants: Dict[str, Tuple[str, str, str, float]] = {}
 
-    @staticmethod
-    def _ip(peer_ip: str) -> str:
-        ip = (peer_ip or "").strip()
-        return ip[7:] if ip.startswith("::ffff:") else ip
-
-    def register(self, peer_ip: str, location: str, parent_url: str, rule_id: str, rule_name: str,
+    def register(self, server_id: str, location: str, parent_url: str, rule_id: str, rule_name: str,
                  internal_suffixes=DEFAULT_INTERNAL_SUFFIXES, allowed_hosts=()) -> bool:
-        """Grants the redirect target for TTL seconds. Internal targets never get a grant; a non-empty
+        """Grants the redirect target to server_id for TTL seconds. Internal targets never get a grant; a non-empty
         ``allowed_hosts`` (the rule's redirect_hosts patterns) limits the targets further."""
+        if not server_id:
+            return False
         try:
             target = urllib.parse.urlsplit(urllib.parse.urljoin(parent_url, location))
         except ValueError:
@@ -560,7 +683,6 @@ class RedirectGrants:
         if not ok:
             return False
         exp = time.time() + self.TTL
-        ip = self._ip(peer_ip)
         with self._lock:
             if len(self._grants) >= self.MAX:
                 now = time.time()
@@ -568,15 +690,14 @@ class RedirectGrants:
                     del self._grants[k]
                 if len(self._grants) >= self.MAX:
                     self._grants.clear()
-            self._grants[f"{ip}|{host}|{path}"] = (parent_url, rule_id, rule_name, exp)
-            self._grants[f"{ip}|{host}|CONNECT"] = (parent_url, rule_id, rule_name, exp)
+            self._grants[f"{server_id}|{host}|{path}"] = (parent_url, rule_id, rule_name, exp)
+            self._grants[f"{server_id}|{host}|CONNECT"] = (parent_url, rule_id, rule_name, exp)
         return True
 
-    def check(self, peer_ip: str, host: str, path: str, method: str) -> Optional[Tuple[str, str, str, float]]:
-        if method not in ("GET", "HEAD", "CONNECT"):
+    def check(self, server_id: str, host: str, path: str, method: str) -> Optional[Tuple[str, str, str, float]]:
+        if method not in ("GET", "HEAD", "CONNECT") or not server_id:
             return None
-        ip = self._ip(peer_ip)
-        key = f"{ip}|{host}|CONNECT" if method == "CONNECT" else f"{ip}|{host}|{path}"
+        key = f"{server_id}|{host}|CONNECT" if method == "CONNECT" else f"{server_id}|{host}|{path}"
         with self._lock:
             grant = self._grants.get(key)
         if grant and time.time() < grant[3]:

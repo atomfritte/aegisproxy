@@ -101,9 +101,10 @@ func (s *Server) DataPlanes() []DataPlaneStatus {
 }
 
 type dpGroup struct {
-	ID              string   `json:"id"`
-	CIDRs           []string `json:"cidrs"`
-	StrictIsolation bool     `json:"strict_isolation"`
+	ID                string   `json:"id"`
+	CIDRs             []string `json:"cidrs"`
+	StrictIsolation   bool     `json:"strict_isolation"`
+	RequireProxyToken bool     `json:"require_proxy_token"`
 }
 
 type dpServer struct {
@@ -144,7 +145,7 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 
 	groups := make([]dpGroup, 0, len(snap.Groups))
 	for _, g := range snap.Groups {
-		groups = append(groups, dpGroup{ID: g.ID, CIDRs: g.CIDRs, StrictIsolation: g.StrictIsolation})
+		groups = append(groups, dpGroup{ID: g.ID, CIDRs: g.CIDRs, StrictIsolation: g.StrictIsolation, RequireProxyToken: g.RequireProxyToken})
 	}
 	servers := make([]dpServer, 0, len(snap.Servers))
 	for _, srv := range snap.Servers {

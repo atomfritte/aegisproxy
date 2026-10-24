@@ -341,6 +341,8 @@ export interface PolicySetDocument extends PolicySetSpec {
 export interface PolicySetBundle {
   /** aegisproxy.policy-sets/v1 */
   format: string;
+  /** 2 since 2.1 ('*' = one path segment); absent: legacy patterns are rewritten on import. */
+  path_syntax?: number;
   exported_at: string;
   exported_by: string;
   policy_sets: PolicySetDocument[];
@@ -392,6 +394,8 @@ export interface ServerGroup {
   owner_team: string;
   color: string;
   strict_isolation: boolean;
+  /** Members are identified only by a valid proxy token (IP address alone = unregistered; no CIDRs). */
+  require_proxy_token?: boolean;
   /** Dynamic membership: every registered server whose labels contain all pairs (`*` = any value). */
   match_labels?: Record<string, string>;
   /** Block page template for servers of this group ("" = default). */
@@ -855,6 +859,7 @@ export type FlowVerdict =
   | 'FILETYPE_BLOCKED'
   | 'POLICY_BLOCKED'
   | 'QUARANTINED'
+  | 'AUTH_FAILED'
   | 'SIMULATED';
 
 export interface TrafficFlow {

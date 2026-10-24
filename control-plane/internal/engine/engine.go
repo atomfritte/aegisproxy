@@ -19,8 +19,10 @@ import (
 	"aegisproxy/control-plane/internal/netguard"
 )
 
+// RedirectGrant is keyed by the resolved server identity (server ID), never by the source address: servers
+// behind one NAT address must not share each other's grants.
 type RedirectGrant struct {
-	ServerIP   string
+	ServerID   string
 	TargetHost string
 	TargetPath string
 	ParentURL  string
@@ -118,6 +120,7 @@ type CompiledPolicyIndex struct {
 	ServerByAuth   map[string]models.Server // bare username -> Server (requires IP/subnet binding)
 	ServerByToken  map[string]models.Server // hex SHA-256(token) -> Server
 	StrictGroups   map[string]bool          // groups with StrictIsolation
+	TokenGroups    map[string]bool          // groups with RequireProxyToken
 	ParsedCIDRs    []CompiledGroupCIDR
 	ExactHostRules map[string][]IndexedRule // exact lowercase hostname -> rules (sorted BLOCK first)
 	WildcardRules  []IndexedRule            // rules with *.domain or * or companion wildcards (sorted BLOCK first)
@@ -171,6 +174,7 @@ func BuildCompiledIndex(revision uint64, groups []models.ServerGroup, servers []
 		ServerByAuth:   make(map[string]models.Server, len(servers)),
 		ServerByToken:  make(map[string]models.Server, len(servers)),
 		StrictGroups:   make(map[string]bool),
+		TokenGroups:    make(map[string]bool),
 		ParsedCIDRs:    make([]CompiledGroupCIDR, 0, len(groups)*2),
 		ExactHostRules: make(map[string][]IndexedRule, len(rules)),
 		WildcardRules:  make([]IndexedRule, 0, len(rules)/2+1),
@@ -179,6 +183,10 @@ func BuildCompiledIndex(revision uint64, groups []models.ServerGroup, servers []
 	for _, g := range groups {
 		if g.StrictIsolation {
 			idx.StrictGroups[g.ID] = true
+		}
+		if g.RequireProxyToken {
+			idx.TokenGroups[g.ID] = true
+			continue // CIDR membership is an address match: never identifies sources for such a group
 		}
 		for _, cidr := range g.CIDRs {
 			if pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr)); err == nil {
@@ -191,9 +199,14 @@ func BuildCompiledIndex(revision uint64, groups []models.ServerGroup, servers []
 		}
 	}
 
+	sharedIPs := map[string]bool{}
 	for _, srv := range servers {
 		cleanIP := strings.TrimSpace(srv.IP)
-		if cleanIP != "" {
+		if _, dup := idx.ServerByIP[cleanIP]; dup || sharedIPs[cleanIP] {
+			// An address registered for several servers identifies none of them.
+			delete(idx.ServerByIP, cleanIP)
+			sharedIPs[cleanIP] = true
+		} else if cleanIP != "" {
 			idx.ServerByIP[cleanIP] = srv
 		}
 		uLower := strings.ToLower(strings.TrimSpace(srv.ProxyAuthUser))
@@ -408,11 +421,12 @@ func CanonicalizePath(rawPath string) (string, bool) {
 	return cleaned, true
 }
 
-// RegisterRedirectGrant records a temporary object access grant when an allowed URL redirects (301/302/307/308) to a CDN/Object host.
-// A non-empty allowedHosts (the rule's redirect_hosts patterns) limits the hosts that can receive a grant.
-func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, ruleID, ruleName string, allowedHosts []string) {
+// RegisterRedirectGrant records a temporary object access grant for the server serverID when an allowed URL
+// redirects (301/302/307/308) to a CDN/Object host. A non-empty allowedHosts (the rule's redirect_hosts patterns)
+// limits the hosts that can receive a grant.
+func (e *PolicyEngine) RegisterRedirectGrant(serverID, locationURL, parentURL, ruleID, ruleName string, allowedHosts []string) {
 	parsed, err := url.Parse(locationURL)
-	if err != nil || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || serverID == "" {
 		return
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
@@ -431,7 +445,7 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, r
 	}
 	exp := time.Now().Add(2 * time.Minute)
 	grant := RedirectGrant{
-		ServerIP:   serverIP,
+		ServerID:   serverID,
 		TargetHost: host,
 		TargetPath: cleanPath,
 		ParentURL:  parentURL,
@@ -439,7 +453,7 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, r
 		RuleName:   ruleName,
 		ExpiresAt:  exp,
 	}
-	key := fmt.Sprintf("%s|%s|%s", serverIP, host, cleanPath)
+	key := fmt.Sprintf("%s|%s|%s", serverID, host, cleanPath)
 	sh := &e.shards[fnv32(key)%redirectShardCount]
 	sh.mu.Lock()
 	if len(sh.grants) < 1024 {
@@ -448,7 +462,7 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, r
 	sh.mu.Unlock()
 
 	// Also register a host-level CONNECT pre-flight key so HTTPS tunnel setup to the redirect target succeeds
-	connKey := fmt.Sprintf("%s|%s|CONNECT", serverIP, host)
+	connKey := fmt.Sprintf("%s|%s|CONNECT", serverID, host)
 	shConn := &e.shards[fnv32(connKey)%redirectShardCount]
 	shConn.mu.Lock()
 	if len(shConn.grants) < 1024 {
@@ -457,7 +471,8 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverIP, locationURL, parentURL, r
 	shConn.mu.Unlock()
 }
 
-func (e *PolicyEngine) CheckRedirectGrant(serverIP, host, rawPath, method string) (RedirectGrant, bool) {
+// CheckRedirectGrant looks up a grant of the server serverID (the requester's resolved identity).
+func (e *PolicyEngine) CheckRedirectGrant(serverID, host, rawPath, method string) (RedirectGrant, bool) {
 	upperMethod := strings.ToUpper(strings.TrimSpace(method))
 	// Redirect object grants only permit read-only retrieval (GET/HEAD) and CONNECT tunnel pre-flight, never POST/PUT exfiltration.
 	if upperMethod != "GET" && upperMethod != "HEAD" && upperMethod != "CONNECT" {
@@ -468,7 +483,7 @@ func (e *PolicyEngine) CheckRedirectGrant(serverIP, host, rawPath, method string
 		return RedirectGrant{}, false
 	}
 	if upperMethod == "CONNECT" {
-		connKey := fmt.Sprintf("%s|%s|CONNECT", serverIP, host)
+		connKey := fmt.Sprintf("%s|%s|CONNECT", serverID, host)
 		shConn := &e.shards[fnv32(connKey)%redirectShardCount]
 		shConn.mu.RLock()
 		grant, ok := shConn.grants[connKey]
@@ -481,7 +496,7 @@ func (e *PolicyEngine) CheckRedirectGrant(serverIP, host, rawPath, method string
 	if !ok {
 		return RedirectGrant{}, false
 	}
-	key := fmt.Sprintf("%s|%s|%s", serverIP, host, cleanPath)
+	key := fmt.Sprintf("%s|%s|%s", serverID, host, cleanPath)
 	sh := &e.shards[fnv32(key)%redirectShardCount]
 	sh.mu.RLock()
 	grant, ok := sh.grants[key]
@@ -507,14 +522,125 @@ func MatchHost(pattern, host string) bool {
 	return false
 }
 
-// IsDomainWidePathPattern returns true if a PathPattern covers the entire host ("", "*", "/*", "/**").
+// IsDomainWidePathPattern returns true if a PathPattern covers the entire host ("", "*", "/**").
 func IsDomainWidePathPattern(pattern string) bool {
 	p := strings.TrimSpace(pattern)
-	return p == "" || p == "*" || p == "/*" || p == "/**"
+	return p == "" || p == "*" || p == "/**"
 }
 
-// MatchPath checks boundary-aware path patterns such as "/microsoft/**", "/repos/microsoft/**", or prefix wildcards like "/token**"
-// after canonicalizing dot-segments and percent-encoding.
+// Path pattern syntax (same as match_path in the data-plane; shared vectors in testdata/path_vectors.json). Pattern
+// and request path are canonicalized first (CanonicalizePath: query ignored, dot-segments and repeated slashes
+// resolved), then:
+//
+//	*      a whole segment ("/simple/*"): exactly one non-empty segment; inside a segment ("/v*.json"): any
+//	       characters except '/'
+//	/**    a whole segment: zero or more segments ("/acme/**" matches /acme, /acme/x and /acme/x/y;
+//	       "/a/**/b" matches /a/b and /a/x/y/b)
+//	**     inside a segment ("/release-asset-**"): any characters including '/'
+//
+// Matching is a linear-time automaton (no backtracking), so hostile request paths cannot blow it up.
+const (
+	pathLit      = iota // the character c
+	pathSegChar         // exactly one character other than '/'
+	pathStar            // any run of characters other than '/'
+	pathAny             // any run of characters
+	pathOptSlash        // '/' followed by the next pathAny token, or neither (zero segments)
+)
+
+type pathToken struct {
+	kind uint8
+	c    byte
+}
+
+func compilePathPattern(p string) []pathToken {
+	toks := make([]pathToken, 0, len(p))
+	for i := 0; i < len(p); {
+		if strings.HasPrefix(p[i:], "/**") && (i+3 == len(p) || p[i+3] == '/') {
+			toks = append(toks, pathToken{kind: pathOptSlash}, pathToken{kind: pathAny})
+			i += 3
+			continue
+		}
+		if p[i] != '*' {
+			toks = append(toks, pathToken{kind: pathLit, c: p[i]})
+			i++
+			continue
+		}
+		j := i
+		for j < len(p) && p[j] == '*' {
+			j++
+		}
+		switch {
+		case j-i >= 2:
+			toks = append(toks, pathToken{kind: pathAny})
+		case (i == 0 || p[i-1] == '/') && (j == len(p) || p[j] == '/'):
+			toks = append(toks, pathToken{kind: pathSegChar}, pathToken{kind: pathStar})
+		default:
+			toks = append(toks, pathToken{kind: pathStar})
+		}
+		i = j
+	}
+	return toks
+}
+
+func matchPathTokens(toks []pathToken, s string) bool {
+	n := len(toks)
+	cur, next := make([]bool, n+1), make([]bool, n+1)
+	// Epsilon moves only go forward, so one ascending pass computes the closure.
+	closure := func(set []bool) {
+		for k := 0; k < n; k++ {
+			if !set[k] {
+				continue
+			}
+			switch toks[k].kind {
+			case pathStar, pathAny:
+				set[k+1] = true
+			case pathOptSlash:
+				set[k+2] = true
+			}
+		}
+	}
+	cur[0] = true
+	closure(cur)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		clear(next)
+		alive := false
+		for k := 0; k < n; k++ {
+			if !cur[k] {
+				continue
+			}
+			switch t := toks[k]; t.kind {
+			case pathLit:
+				if ch == t.c {
+					next[k+1], alive = true, true
+				}
+			case pathSegChar:
+				if ch != '/' {
+					next[k+1], alive = true, true
+				}
+			case pathStar:
+				if ch != '/' {
+					next[k], alive = true, true
+				}
+			case pathAny:
+				next[k], alive = true, true
+			case pathOptSlash:
+				if ch == '/' {
+					next[k+1], alive = true, true
+				}
+			}
+		}
+		if !alive {
+			return false
+		}
+		closure(next)
+		cur, next = next, cur
+	}
+	return cur[n]
+}
+
+// MatchPath checks a path pattern ("/microsoft/**", "/simple/*", "/repos/*/releases/**", exact paths) against a
+// request path; see the syntax above.
 func MatchPath(pattern, reqPath string) bool {
 	pattern = strings.TrimSpace(pattern)
 	cleanPath, ok := CanonicalizePath(reqPath)
@@ -524,44 +650,34 @@ func MatchPath(pattern, reqPath string) bool {
 	if IsDomainWidePathPattern(pattern) {
 		return true
 	}
-	if strings.HasSuffix(pattern, "/**") {
-		rawPrefix := strings.TrimSuffix(pattern, "/**")
-		if rawPrefix == "" {
-			return true
-		}
-		prefix, okP := CanonicalizePath(rawPrefix)
-		if !okP {
-			return false
-		}
-		return cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/")
-	}
-	if strings.HasSuffix(pattern, "/*") {
-		rawPrefix := strings.TrimSuffix(pattern, "/*")
-		if rawPrefix == "" {
-			return true
-		}
-		prefix, okP := CanonicalizePath(rawPrefix)
-		if !okP {
-			return false
-		}
-		return cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/")
-	}
-	// Support mid/suffix wildcards not preceded by slash (e.g. "/github-production-release-asset-**" or "/token**")
-	if strings.HasSuffix(pattern, "**") || strings.HasSuffix(pattern, "*") {
-		rawPrefix := strings.TrimRight(pattern, "*")
-		if rawPrefix == "" || rawPrefix == "/" {
-			return true
-		}
-		if !strings.HasPrefix(rawPrefix, "/") {
-			rawPrefix = "/" + rawPrefix
-		}
-		return strings.HasPrefix(cleanPath, rawPrefix)
-	}
-	cleanPattern, okPat := CanonicalizePath(pattern)
-	if !okPat {
+	cleanPattern, ok := CanonicalizePath(pattern)
+	if !ok {
 		return false
 	}
-	return cleanPath == cleanPattern
+	if !strings.Contains(cleanPattern, "*") {
+		return cleanPath == cleanPattern
+	}
+	return matchPathTokens(compilePathPattern(cleanPattern), cleanPath)
+}
+
+// LegacyPathPattern translates a path pattern written for releases before 2.1, where a trailing "/*" also
+// matched every deeper path and a trailing "x*" was a plain prefix, into the current syntax with the same
+// meaning ("/simple/*" -> "/simple/**", "/token*" -> "/token**"). literalStar reports a '*' elsewhere in the
+// pattern: older releases compared it literally, now it is a wildcard (no equivalent exists).
+func LegacyPathPattern(p string) (out string, changed, literalStar bool) {
+	p = strings.TrimSpace(p)
+	if IsDomainWidePathPattern(p) {
+		return p, false, false
+	}
+	out = p
+	body := p
+	if strings.HasSuffix(p, "*") && !strings.HasSuffix(p, "**") {
+		out = p + "*"
+		body = strings.TrimSuffix(p, "*")
+	} else if strings.HasSuffix(p, "**") {
+		body = strings.TrimRight(p, "*")
+	}
+	return out, out != p, strings.Contains(body, "*")
 }
 
 func MatchMethod(methods []string, reqMethod string) bool {
@@ -593,7 +709,7 @@ func MatchRule(rule models.PolicyRule, host, path, method string) bool {
 	}
 	// For HTTP CONNECT tunnel initiation, path is empty or host:port.
 	// Allow CONNECT for ALLOW rules if the host matches so mitmproxy can inspect the inner HTTPS path.
-	// For BLOCK rules, only block at the CONNECT stage if the BLOCK rule is domain-wide ("/**", "/*", "*");
+	// For BLOCK rules, only block at the CONNECT stage if the BLOCK rule is domain-wide ("/**", "*");
 	// path-specific BLOCK rules (e.g. "github.com/torvalds/**") must NOT block CONNECT to github.com:443!
 	if strings.EqualFold(method, "CONNECT") {
 		if strings.EqualFold(rule.Action, "BLOCK") {

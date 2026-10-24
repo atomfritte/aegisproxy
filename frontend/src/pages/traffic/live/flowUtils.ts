@@ -22,9 +22,9 @@ export const VERDICT_CLASSES: Array<{ id: VerdictClass; label: string; descripti
   {
     id: 'security',
     label: 'Threats',
-    description: 'Threat intel, antivirus, DLP, file type, policy guardrails, quarantine',
+    description: 'Threat intel, antivirus, DLP, file type, policy guardrails, quarantine, failed proxy authentication',
     tone: 'danger',
-    verdicts: ['THREAT_BLOCKED', 'MALWARE_BLOCKED', 'DLP_BLOCKED', 'FILETYPE_BLOCKED', 'POLICY_BLOCKED', 'QUARANTINED'],
+    verdicts: ['THREAT_BLOCKED', 'MALWARE_BLOCKED', 'DLP_BLOCKED', 'FILETYPE_BLOCKED', 'POLICY_BLOCKED', 'QUARANTINED', 'AUTH_FAILED'],
   },
   {
     id: 'bypass',
@@ -59,6 +59,7 @@ export const ALL_VERDICTS: Array<{ value: FlowVerdict; label: string }> = [
   { value: 'FILETYPE_BLOCKED', label: 'File type blocked' },
   { value: 'POLICY_BLOCKED', label: 'Policy blocked' },
   { value: 'QUARANTINED', label: 'Quarantined' },
+  { value: 'AUTH_FAILED', label: 'Proxy authentication failed' },
   { value: 'TLS_BYPASS', label: 'TLS bypass' },
   { value: 'LEARNING_ALLOWED', label: 'Learning' },
   { value: 'SIMULATED', label: 'Simulated' },

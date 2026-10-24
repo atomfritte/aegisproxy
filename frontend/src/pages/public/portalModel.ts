@@ -35,7 +35,7 @@ export function decodeBlockToken(token: string): BlockTokenClaims | null {
 }
 
 /** Verdicts without self-service (data-plane: security verdicts except POLICY_BLOCKED). */
-export const NO_SELF_SERVICE_VERDICTS = ['THREAT_BLOCKED', 'MALWARE_BLOCKED', 'DLP_BLOCKED', 'FILETYPE_BLOCKED', 'QUARANTINED'];
+export const NO_SELF_SERVICE_VERDICTS = ['THREAT_BLOCKED', 'MALWARE_BLOCKED', 'DLP_BLOCKED', 'FILETYPE_BLOCKED', 'QUARANTINED', 'AUTH_FAILED'];
 
 export const VERDICT_LABELS: Record<string, string> = {
   BLOCKED: 'Not on the allow list',
@@ -45,6 +45,7 @@ export const VERDICT_LABELS: Record<string, string> = {
   DLP_BLOCKED: 'Data loss prevention',
   FILETYPE_BLOCKED: 'File type not allowed',
   QUARANTINED: 'Server is quarantined',
+  AUTH_FAILED: 'Proxy credentials not valid',
 };
 
 export const SCOPES: Array<{ value: AccessScope; title: string; description: string }> = [

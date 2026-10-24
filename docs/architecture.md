@@ -118,9 +118,15 @@ A server is identified in this order:
    rotated in the console. For HTTPS the header comes from the `CONNECT` request and applies to the whole
    connection.
 2. A bare user name — **only** if the source IP matches the server's registered IP or subnet.
-3. The registered server IP.
-4. A server group CIDR (synthetic ID `srv-auto-…`).
-5. Otherwise: unregistered, **no** groups (only global rules apply).
+3. Presented credentials that match neither are refused: verdict `AUTH_FAILED`, HTTP 407 — never a fallback
+   to the source address.
+4. Without credentials: the registered server IP (only when exactly one server has it and none of its groups
+   requires a proxy token).
+5. A server group CIDR (synthetic ID `srv-auto-…`; groups that require a proxy token have no CIDRs).
+6. Otherwise: unregistered, **no** groups (only global rules apply).
+
+Learning sessions and redirect grants belong to the resolved server ID, never to the source address, so servers
+behind one NAT address cannot use each other's temporary grants.
 
 The source IP of the servers must therefore reach the data-plane: a Kubernetes Service with
 `externalTrafficPolicy: Local`, an L4 load balancer without SNAT, or token authentication.

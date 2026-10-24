@@ -4,7 +4,7 @@ import type { RuleInput } from '../../types';
 import { cn } from '../../lib/cn';
 import { usePermissions } from '../../data/AppData';
 import { Button, Callout, Drawer, Field, HelpTip, Input, PatternText, SegmentedControl, Switch, TagInput, Textarea } from '../../ui';
-import { describeRule, HTTP_METHODS, PATTERN_EXAMPLES, validateCompanion, validateRedirectHost, validateRule } from './policyUtils';
+import { describeRule, HTTP_METHODS, pathPatternHint, PATTERN_EXAMPLES, validateCompanion, validateRedirectHost, validateRule } from './policyUtils';
 
 function toLocalInput(iso?: string): string {
   if (!iso) return '';
@@ -132,8 +132,10 @@ export const RuleFormDrawer: React.FC<RuleFormDrawerProps> = ({ open, rule, setK
             <Field
               label="Path pattern"
               error={show('path_pattern')}
-              hint="/acme/** prefix with sub-paths, /simple/* one level"
-              labelAside={<HelpTip content="** matches any number of path segments, * exactly one. Leave /** to match the whole host." />}
+              hint={pathPatternHint(r.path_pattern)}
+              labelAside={
+                <HelpTip content="/** matches any number of path segments, including none: /acme/** covers /acme and everything below. * matches exactly one segment: /simple/* covers /simple/requests, but neither /simple nor /simple/a/b. Inside a segment, * never crosses a slash (/v*.json) and ** does (/asset-**). The query string is ignored. Since 2.1; rules that ended in /* before were migrated to /** automatically. Leave /** to match the whole host." />
+              }
             >
               <Input mono value={r.path_pattern} onChange={(e) => setR({ ...r, path_pattern: e.target.value })} placeholder="/**" spellCheck={false} autoCapitalize="off" disabled={blockLocked} />
             </Field>

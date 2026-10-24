@@ -5556,8 +5556,10 @@ components:
         Flow / evaluation verdict shared by control-plane, data-plane and console. Allowed verdicts:
         `ALLOWED`, `LEARNING_ALLOWED`, `REDIRECT_OBJECT_ALLOWED`, `TLS_BYPASS`. `BLOCKED` is the default-deny
         whitelist verdict; `THREAT_BLOCKED`, `MALWARE_BLOCKED`, `DLP_BLOCKED`, `FILETYPE_BLOCKED`,
-        `POLICY_BLOCKED` and `QUARANTINED` come from threat protection; `SIMULATED` marks dry-run records.
-      enum: [ALLOWED, BLOCKED, LEARNING_ALLOWED, REDIRECT_OBJECT_ALLOWED, TLS_BYPASS, THREAT_BLOCKED, MALWARE_BLOCKED, DLP_BLOCKED, FILETYPE_BLOCKED, POLICY_BLOCKED, QUARANTINED, SIMULATED]
+        `POLICY_BLOCKED` and `QUARANTINED` come from threat protection; `AUTH_FAILED` marks presented proxy credentials
+        that identify no server (HTTP 407, `block_reason` `invalid_proxy_token` or `proxy_token_required`); `SIMULATED`
+        marks dry-run records.
+      enum: [ALLOWED, BLOCKED, LEARNING_ALLOWED, REDIRECT_OBJECT_ALLOWED, TLS_BYPASS, THREAT_BLOCKED, MALWARE_BLOCKED, DLP_BLOCKED, FILETYPE_BLOCKED, POLICY_BLOCKED, QUARANTINED, AUTH_FAILED, SIMULATED]
     HTTPMethod:
       type: string
       description: HTTP method of a rule (`*` = any method).
@@ -6891,7 +6893,10 @@ components:
           description: '`example.com`, `*.example.com`, an IP literal or `*` (catch-all ALLOW rules: Super Admins only).'
         path_pattern:
           type: string
-          description: Path glob starting with `/` (default `/**`).
+          description: Path glob starting with `/` (default `/**`), matched against the canonicalized path (query ignored). `*` as a
+            whole segment is exactly one non-empty segment (`/simple/*` matches `/simple/requests`, not `/simple` or `/simple/a/b`),
+            inside a segment any characters except `/`; `/**` is zero or more segments (`/acme/**` matches `/acme` and everything
+            below); `**` inside a segment spans `/` (`/release-asset-**`).
         methods:
           type: [array, 'null']
           description: Default `["GET","HEAD"]`.
@@ -7415,6 +7420,12 @@ components:
           type: string
           description: '`aegisproxy.policy-sets/v1` (empty is accepted on import).'
           enum: ['aegisproxy.policy-sets/v1', '']
+        path_syntax:
+          type: integer
+          minimum: 1
+          maximum: 2
+          description: Path pattern syntax. `2` (written by 2.1+ exports) - `*` is exactly one path segment, `**` any depth. Absent or
+            `1` - bundle from an earlier release; on import, patterns ending in `/*` or `x*` are rewritten to `/**` / `x**` (same meaning).
         exported_at:
           type: string
           format: date-time
@@ -8131,7 +8142,13 @@ components:
           default: '#64748B'
         strict_isolation:
           type: boolean
-          description: Zero-internet tier - unscoped TLS exceptions never apply and record-and-allow learning sessions are not permitted.
+          description: Zero-internet tier - unscoped TLS exceptions never apply, record-and-allow learning sessions are not permitted
+            and temporary grants (learning sessions, redirect objects) never open anything for members.
+        require_proxy_token:
+          type: boolean
+          default: false
+          description: Members are identified only by a valid proxy token. A request from a member's IP address without one is treated
+            as an unregistered source; a proxy username alone is refused (`AUTH_FAILED`, HTTP 407). Cannot be combined with `cidrs`.
         match_labels:
           type: object
           description: Dynamic membership - every server whose labels contain all pairs (`*` = any value).
@@ -9705,7 +9722,7 @@ components:
     # -------------------------------------------------------------------------
     DataPlaneGroup:
       type: object
-      required: [id, cidrs, strict_isolation]
+      required: [id, cidrs, strict_isolation, require_proxy_token]
       properties:
         id:
           type: string
@@ -9714,6 +9731,8 @@ components:
           items:
             type: string
         strict_isolation:
+          type: boolean
+        require_proxy_token:
           type: boolean
     DataPlaneServer:
       type: object

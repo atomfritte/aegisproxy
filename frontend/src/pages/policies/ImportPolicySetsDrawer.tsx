@@ -34,7 +34,13 @@ function parseBundle(text: string): PolicySetBundle {
   if (b.format && b.format !== FORMAT) throw new Error(`Unsupported format “${b.format}” (expected ${FORMAT}).`);
   if (b.policy_sets.length === 0) throw new Error('The bundle contains no policy sets.');
   if (b.policy_sets.length > 200) throw new Error('At most 200 policy sets per import.');
-  return { format: b.format || FORMAT, exported_at: b.exported_at || '', exported_by: b.exported_by || '', policy_sets: b.policy_sets as PolicySetDocument[] };
+  return {
+    format: b.format || FORMAT,
+    path_syntax: typeof b.path_syntax === 'number' ? b.path_syntax : undefined,
+    exported_at: b.exported_at || '',
+    exported_by: b.exported_by || '',
+    policy_sets: b.policy_sets as PolicySetDocument[],
+  };
 }
 
 const diffText = (r: PolicySetImportResult) => {
@@ -209,6 +215,8 @@ export const ImportPolicySetsDrawer: React.FC<{ open: boolean; onClose: () => vo
             {pluralize(bundle.policy_sets.length, 'policy set')}
             {bundle.exported_by ? ` exported by ${bundle.exported_by}` : ''}
             {bundle.exported_at ? ` on ${formatDateTime(bundle.exported_at)}` : ''}. Sets are matched by id, then by name.
+            {(bundle.path_syntax ?? 1) < 2 &&
+              ' Written for a release before 2.1 (no path_syntax): path patterns ending in /* or x* are rewritten to /** and x** so they keep their meaning.'}
           </p>
         )}
 

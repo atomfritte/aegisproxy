@@ -99,8 +99,9 @@ topology or add integrations.
 | InfoSec user grants themselves Super Admin through the IdP mapping | SSO configuration is Super Admin only |
 | Team Lead widens scope | Scope checks on every policy, request and session operation (effective groups incl. label-selected); no catch-all or TLD wildcard hosts; permanent grants not allowed |
 | Automation obtains admin rights | Service accounts cannot be Super Admin, cannot manage identities or integrations |
-| Learning session opens a zero-internet tier | `record_and_allow` refused for strict-isolation groups; internal destinations never opened by learning or redirect grants |
-| Allowed site redirects to an arbitrary host (open redirect, user-controlled links) | Redirect grants only for rules with *Follow redirects* (and learning sessions); one object (exact path), GET/HEAD, two minutes, single hop, same source IP, never internal destinations; optional per-rule `redirect_hosts` allowlist |
+| Learning session opens a zero-internet tier | `record_and_allow` refused for strict-isolation groups; learning sessions and redirect grants never apply to members of strict-isolation groups; internal destinations never opened by learning or redirect grants |
+| Allowed site redirects to an arbitrary host (open redirect, user-controlled links) | Redirect grants only for rules with *Follow redirects* (and learning sessions); one object (exact path), GET/HEAD, two minutes, single hop, same server identity (not source address), never internal destinations; optional per-rule `redirect_hosts` allowlist |
+| Servers behind one NAT address use each other's grants or identity | Learning sessions and redirect grants keyed by server ID; invalid proxy credentials refused (407) instead of falling back to the address; groups with `require_proxy_token` are never identified by address |
 | Compromised server keeps communicating | Quarantine overrides every allow rule, TLS exception and learning session; Defender risk/isolation and SOAR playbooks can quarantine automatically |
 
 ## Residual risks and operator responsibilities
