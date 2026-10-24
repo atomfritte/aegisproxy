@@ -15,19 +15,26 @@ import (
 	"sync"
 )
 
-// spool is a durable FIFO of encoded records (append-only segment files + a read cursor). Records
-// are kept until the destination accepted them; the oldest segments are discarded when the size
-// limit is exceeded.
+// spool is a durable FIFO of records (append-only segment files + a read cursor). Records are kept
+// until the destination accepted them. When the size limit is exceeded the oldest segments are set
+// aside (evicted) for the runtime, which dead-letters their audit and security records.
+//
+// Records are destination independent: the event as JSON behind a marker byte, encoded for the
+// destination when it is sent, so a changed endpoint, format, index or source type keeps them.
+// Spools of earlier releases (signature "v1|…") hold records already encoded for the destination;
+// they stay as legacy records together with the encoding they were written in (legacyKey).
 type spool struct {
-	mu       sync.Mutex
-	dir      string
-	maxBytes int64
-	segs     []*segment
-	readSeq  uint64
-	readOff  int64
-	wf       *os.File
-	nextSeq  uint64
-	dropped  uint64
+	mu        sync.Mutex
+	dir       string
+	maxBytes  int64
+	segs      []*segment
+	readSeq   uint64
+	readOff   int64
+	wf        *os.File
+	nextSeq   uint64
+	unsynced  bool
+	legacyKey string    // encoding of records without marker byte ("" = unknown)
+	evicted   []evicted // segments set aside by the size limit, not yet processed
 }
 
 type segment struct {
@@ -36,9 +43,23 @@ type segment struct {
 	records int64 // records not yet consumed
 }
 
+// evicted is a segment file removed from the spool by the size limit; records before from had
+// already been delivered.
+type evicted struct {
+	path string
+	from int64
+}
+
+// Variables for tests.
+var (
+	segMaxBytes   int64 = 8 << 20
+	maxRecordSize       = 32 << 20 // audit lines are up to 16 MiB
+)
+
 const (
-	segMaxBytes   = 8 << 20
-	maxRecordSize = 4 << 20
+	spoolVersion = "v2"
+	eventMarker  = 0x00 // first byte of a destination independent record
+	legacyFile   = "legacy-encoding"
 )
 
 type spoolCursor struct {
@@ -48,36 +69,51 @@ type spoolCursor struct {
 
 func segName(seq uint64) string { return fmt.Sprintf("seg-%016d.dat", seq) }
 
-// openSpool opens (or creates) the spool in dir. A changed signature (record encoding) discards
-// the existing content.
-func openSpool(dir string, maxBytes int64, signature string) (*spool, int64, error) {
+// legacyEncoding is the encoding of records spooled by release 2.0 and earlier (signature "v1|…"
+// without the endpoint, which does not change the records).
+func legacyEncoding(signature string) string {
+	parts := strings.SplitN(signature, "|", 8)
+	if len(parts) != 8 || parts[0] != "v1" {
+		return ""
+	}
+	return strings.Join(parts[:7], "|")
+}
+
+// openSpool opens (or creates) the spool in dir. A spool of an earlier release is kept: its records
+// are marked as legacy records with the encoding they were written in.
+func openSpool(dir string, maxBytes int64) (*spool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	s := &spool{dir: dir, maxBytes: maxBytes}
-	var discarded int64
 	metaPath := filepath.Join(dir, "signature")
-	if old, err := os.ReadFile(metaPath); err == nil && string(old) != signature {
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "seg-") {
-				if fi, err := e.Info(); err == nil {
-					discarded += fi.Size()
-				}
-				_ = os.Remove(filepath.Join(dir, e.Name()))
-			}
+	if old, err := os.ReadFile(metaPath); err == nil && string(old) != spoolVersion {
+		if err := writeFileSync(filepath.Join(dir, legacyFile), []byte(legacyEncoding(string(old)))); err != nil {
+			return nil, err
 		}
-		_ = os.Remove(filepath.Join(dir, "cursor"))
 	}
-	if err := os.WriteFile(metaPath, []byte(signature), 0o600); err != nil {
-		return nil, 0, err
+	if err := writeFileSync(metaPath, []byte(spoolVersion)); err != nil {
+		return nil, err
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, legacyFile)); err == nil {
+		s.legacyKey = string(b)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	for _, e := range entries {
 		name := e.Name()
+		if strings.HasPrefix(name, "evict-") && strings.HasSuffix(name, ".dat") {
+			// Evicted before a crash, not yet dead-lettered.
+			parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, "evict-"), ".dat"), "-")
+			var from int64
+			if len(parts) == 2 {
+				from, _ = strconv.ParseInt(parts[1], 10, 64)
+			}
+			s.evicted = append(s.evicted, evicted{path: filepath.Join(dir, name), from: from})
+			continue
+		}
 		if !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".dat") {
 			continue
 		}
@@ -119,10 +155,44 @@ func openSpool(dir string, maxBytes int64, signature string) (*spool, int64, err
 		s.readSeq, s.readOff = s.nextSeq, 0
 	} else if s.segs[0].seq == cur.Seq {
 		s.readSeq, s.readOff = cur.Seq, cur.Off
-	} else if len(s.segs) > 0 {
+	} else {
 		s.readSeq, s.readOff = s.segs[0].seq, 0
 	}
-	return s, discarded, nil
+	return s, nil
+}
+
+// writeFileSync replaces a small file atomically and durably.
+func writeFileSync(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+// syncDir makes created and renamed directory entries durable (not supported on Windows, where
+// NTFS journals them).
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 }
 
 // countRecords counts complete records after offset start and truncates a torn tail.
@@ -144,7 +214,7 @@ func countRecords(path string, start int64) (int64, int64, error) {
 			break
 		}
 		l := int64(binary.BigEndian.Uint32(hdr[:]))
-		if l > maxRecordSize || off+4+l > fi.Size() {
+		if l > int64(maxRecordSize) || off+4+l > fi.Size() {
 			break
 		}
 		if _, err := r.Discard(int(l)); err != nil {
@@ -159,6 +229,34 @@ func countRecords(path string, start int64) (int64, int64, error) {
 		_ = f.Truncate(off) // torn write from a crash
 	}
 	return n, off, nil
+}
+
+// readSegment calls fn for every complete record of a segment file from offset from on.
+func readSegment(path string, from int64, fn func(rec []byte)) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Seek(from, io.SeekStart); err != nil {
+		return err
+	}
+	r := bufio.NewReaderSize(f, 1<<16)
+	var hdr [4]byte
+	for {
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			return nil
+		}
+		l := int(binary.BigEndian.Uint32(hdr[:]))
+		if l > maxRecordSize {
+			return nil
+		}
+		rec := make([]byte, l)
+		if _, err := io.ReadFull(r, rec); err != nil {
+			return nil
+		}
+		fn(rec)
+	}
 }
 
 func (s *spool) records() (int64, int64) {
@@ -177,13 +275,15 @@ func (s *spool) empty() bool {
 	return n == 0
 }
 
-// Append stores records at the tail.
-func (s *spool) Append(recs [][]byte) error {
+// Append stores records at the tail; with sync they are on stable storage when it returns. It
+// returns the indexes of records larger than maxRecordSize, which are not stored.
+func (s *spool) Append(recs [][]byte, sync bool) (oversize []int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, rec := range recs {
+	created := false
+	for i, rec := range recs {
 		if len(rec) > maxRecordSize {
-			s.dropped++
+			oversize = append(oversize, i)
 			continue
 		}
 		var tail *segment
@@ -192,6 +292,9 @@ func (s *spool) Append(recs [][]byte) error {
 		}
 		if tail == nil || tail.bytes >= segMaxBytes {
 			if s.wf != nil {
+				if s.unsynced {
+					_ = s.wf.Sync()
+				}
 				_ = s.wf.Close()
 				s.wf = nil
 			}
@@ -201,11 +304,12 @@ func (s *spool) Append(recs [][]byte) error {
 			if len(s.segs) == 1 {
 				s.readSeq, s.readOff = tail.seq, 0
 			}
+			created = true
 		}
 		if s.wf == nil {
 			f, err := os.OpenFile(filepath.Join(s.dir, segName(tail.seq)), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if err != nil {
-				return err
+				return oversize, err
 			}
 			s.wf = f
 		}
@@ -213,15 +317,26 @@ func (s *spool) Append(recs [][]byte) error {
 		binary.BigEndian.PutUint32(buf, uint32(len(rec)))
 		copy(buf[4:], rec)
 		if _, err := s.wf.Write(buf); err != nil {
-			return err
+			return oversize, err
 		}
+		s.unsynced = true
 		tail.bytes += int64(len(buf))
 		tail.records++
 	}
+	if sync && s.wf != nil && s.unsynced {
+		if err := s.wf.Sync(); err != nil {
+			return oversize, err
+		}
+		s.unsynced = false
+		if created {
+			syncDir(s.dir)
+		}
+	}
 	s.enforceLimitLocked()
-	return nil
+	return oversize, nil
 }
 
+// enforceLimitLocked sets the oldest segments aside while the spool exceeds its limit.
 func (s *spool) enforceLimitLocked() {
 	var total int64
 	for _, seg := range s.segs {
@@ -230,41 +345,59 @@ func (s *spool) enforceLimitLocked() {
 	for total > s.maxBytes && len(s.segs) > 1 {
 		old := s.segs[0]
 		total -= old.bytes
-		s.dropped += uint64(old.records)
-		_ = os.Remove(filepath.Join(s.dir, segName(old.seq)))
+		from := int64(0)
+		if old.seq == s.readSeq {
+			from = s.readOff
+		}
+		src := filepath.Join(s.dir, segName(old.seq))
+		dst := filepath.Join(s.dir, fmt.Sprintf("evict-%016d-%d.dat", old.seq, from))
+		if err := os.Rename(src, dst); err == nil {
+			s.evicted = append(s.evicted, evicted{path: dst, from: from})
+		} else {
+			_ = os.Remove(src)
+		}
 		s.segs = s.segs[1:]
 		s.readSeq, s.readOff = s.segs[0].seq, 0
 		s.saveCursorLocked()
 	}
 }
 
-type position struct {
-	seq      uint64
-	off      int64
-	consumed map[uint64]int64 // records consumed per segment
+// takeEvicted returns the segments set aside since the last call.
+func (s *spool) takeEvicted() []evicted {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev := s.evicted
+	s.evicted = nil
+	return ev
+}
+
+// peeked is a record read from the head of the spool, with its position.
+type peeked struct {
+	data []byte
+	seq  uint64
+	end  int64 // offset after the record in its segment
 }
 
 // Peek reads up to n records from the head without consuming them.
-func (s *spool) Peek(n int) ([][]byte, position, error) {
+func (s *spool) Peek(n int) ([]peeked, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pos := position{seq: s.readSeq, off: s.readOff, consumed: map[uint64]int64{}}
-	var out [][]byte
+	var out []peeked
 	for _, seg := range s.segs {
-		if seg.seq < pos.seq || len(out) >= n {
+		if seg.seq < s.readSeq || len(out) >= n {
 			continue
 		}
 		start := int64(0)
-		if seg.seq == pos.seq {
-			start = pos.off
+		if seg.seq == s.readSeq {
+			start = s.readOff
 		}
 		f, err := os.Open(filepath.Join(s.dir, segName(seg.seq)))
 		if err != nil {
-			return nil, pos, err
+			return nil, err
 		}
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			f.Close()
-			return nil, pos, err
+			return nil, err
 		}
 		r := bufio.NewReaderSize(f, 1<<16)
 		off := start
@@ -278,27 +411,34 @@ func (s *spool) Peek(n int) ([][]byte, position, error) {
 			if _, err := io.ReadFull(r, rec); err != nil {
 				break
 			}
-			out = append(out, rec)
 			off += 4 + int64(l)
-			pos.consumed[seg.seq]++
+			out = append(out, peeked{data: rec, seq: seg.seq, end: off})
 		}
 		f.Close()
-		pos.seq, pos.off = seg.seq, off
 	}
-	return out, pos, nil
+	return out, nil
 }
 
-// Commit consumes everything up to pos (returned by Peek).
-func (s *spool) Commit(pos position) {
+// Commit consumes recs, a prefix of what Peek returned.
+func (s *spool) Commit(recs []peeked) {
+	if len(recs) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	consumed := map[uint64]int64{}
+	for _, r := range recs {
+		consumed[r.seq]++
+	}
+	last := recs[len(recs)-1]
 	kept := s.segs[:0]
 	for i, seg := range s.segs {
-		seg.records -= pos.consumed[seg.seq]
-		if seg.seq < pos.seq || (seg.seq == pos.seq && pos.off >= seg.bytes) {
+		seg.records -= consumed[seg.seq]
+		if seg.seq < last.seq || (seg.seq == last.seq && last.end >= seg.bytes) {
 			if i == len(s.segs)-1 && s.wf != nil {
 				_ = s.wf.Close()
 				s.wf = nil
+				s.unsynced = false
 			}
 			_ = os.Remove(filepath.Join(s.dir, segName(seg.seq)))
 			continue
@@ -309,8 +449,8 @@ func (s *spool) Commit(pos position) {
 	switch {
 	case len(s.segs) == 0:
 		s.readSeq, s.readOff = s.nextSeq, 0
-	case s.segs[0].seq == pos.seq:
-		s.readSeq, s.readOff = pos.seq, pos.off
+	case s.segs[0].seq == last.seq:
+		s.readSeq, s.readOff = last.seq, last.end
 	default:
 		s.readSeq, s.readOff = s.segs[0].seq, 0
 	}
@@ -323,14 +463,6 @@ func (s *spool) saveCursorLocked() {
 	if err := os.WriteFile(tmp, b, 0o600); err == nil {
 		_ = os.Rename(tmp, filepath.Join(s.dir, "cursor"))
 	}
-}
-
-func (s *spool) takeDropped() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	d := s.dropped
-	s.dropped = 0
-	return d
 }
 
 func (s *spool) Close() error {

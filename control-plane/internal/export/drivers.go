@@ -45,13 +45,23 @@ type permanentError struct{ msg string }
 
 func (e *permanentError) Error() string { return e.msg }
 
-// partialError reports that some records of a batch were rejected permanently.
+// partialError reports that some records of a batch were rejected permanently (or set aside after
+// repeated missing acknowledgements). Records before retryFrom that are not rejected were delivered;
+// records from retryFrom on were not and are retried.
 type partialError struct {
-	rejected int
-	msg      string
+	rejected  map[int]string // index in the batch -> reason
+	retryFrom int
+	kind      string // alertRejected | alertUnacknowledged
+	msg       string
 }
 
 func (e *partialError) Error() string { return e.msg }
+
+// pendingError reports a batch the destination accepted whose confirmation is still outstanding: it
+// is retried soon (to keep polling), without the backoff of an unavailable destination.
+type pendingError struct{ msg string }
+
+func (e *pendingError) Error() string { return e.msg }
 
 func newDriver(cfg models.ExportSink, meta Meta, exportDir string) (driver, error) {
 	switch cfg.Type {
@@ -471,11 +481,17 @@ func (d *otlpDriver) send(ctx context.Context, recs [][]byte) error {
 type splunkDriver struct {
 	httpBase
 	channel string
+	// ackAttempts is the number of acknowledgement timeouts after which records are set aside
+	// (dead-lettered) instead of being resent once more.
+	ackAttempts int
 	// Progress of the batch being retried (a retry may have grown by records spooled meanwhile): its
 	// confirmed leading records are indexed, the pending ones after them await their acknowledgement.
 	mu        sync.Mutex
 	confirmed hecRecords
 	pending   *hecPending
+	unacked   hecRecords // records whose acknowledgement timed out (and that were resent since)
+	timeouts  int        // acknowledgement timeouts of unacked
+	ackOn     bool       // the token uses indexer acknowledgement (an ackId was returned)
 }
 
 // hecRecords identifies the first n records of a batch.
@@ -493,6 +509,12 @@ type hecPending struct {
 
 // splunkAckTimeout bounds the wait for an indexer acknowledgement; the batch is resent afterwards.
 var splunkAckTimeout = 2 * time.Minute
+
+// defaultHECAckAttempts is the number of acknowledgement timeouts after which records are set aside.
+const defaultHECAckAttempts = 5
+
+// errAckTimeout reports that the acknowledgement did not arrive within splunkAckTimeout of sending.
+var errAckTimeout = errors.New("acknowledgement timed out")
 
 func recordsOf(recs [][]byte) hecRecords {
 	h := sha256.New()
@@ -512,17 +534,9 @@ func (r hecRecords) leads(recs [][]byte) bool {
 	return r.n > 0 && len(recs) >= r.n && recordsOf(recs[:r.n]) == r
 }
 
-func (d *splunkDriver) clearPending(id int64) {
-	d.mu.Lock()
-	if d.pending != nil && d.pending.id == id {
-		d.pending = nil
-	}
-	d.mu.Unlock()
-}
-
 func (d *splunkDriver) reset() {
 	d.mu.Lock()
-	d.confirmed, d.pending = hecRecords{}, nil
+	d.confirmed, d.pending, d.unacked, d.timeouts = hecRecords{}, nil, hecRecords{}, 0
 	d.mu.Unlock()
 }
 
@@ -582,7 +596,9 @@ func (d *splunkDriver) encode(ev Event) ([]byte, error) {
 //
 // A delivery attempt is shorter than splunkAckTimeout. When it ends while an acknowledgement is still
 // outstanding, the retried batch is not posted again: the next attempts keep polling the same ackId,
-// and only an acknowledgement that does not arrive within splunkAckTimeout leads to a resend.
+// and only an acknowledgement that does not arrive within splunkAckTimeout leads to a resend. Records
+// that stay unacknowledged after ackAttempts resends are set aside (a *partialError rejecting them),
+// so that one record the indexers never confirm does not block the destination forever.
 func (d *splunkDriver) send(ctx context.Context, recs [][]byte) error {
 	hdr := map[string]string{"Authorization": "Splunk " + string(d.cfg.Secret), "X-Splunk-Request-Channel": d.channel}
 	target := endpointWithPath(d.cfg.Endpoint, "/services/collector/event")
@@ -592,8 +608,12 @@ func (d *splunkDriver) send(ctx context.Context, recs [][]byte) error {
 	}
 	skip, p := d.confirmed.n, d.pending
 	d.mu.Unlock()
-	if p != nil && time.Since(p.sentAt) < splunkAckTimeout && p.leads(recs[skip:]) {
-		if err := d.awaitAck(ctx, target, *p, hdr); err != nil {
+	if p != nil && p.leads(recs[skip:]) {
+		err := d.awaitAck(ctx, target, *p, hdr)
+		if errors.Is(err, errAckTimeout) {
+			return d.ackTimedOut(recs, skip, *p)
+		}
+		if err != nil {
 			return err
 		}
 		skip += p.n
@@ -612,25 +632,90 @@ func (d *splunkDriver) send(ctx context.Context, recs [][]byte) error {
 	}
 	var r struct {
 		AckID *int64 `json:"ackId"`
+		Code  *int   `json:"code"`
+		Text  string `json:"text"`
 	}
-	if json.Unmarshal(resp, &r) != nil || r.AckID == nil {
+	_ = json.Unmarshal(resp, &r)
+	d.mu.Lock()
+	ackOn := d.ackOn || r.AckID != nil
+	d.ackOn = ackOn
+	d.mu.Unlock()
+	if !ackOn {
 		d.reset()
 		return nil // indexer acknowledgement is disabled for this token
+	}
+	// The token acknowledges: a success without ackId (a proxy or a misrouted request) is no proof
+	// that the batch was indexed.
+	if r.AckID == nil || r.Code == nil || *r.Code != 0 {
+		code, ack := "none", "none"
+		if r.Code != nil {
+			code = strconv.Itoa(*r.Code)
+		}
+		if r.AckID != nil {
+			ack = strconv.FormatInt(*r.AckID, 10)
+		}
+		return fmt.Errorf("Splunk HEC: unconfirmed response (code %s, ackId %s: %s) although the token uses indexer acknowledgement; the batch will be resent",
+			code, ack, snippet([]byte(r.Text)))
 	}
 	p = &hecPending{hecRecords: recordsOf(rest), id: *r.AckID, sentAt: time.Now()}
 	d.mu.Lock()
 	d.pending = p
 	d.mu.Unlock()
 	if err := d.awaitAck(ctx, target, *p, hdr); err != nil {
+		if errors.Is(err, errAckTimeout) {
+			return d.ackTimedOut(recs, skip, *p)
+		}
 		return err
 	}
 	d.reset()
 	return nil
 }
 
+func (d *splunkDriver) attempts() int {
+	if d.ackAttempts > 0 {
+		return d.ackAttempts
+	}
+	return defaultHECAckAttempts
+}
+
+// ackTimedOut accounts an acknowledgement timeout of the pending records p (at offset skip of recs).
+// Records that timed out ackAttempts times in a row are rejected (set aside); otherwise the batch is
+// resent by the next attempt.
+func (d *splunkDriver) ackTimedOut(recs [][]byte, skip int, p hecPending) error {
+	pend := recs[skip : skip+p.n]
+	d.mu.Lock()
+	if d.pending != nil && d.pending.id == p.id {
+		d.pending = nil
+	}
+	if d.unacked.leads(pend) {
+		d.timeouts++
+	} else {
+		d.unacked, d.timeouts = recordsOf(pend), 1
+	}
+	n, timeouts := d.unacked.n, d.timeouts
+	giveUp := timeouts >= d.attempts()
+	if giveUp {
+		d.unacked, d.timeouts, d.confirmed = hecRecords{}, 0, hecRecords{}
+	}
+	d.mu.Unlock()
+	if !giveUp {
+		return fmt.Errorf("Splunk HEC: no indexer acknowledgement for ackId %d within %s on channel %s (%d of %d attempts); the batch will be resent",
+			p.id, splunkAckTimeout, d.channel, timeouts, d.attempts())
+	}
+	reason := fmt.Sprintf("Splunk HEC: no indexer acknowledgement after %d attempts (last ackId %d on channel %s, %s each)",
+		timeouts, p.id, d.channel, splunkAckTimeout)
+	rejected := make(map[int]string, n)
+	for i := skip; i < skip+n; i++ {
+		rejected[i] = reason
+	}
+	return &partialError{rejected: rejected, retryFrom: skip + n, kind: alertUnacknowledged,
+		msg: fmt.Sprintf("%d records set aside: %s", n, reason)}
+}
+
 // awaitAck polls /services/collector/ack until the batch is indexed. Without a confirmation within
-// splunkAckTimeout of sending, the batch is resent (at-least-once delivery, as Splunk recommends for
-// acknowledged HEC); when the attempt's context ends first, the acknowledgement stays pending.
+// splunkAckTimeout of sending it returns errAckTimeout (the batch is resent: at-least-once delivery,
+// as Splunk recommends for acknowledged HEC); when the attempt's context ends first, the
+// acknowledgement stays pending.
 func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, p hecPending, hdr map[string]string) error {
 	id := p.id
 	u, err := url.Parse(eventURL)
@@ -655,18 +740,22 @@ func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, p hecPendi
 				Acks map[string]bool `json:"acks"`
 			}
 			if json.Unmarshal(resp, &r) == nil && r.Acks[key] {
-				d.clearPending(id)
+				d.mu.Lock()
+				if d.pending != nil && d.pending.id == id {
+					d.pending = nil
+				}
+				d.unacked, d.timeouts = hecRecords{}, 0
+				d.mu.Unlock()
 				return nil
 			}
 		}
 		if time.Now().After(deadline) {
-			d.clearPending(id)
-			return fmt.Errorf("Splunk HEC: no indexer acknowledgement for ackId %d within %s on channel %s; the batch will be resent", id, splunkAckTimeout, d.channel)
+			return errAckTimeout
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("Splunk HEC: indexer acknowledgement for ackId %d on channel %s still outstanding after %s; polling again before resending",
-				id, d.channel, time.Since(p.sentAt).Round(time.Second))
+			return &pendingError{fmt.Sprintf("Splunk HEC: indexer acknowledgement for ackId %d on channel %s still outstanding after %s; polling again before resending",
+				id, d.channel, time.Since(p.sentAt).Round(time.Second))}
 		case <-time.After(wait):
 		}
 		if wait < 5*time.Second {
@@ -719,18 +808,24 @@ func (d *elasticDriver) send(ctx context.Context, recs [][]byte) error {
 	if err := json.Unmarshal(body, &res); err != nil || !res.Errors {
 		return nil
 	}
-	rejected, retry := 0, false
+	// Items answer the records in order. Throttled items retry the whole batch: documents carry their
+	// _id, so the ones already created come back as 409 (counted as delivered).
+	rejected, retry := map[int]string{}, false
 	msg := ""
-	for _, item := range res.Items {
+	for i, item := range res.Items {
 		for _, r := range item {
 			switch {
 			case r.Status < 300 || r.Status == http.StatusConflict:
 			case r.Status == http.StatusTooManyRequests || r.Status >= 500:
 				retry = true
-			default:
-				rejected++
-				if msg == "" && r.Error != nil {
-					msg = r.Error.Type + ": " + r.Error.Reason
+			case i < len(recs):
+				reason := fmt.Sprintf("HTTP %d", r.Status)
+				if r.Error != nil {
+					reason = snippet([]byte(r.Error.Type + ": " + r.Error.Reason))
+				}
+				rejected[i] = reason
+				if msg == "" {
+					msg = reason
 				}
 			}
 		}
@@ -738,8 +833,9 @@ func (d *elasticDriver) send(ctx context.Context, recs [][]byte) error {
 	if retry {
 		return errors.New("bulk request partially throttled (429/5xx); retrying")
 	}
-	if rejected > 0 {
-		return &partialError{rejected: rejected, msg: fmt.Sprintf("%d documents rejected: %s", rejected, msg)}
+	if len(rejected) > 0 {
+		return &partialError{rejected: rejected, retryFrom: len(recs), kind: alertRejected,
+			msg: fmt.Sprintf("%d documents rejected: %s", len(rejected), msg)}
 	}
 	return nil
 }

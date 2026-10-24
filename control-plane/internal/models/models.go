@@ -1091,10 +1091,15 @@ type ExportSinkStatus struct {
 	Dropped      uint64 `json:"dropped"`
 	// DiscardedBatches counts batches the destination rejected permanently (4xx); sinks carrying audit
 	// or security records keep them in dead-letter.jsonl in their spool directory.
-	DiscardedBatches uint64     `json:"discarded_batches"`
-	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
-	LastError        string     `json:"last_error,omitempty"`
-	LastErrorAt      *time.Time `json:"last_error_at,omitempty"`
+	DiscardedBatches uint64 `json:"discarded_batches"`
+	// DeadLettered counts records set aside in dead-letter.jsonl (rejected, never acknowledged,
+	// evicted by the spool limit or no longer encodable).
+	DeadLettered uint64 `json:"dead_lettered"`
+	// Replayed counts audit records re-read from the audit trail after a restart (crash recovery).
+	Replayed      uint64     `json:"replayed"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
 }
 
 // PolicySetDocument is the portable representation of a policy set (policy as code).
