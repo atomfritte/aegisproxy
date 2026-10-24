@@ -49,22 +49,32 @@ func (s *Store) planImportLocked(doc models.PolicySetDocument, actor *auth.Token
 		res.Action, res.Error = "error", "kind must be standard or baseline"
 		return res, -1, doc.PolicySetSpec
 	}
+	// Sets outside the actor's view do not exist for the import (no IDs, names or scopes leak).
 	idx := -1
 	if doc.ID != "" {
-		idx = s.setIndexLocked(doc.ID)
+		if i := s.setIndexLocked(doc.ID); i >= 0 && s.setVisibleLocked(actor, &s.state.PolicySets[i]) {
+			idx = i
+		}
 	}
 	if idx < 0 { // match by name (sets created on another installation)
-		for i, set := range s.state.PolicySets {
-			if strings.EqualFold(set.Name, strings.TrimSpace(doc.Name)) {
-				idx = i
-				break
+		for i := range s.state.PolicySets {
+			set := &s.state.PolicySets[i]
+			if !strings.EqualFold(set.Name, strings.TrimSpace(doc.Name)) {
+				continue
 			}
+			if !s.setVisibleLocked(actor, set) {
+				res.ID, res.Action, res.Error = "", "error", fmt.Sprintf("a policy set named %q already exists; rename the set in the bundle", strings.TrimSpace(doc.Name))
+				return res, -1, doc.PolicySetSpec
+			}
+			idx = i
+			break
 		}
 	}
 	spec := cloneSpec(doc.PolicySetSpec)
 	if idx >= 0 {
 		set := s.state.PolicySets[idx]
 		res.ID = set.ID
+		sanitizeClientRulesLocked(&set, &spec)
 		if set.Kind != doc.Kind {
 			res.Action, res.Error = "error", fmt.Sprintf("existing set %q is %s, document says %s", set.Name, set.Kind, doc.Kind)
 			return res, idx, spec
@@ -74,6 +84,10 @@ func (s *Store) planImportLocked(doc models.PolicySetDocument, actor *auth.Token
 			return res, idx, spec
 		}
 		if err := s.canManageSetLocked(actor, set.Kind, set.PolicySetSpec, spec); err != nil {
+			res.Action, res.Error = "error", err.Error()
+			return res, idx, spec
+		}
+		if err := s.checkDraftGuardrailsLocked(&set, spec, actor); err != nil {
 			res.Action, res.Error = "error", err.Error()
 			return res, idx, spec
 		}
@@ -89,6 +103,8 @@ func (s *Store) planImportLocked(doc models.PolicySetDocument, actor *auth.Token
 		}
 		return res, idx, spec
 	}
+	res.ID = "" // a new set gets a new ID (also when the document's ID belongs to a set the actor cannot see)
+	sanitizeClientRulesLocked(nil, &spec)
 	if err := s.canManageSetLocked(actor, doc.Kind, spec); err != nil {
 		res.Action, res.Error = "error", err.Error()
 		return res, -1, spec
@@ -143,7 +159,7 @@ func (s *Store) ImportPolicySets(bundle models.PolicySetBundle, dryRun bool, act
 				if kind == "" {
 					kind = models.PolicySetKindStandard
 				}
-				i, err := s.createSetLocked(kind, st.doc.PolicySetSpec, actor)
+				i, err := s.createSetLocked(kind, st.spec, actor)
 				if err != nil {
 					return err
 				}

@@ -655,6 +655,8 @@ export interface ImpactSample {
   before: string;
   after: string;
   rule_name?: string;
+  server_id?: string;
+  group_ids?: string[];
 }
 
 export interface ImpactSummary {
@@ -698,6 +700,8 @@ export interface ChangeRequest {
   decided_by?: string;
   decided_at?: string;
   published_version?: number;
+  /** Set when the change carries the approval of an access request that needs four-eyes review. */
+  access_request_id?: string;
 }
 
 export interface GovernanceSettings {
@@ -1028,6 +1032,8 @@ export interface AccessRequest {
   expires_at?: string;
   revoked_by?: string;
   revoked_at?: string;
+  /** Change requests carrying an approval that awaits four-eyes review (the request stays pending). */
+  change_request_ids?: string[] | null;
 }
 
 export interface ReviewAccessRequestBody {

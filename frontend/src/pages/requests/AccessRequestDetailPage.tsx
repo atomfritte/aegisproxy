@@ -124,6 +124,20 @@ const RequestDetail: React.FC<{ request: AccessRequest }> = ({ request: r }) => 
       <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="min-w-0 space-y-6">
           <FactsCard request={r} />
+          {r.status === 'pending' && (r.change_request_ids?.length ?? 0) > 0 && (
+            <Callout tone="info" title="Approval in four-eyes review">
+              The approval was submitted as change request{' '}
+              {(r.change_request_ids ?? []).map((id, i) => (
+                <React.Fragment key={id}>
+                  {i > 0 && ', '}
+                  <Link to={`/changes/${encodeURIComponent(id)}`} className="font-medium text-accent hover:underline">
+                    {id}
+                  </Link>
+                </React.Fragment>
+              ))}
+              . Access is granted when another reviewer approves it; rejecting the request withdraws it.
+            </Callout>
+          )}
           {r.status === 'pending' ? (
             can ? (
               <ReviewPanel request={r} />

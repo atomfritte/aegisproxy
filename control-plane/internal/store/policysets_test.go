@@ -18,6 +18,8 @@ import (
 var (
 	infosecClaims = &auth.TokenClaims{UserID: "u-is", Username: "infosec", Role: models.RoleInfoSecApprover, AllowedGroups: []string{"*"}}
 	teamLeadCI    = &auth.TokenClaims{UserID: "u-tl", Username: "tl", Role: models.RoleTeamLead, AllowedGroups: []string{"grp-ci"}}
+	teamLeadCI2   = &auth.TokenClaims{UserID: "u-tl2", Username: "tl2", Role: models.RoleTeamLead, AllowedGroups: []string{"grp-ci"}}
+	teamLeadVault = &auth.TokenClaims{UserID: "u-tlv", Username: "tlv", Role: models.RoleTeamLead, AllowedGroups: []string{"grp-vault"}}
 	auditorClaims = &auth.TokenClaims{UserID: "u-au", Username: "auditor", Role: models.RoleAuditorOperator}
 )
 
@@ -60,8 +62,11 @@ func TestPolicySetFourEyesLifecycle(t *testing.T) {
 	if _, err := st.ReviewChangeRequest(cr.ID, "approve", "lgtm", adminClaims); err == nil {
 		t.Fatal("author approved own change request")
 	}
-	if _, err := st.ReviewChangeRequest(cr.ID, "comment", "please double-check the path", auditorClaims); err != nil {
-		t.Fatalf("auditor comment: %v", err)
+	if _, err := st.ReviewChangeRequest(cr.ID, "comment", "please double-check the path", auditorClaims); err == nil {
+		t.Fatal("auditor (read-only) commented on a change request")
+	}
+	if _, err := st.ReviewChangeRequest(cr.ID, "comment", "please double-check the path", infosecClaims); err != nil {
+		t.Fatalf("infosec comment: %v", err)
 	}
 	if _, err := st.ReviewChangeRequest(cr.ID, "approve", "lgtm", auditorClaims); err == nil {
 		t.Fatal("auditor approved a change request")
@@ -136,6 +141,74 @@ func TestTeamLeadCannotTouchGuardrailsInSets(t *testing.T) {
 	spec3.Rules[0].HostPattern = "example.com"
 	if _, err := st.SaveDraft(set.ID, spec3, teamLeadCI); err == nil {
 		t.Fatal("team lead modified a BLOCK guardrail")
+	}
+	// Turning the guardrail into an ALLOW rule, or touching any of its matching fields, is refused.
+	for name, mutate := range map[string]func(r *models.PolicyRule){
+		"action":   func(r *models.PolicyRule) { r.Action = "ALLOW" },
+		"path":     func(r *models.PolicyRule) { r.PathPattern = "/nothing/**" },
+		"methods":  func(r *models.PolicyRule) { r.Methods = []string{"DELETE"} },
+		"enabled":  func(r *models.PolicyRule) { r.Enabled = false },
+		"expiry":   func(r *models.PolicyRule) { exp := time.Now().Add(time.Hour); r.ExpiresAt = &exp },
+		"redirect": func(r *models.PolicyRule) { r.FollowRedirects = true },
+	} {
+		sp := cloneSpec(set.PolicySetSpec)
+		mutate(&sp.Rules[0])
+		if _, err := st.SaveDraft(set.ID, sp, teamLeadCI); err == nil || !strings.Contains(err.Error(), "guardrail") {
+			t.Errorf("team lead changed the guardrail's %s: %v", name, err)
+		}
+	}
+	// Re-scoping the set (and with it the guardrail) is refused as well.
+	scoped := cloneSpec(set.PolicySetSpec)
+	scoped.GroupIDs, scoped.ServerIDs = []string{}, []string{"srv-ci-1"}
+	if _, err := st.SaveDraft(set.ID, scoped, teamLeadCI); err == nil {
+		t.Fatal("team lead re-scoped the guardrail")
+	}
+	if res := evalCI(st, "pastebin.com", "/raw/x"); res.Allowed {
+		t.Fatalf("guardrail lost: %+v", res)
+	}
+
+	// Four-eyes with two Team Leads: InfoSec drafts BLOCK -> ALLOW; neither Team Lead may submit or
+	// approve that change, so the guardrail stays published.
+	gov := st.Governance()
+	gov.RequirePolicyReview = true
+	if _, err := st.UpdateGovernance(gov, adminClaims); err != nil {
+		t.Fatal(err)
+	}
+	flip := cloneSpec(set.PolicySetSpec)
+	flip.Rules[0].Action = "ALLOW"
+	if _, err := st.SaveDraft(set.ID, flip, infosecClaims); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SubmitChangeRequest(set.ID, "", "", teamLeadCI); err == nil || !strings.Contains(err.Error(), "guardrail") {
+		t.Fatalf("team lead submitted a guardrail flip: %v", err)
+	}
+	cr, err := st.SubmitChangeRequest(set.ID, "", "", infosecClaims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range []*auth.TokenClaims{teamLeadCI, teamLeadCI2} {
+		if _, err := st.ReviewChangeRequest(cr.ID, "approve", "lgtm", tl); err == nil || !strings.Contains(err.Error(), "guardrail") {
+			t.Fatalf("team lead %s approved a guardrail flip: %v", tl.Username, err)
+		}
+	}
+	if err := st.WithdrawChangeRequest(cr.ID, infosecClaims); err != nil {
+		t.Fatal(err)
+	}
+	// A guardrail InfoSec added to the draft only (not yet published) is protected the same way.
+	draftOnly := cloneSpec(set.PolicySetSpec)
+	draftOnly.Rules = append(draftOnly.Rules, models.PolicyRule{Name: "deny transfer", Action: "BLOCK", HostPattern: "transfer.sh", PathPattern: "/**", Enabled: true})
+	saved, err := st.SaveDraft(set.ID, draftOnly, infosecClaims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamper := cloneSpec(saved.Draft.Spec)
+	tamper.Rules[len(tamper.Rules)-1].Action = "ALLOW"
+	if _, err := st.SaveDraft(set.ID, tamper, teamLeadCI); err == nil || !strings.Contains(err.Error(), "guardrail") {
+		t.Fatalf("team lead flipped a drafted guardrail: %v", err)
+	}
+	tamper.Rules = tamper.Rules[:len(tamper.Rules)-1]
+	if _, err := st.SaveDraft(set.ID, tamper, teamLeadCI); err == nil || !strings.Contains(err.Error(), "guardrail") {
+		t.Fatalf("team lead dropped a drafted guardrail: %v", err)
 	}
 	if _, err := st.CreatePolicySet(models.PolicySetKindBaseline, models.PolicySetSpec{Name: "x", Enabled: true}, teamLeadCI); err == nil {
 		t.Fatal("team lead created a baseline set")

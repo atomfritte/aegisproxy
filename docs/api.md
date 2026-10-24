@@ -84,8 +84,8 @@ JSON field names follow the Go models in `control-plane/internal/models/models.g
 | Method | Path | Role | Description |
 |---|---|---|---|
 | GET | `/api/state[?exclude_flows=1]` | any | complete console state: `groups`, `servers` (with `effective_group_ids`, `labels`, quarantine fields), `rules` (effective, compiled from policy sets), `policy_sets`, `change_requests`, `governance`, `block_pages`, `requests`, `sessions`, `tls_bypass`, `users`, `audit_events`, `security`, `bandwidth`, `stats`, `overview` (work-queue counters), `data_planes`, `proxy_address`, `me` |
-| GET | `/api/flows/stream` | any | Server-Sent Events: live flows; `event: session_expired` |
-| POST | `/api/simulate/request` | any | side-effect-free policy simulation `{server_ip, proxy_auth_user, method, full_url}` |
+| GET | `/api/flows/stream` | any | Server-Sent Events: live flows (Team Leads: their groups); the session and its role/groups are re-checked every minute, `event: session_expired` when it ends |
+| POST | `/api/simulate/request` | any | side-effect-free policy simulation `{server_ip, proxy_auth_user, method, full_url}`; Team Leads only for servers of their groups (other or unknown sources → 404) |
 
 `overview` counters: `pending_requests`, `overdue_requests`, `assigned_to_me`, `open_change_requests`,
 `changes_to_review`, `recertification_overdue`, `recertification_due_soon`, `drafts`, `quarantined_servers`,
@@ -105,10 +105,10 @@ the set's assignment applies. Editing happens in a **draft**; publishing creates
 | GET | `/api/policy-sets` | any | all sets with computed `review_due_at`, `review_state` (`ok`/`due_soon`/`overdue`) |
 | POST | `/api/policy-sets` | scoped | create `{kind, spec}` → set whose content is in `draft` (version 0 = never published) |
 | GET | `/api/policy-sets/export[?id=…&id=…]` | any | policy-as-code bundle `{format: "aegisproxy.policy-sets/v1", exported_at, exported_by, policy_sets[{id, kind, …spec}]}` (published content) |
-| POST | `/api/policy-sets/import` | scoped | `{dry_run, bundle}` → `{results[{id, name, action: create|update|unchanged|skip|error, diff, error}]}`; sets are matched by id, then by name; changes land in **drafts** (publish or submit them as usual); all-or-nothing (422 with per-set errors); approvals sets are skipped |
+| POST | `/api/policy-sets/import` | scoped | `{dry_run, bundle}` → `{results[{id, name, action: create|update|unchanged|skip|error, diff, error}]}`; sets are matched by id, then by name (sets the caller cannot see are never matched); rule attribution in the bundle is ignored; changes land in **drafts** (publish or submit them as usual); all-or-nothing (422 with per-set errors); approvals sets are skipped |
 | GET | `/api/policy-sets/{id}` | any | `{policy_set, versions, change_requests, draft_diff}` |
 | DELETE | `/api/policy-sets/{id}?reason=` | InfoSec | delete (versions are kept) |
-| PUT | `/api/policy-sets/{id}/draft` | scoped | replace the draft `{spec}`; 400 while the draft is in review |
+| PUT | `/api/policy-sets/{id}/draft` | scoped | replace the draft `{spec}`; 400 while the draft is in review. `created_by`, `created_at`, `approved_by`, `access_request_id` and `source_session_id` of rules are set by the server (client values are ignored) |
 | DELETE | `/api/policy-sets/{id}/draft` | scoped | discard the draft |
 | POST | `/api/policy-sets/{id}/publish` | scoped | `{comment, emergency}` publish the draft. 409 when four-eyes review is required; `emergency: true` is allowed for Super Admins with a justification (≥ 10 characters) |
 | POST | `/api/policy-sets/{id}/submit` | scoped | `{title, description}` → change request (draft is locked until decided) |
@@ -134,8 +134,8 @@ Diff: `{metadata[] (changed set fields), rules[{op: added|removed|modified, rule
 | Method | Path | Role | Description |
 |---|---|---|---|
 | GET | `/api/change-requests[?status=open]` | any | newest first |
-| GET | `/api/change-requests/{id}` | any | incl. `spec`, `diff`, `impact`, `reviews[]` |
-| POST | `/api/change-requests/{id}/review` | scoped | `{decision: approve|reject|comment, comment}`. Approval publishes the change. The author — and whoever last edited the draft — cannot approve. Auditors may comment. 409 + `change_request` when the set changed meanwhile (status `superseded`) |
+| GET | `/api/change-requests/{id}` | any | incl. `spec`, `diff`, `impact`, `reviews[]`, `access_request_id` (approval of an access request in four-eyes review). Team Leads get `impact` counters and samples of their own groups only (also in `/api/state` and `GET /api/policy-sets/{id}`) |
+| POST | `/api/change-requests/{id}/review` | scoped | `{decision: approve|reject|comment, comment}`. Approval publishes the change. The author — and whoever last edited the draft — cannot approve. Every decision, `comment` included, needs the rights to manage the set (Auditors are read-only). 409 + `change_request` when the set changed meanwhile (status `superseded`); access-request change requests are rebased instead and grant the request on approval |
 | POST | `/api/change-requests/{id}/withdraw` | author / InfoSec | unlocks the draft |
 | GET · PUT | `/api/settings/governance` | any · InfoSec | `{require_policy_review, request_sla_hours, default_review_interval_days, max_temporary_access_days, daily_digest, prune_expired_after_days, last_digest_at (read-only)}` |
 
@@ -145,11 +145,11 @@ Diff: `{metadata[] (changed set fields), rules[{op: added|removed|modified, rule
 |---|---|---|---|
 | GET | `/api/requests` | any | newest first; filters `status` (`pending`, `approved`, `rejected`, `revoked`, …), `assigned_to`, `server_id`, `group_id`, `overdue=true` (pending and past `due_at`), `limit` (default 500, max 5000) → `{requests, total}` (`total` = matches before `limit`) |
 | GET | `/api/requests/{id}` | any | one request incl. comments; 404 when unknown |
-| POST | `/api/requests/{id}/review` | scoped | `{approve, comment, host_pattern?, path_pattern?, follow_redirects, target_group_ids?, duration?, methods?}` → `{request, rules}`. Approval adds one rule per target group to that group's approvals set. Durations: `1h 8h 24h 7d 30d 90d permanent`; Team Leads are limited to `max_temporary_access_days` and cannot grant permanent access |
+| POST | `/api/requests/{id}/review` | scoped | `{approve, comment, host_pattern?, path_pattern?, follow_redirects, target_group_ids?, duration?, methods?}` → `{request, rules}`. Approval adds one rule per target group to that group's approvals set. Durations: `1h 8h 24h 7d 30d 90d permanent`; Team Leads are limited to `max_temporary_access_days` and cannot grant permanent access. The reviewer must be allowed to act for the request's own groups and every target group. With `require_policy_review`, an approval below InfoSec of an unattested request or with changes (patterns, extra methods, longer duration, redirects, other groups) opens one change request per target group instead (`rules` empty; the request stays `pending` with `change_request_ids`) |
 | POST | `/api/requests/bulk-review` | scoped | `{ids[], approve, comment}` → `{results[{id, status?, error?}]}` (requested scope/duration) |
 | POST | `/api/requests/{id}/comments` | scoped | `{text}` |
 | POST | `/api/requests/{id}/assign` | scoped | `{assignee}` (username, `""` = unassign; must be able to approve the request) |
-| POST | `/api/requests/{id}/extend` | scoped | `{duration}` new expiry for an approved request |
+| POST | `/api/requests/{id}/extend` | scoped | `{duration}` new expiry for an approved request; with `require_policy_review`, Team Leads can extend to at most `max_temporary_access_days` after the original approval |
 | POST | `/api/requests/{id}/revoke` | scoped | `{reason}` removes the granted rules (status `revoked`) |
 
 Request fields added in 2.1: `assigned_to`, `due_at` (SLA), `comments[]`, `created_rule_ids[]`, `expires_at`, `revoked_by`, `revoked_at`.
@@ -279,7 +279,11 @@ sessions immediately. Details and IdP setup: [identity.md](identity.md#scim-prov
 | POST | `/api/security/lookup` | any | `{value}` → matches across all sources |
 
 "scoped": Super Admin / InfoSec for all groups, Team Lead for the assigned groups (no BLOCK rules, no
-catch-all hosts, no baseline sets, unchanged guardrails of other roles stay untouchable).
+catch-all hosts, no baseline sets, unchanged guardrails of other roles stay untouchable). Objects outside a
+Team Lead's groups answer 404 exactly like unknown ones, before any RBAC detail: policy sets and change
+requests (reads, drafts, publish, submit, simulate, rollback, recertify, review, withdraw), access requests
+(read, review, bulk review, comment, assign, revoke, extend), servers (effective policy, quarantine) and the
+request simulator.
 
 Removed in 2.1: `POST /api/rules`, `DELETE /api/rules/{id}` and `POST /api/audit/{id}/rollback` — rules are
 edited through policy sets; rollback uses policy set versions.
