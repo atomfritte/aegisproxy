@@ -167,6 +167,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	defer attempt.Release() // no-op once resolved; never leaks a reservation
 	user, err := s.store.AuthenticateLocal(body.Username, body.Password)
+	if errors.Is(err, store.ErrAuditUnavailable) {
+		// Correct break-glass password, but its audit event cannot be written: no unaudited emergency access.
+		s.metrics.Inc("aegis_login_total", "result", "audit_unavailable")
+		s.log.Error("break-glass login refused: the audit log cannot be written", "username", truncateForLog(body.Username), "client_ip", ip)
+		writeError(w, http.StatusServiceUnavailable, "Sign-in refused: the audit log cannot be written. Restore audit log storage and try again.")
+		return
+	}
 	if err != nil {
 		attempt.Fail()
 		s.metrics.Inc("aegis_login_total", "result", "failure")
