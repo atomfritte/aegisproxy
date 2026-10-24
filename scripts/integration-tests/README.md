@@ -19,6 +19,12 @@ export LA_WORKSPACE_ID=…            # optional: wait until the record is query
 python3 -I scripts/integration-tests/live_microsoft.py
 ```
 
-The GitHub workflow `.github/workflows/live-integration.yml` runs the same script weekly or on demand with the
-secrets of the `staging` environment. Splunk HEC, Datadog, MISP, TAXII, Keycloak, c-icap/ClamAV and the SIEM
-collectors are covered by the end-to-end tests in [`docs/testing.md`](../../docs/testing.md).
+The GitHub workflow `.github/workflows/live-integration.yml` runs the Sentinel part weekly or on demand
+**without any stored secret**: it starts a control-plane on the runner, which authenticates with the runner's
+GitHub OIDC token (`SENTINEL_AUTH=workload_identity`, `AZURE_FEDERATED_TOKEN_FILE`) through a federated
+credential whose subject names the default branch (`repo:atomfritte/aegisproxy:ref:refs/heads/aegisproxy-2.1`),
+so a workflow pushed to another branch cannot obtain Azure tokens. The Defender for Endpoint integration
+authenticates with a client secret only; repository secrets are readable by any pushed workflow when
+environments cannot be protected, so run the Defender part from an administrator workstation as shown above.
+Splunk HEC, Datadog, MISP, TAXII, Keycloak, c-icap/ClamAV and the SIEM collectors are covered by the
+end-to-end tests in [`docs/testing.md`](../../docs/testing.md).

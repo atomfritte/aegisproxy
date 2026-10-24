@@ -17,6 +17,9 @@ Microsoft Defender for Endpoint (skipped when DEFENDER_CLIENT_ID is unset):
 Microsoft Sentinel / Azure Monitor Logs Ingestion (skipped when SENTINEL_DCE is unset):
   SENTINEL_DCE (logs ingestion endpoint), SENTINEL_DCR_ID (immutable id), SENTINEL_STREAM (Custom-AegisProxy_CL),
   SENTINEL_CLIENT_ID / SENTINEL_CLIENT_SECRET (Monitoring Metrics Publisher on the DCR; defaults to the Defender app)
+  SENTINEL_AUTH=workload_identity: no client secret; the control-plane exchanges the token in
+  AZURE_FEDERATED_TOKEN_FILE (e.g. a GitHub OIDC token, see .github/workflows/live-integration.yml) for the app
+  SENTINEL_CLIENT_ID / AZURE_CLIENT_ID in AZURE_TENANT_ID; the KQL check below uses the same assertion.
   Optional end-to-end check that the record arrived: LA_WORKSPACE_ID plus LA_CLIENT_ID / LA_CLIENT_SECRET with
   Log Analytics Reader on the workspace (defaults to the Sentinel app). Ingestion can take up to 15 minutes.
   SENTINEL_CA_FILE: optional CA bundle when the ingestion endpoint is reached through a TLS-inspecting proxy.
@@ -79,6 +82,17 @@ def azure_token(tenant, client_id, secret, scope, authority="https://login.micro
         return json.loads(r.read())["access_token"]
 
 
+def azure_token_federated(tenant, client_id, assertion_file, scope, authority="https://login.microsoftonline.com"):
+    """Client credentials with a federated assertion (workload identity): no stored secret."""
+    assertion = open(assertion_file, encoding="utf-8").read().strip()
+    body = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": client_id, "scope": scope,
+                                   "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                                   "client_assertion": assertion}).encode()
+    req = urllib.request.Request(f"{authority.rstrip('/')}/{tenant}/oauth2/v2.0/token", data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())["access_token"]
+
+
 def defender(aegis):
     tenant, client, secret = env("AZURE_TENANT_ID"), env("DEFENDER_CLIENT_ID"), env("DEFENDER_CLIENT_SECRET")
     cfg = {"enabled": True, "tenant_id": tenant, "client_id": client, "client_secret": secret,
@@ -108,12 +122,15 @@ def defender(aegis):
 
 def sentinel(aegis):
     tenant = env("AZURE_TENANT_ID")
-    client = env("SENTINEL_CLIENT_ID") or env("DEFENDER_CLIENT_ID")
-    secret = env("SENTINEL_CLIENT_SECRET") or env("DEFENDER_CLIENT_SECRET")
+    auth = env("SENTINEL_AUTH", "client_secret")
+    client = env("SENTINEL_CLIENT_ID") or env("AZURE_CLIENT_ID") or env("DEFENDER_CLIENT_ID")
+    secret = "" if auth != "client_secret" else env("SENTINEL_CLIENT_SECRET") or env("DEFENDER_CLIENT_SECRET")
     marker = "aegis-live-" + uuid.uuid4().hex[:12]
     sink = {"name": "Live test " + marker, "type": "sentinel", "enabled": True, "streams": ["audit"], "endpoint": env("SENTINEL_DCE"),
             "dcr_immutable_id": env("SENTINEL_DCR_ID"), "stream_name": env("SENTINEL_STREAM", "Custom-AegisProxy_CL"),
-            "azure_auth": "client_secret", "tenant_id": tenant, "client_id": client, "secret": secret, "flush_seconds": 1}
+            "azure_auth": auth, "tenant_id": tenant, "client_id": client, "flush_seconds": 1}
+    if secret:
+        sink["secret"] = secret
     if env("SENTINEL_AUTHORITY") or env("AZURE_AUTHORITY"):
         sink["authority_url"] = env("SENTINEL_AUTHORITY") or env("AZURE_AUTHORITY")
     if env("SENTINEL_CA_FILE"):  # TLS-inspecting egress proxies / private endpoints with a corporate CA
@@ -134,7 +151,11 @@ def sentinel(aegis):
             break
     check("Sentinel: live audit records delivered (sent > 0, no error)", status.get("sent", 0) > 0 and not status.get("last_error"), status)
     if env("LA_WORKSPACE_ID"):
-        token = azure_token(tenant, env("LA_CLIENT_ID") or client, env("LA_CLIENT_SECRET") or secret, "https://api.loganalytics.io/.default")
+        if auth == "workload_identity":
+            token = azure_token_federated(tenant, env("LA_CLIENT_ID") or client, env("AZURE_FEDERATED_TOKEN_FILE"),
+                                          "https://api.loganalytics.io/.default")
+        else:
+            token = azure_token(tenant, env("LA_CLIENT_ID") or client, env("LA_CLIENT_SECRET") or secret, "https://api.loganalytics.io/.default")
         table = env("SENTINEL_STREAM", "Custom-AegisProxy_CL").removeprefix("Custom-")
         query = f'{table} | where TimeGenerated > ago(1h) | where tostring(Message) has "{marker}" or tostring(Data) has "{marker}" | take 1'
         found = False

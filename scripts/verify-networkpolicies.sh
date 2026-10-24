@@ -20,8 +20,13 @@ trap cleanup EXIT
 $K create ns "$PROBE_NS" >/dev/null
 $K -n "$PROBE_NS" run "np-probe-$$" --image="$IMG" --restart=Never --command -- sleep 600 >/dev/null
 $K -n "$NS" run "np-probe-$$" --image="$IMG" --restart=Never --command -- sleep 600 >/dev/null
+# A pod outside kube-system that carries the cluster DNS label must not become a DNS (port 53) destination.
+$K -n "$PROBE_NS" run "np-fake-dns-$$" --image="$IMG" --restart=Never --labels=k8s-app=kube-dns --command -- \
+    sh -c 'while true; do nc -l -p 53 >/dev/null 2>&1; done' >/dev/null
 $K -n "$PROBE_NS" wait --for=condition=Ready "pod/np-probe-$$" --timeout=180s >/dev/null || { echo "probe pod not ready"; exit 2; }
 $K -n "$NS" wait --for=condition=Ready "pod/np-probe-$$" --timeout=180s >/dev/null || { echo "probe pod not ready"; exit 2; }
+$K -n "$PROBE_NS" wait --for=condition=Ready "pod/np-fake-dns-$$" --timeout=180s >/dev/null || { echo "probe pod not ready"; exit 2; }
+FAKE_DNS=$($K -n "$PROBE_NS" get pod "np-fake-dns-$$" -o jsonpath='{.status.podIP}')
 
 svc() { echo "$FULL-$1.$NS.svc.cluster.local"; }
 has_svc() { $K -n "$NS" get svc "$FULL-$1" >/dev/null 2>&1; }
@@ -50,6 +55,10 @@ check "data-plane -> control-plane 8081" open py "$(svc control-plane)" 8081
 if has_svc clamav; then check "data-plane -> ClamAV 3310" open py "$(svc clamav)" 3310; fi
 if has_svc pg-rw; then check "data-plane -> PostgreSQL 5432" blocked py "$(svc pg-rw)" 5432; fi
 check "data-plane -> cloud metadata 169.254.169.254:80" blocked py 169.254.169.254 80
+check "data-plane -> Azure WireServer 168.63.129.16:80" blocked py 168.63.129.16 80
+check "data-plane -> cluster DNS kube-dns.kube-system:53" open py kube-dns.kube-system.svc.cluster.local 53
+check "probe namespace -> pod labelled k8s-app=kube-dns :53 (listener up)" open nc_from "$PROBE_NS" "$FAKE_DNS" 53
+check "data-plane -> pod labelled k8s-app=kube-dns outside kube-system :53" blocked py "$FAKE_DNS" 53
 check "data-plane -> internet example.com:443" open py example.com 443
 
 # ClamAV: DNS and public HTTPS (signature updates) only.
@@ -58,6 +67,7 @@ if [ -n "$CV" ]; then
     cv_nc() { $K -n "$NS" exec "$CV" -- nc -z -w 4 "$1" "$2"; }
     check "ClamAV -> control-plane 8081" blocked cv_nc "$(svc control-plane)" 8081
     check "ClamAV -> cloud metadata 169.254.169.254:80" blocked cv_nc 169.254.169.254 80
+    check "ClamAV -> pod labelled k8s-app=kube-dns outside kube-system :53" blocked cv_nc "$FAKE_DNS" 53
     check "ClamAV -> internet example.com:80" blocked cv_nc example.com 80
     check "ClamAV -> signature mirror database.clamav.net:443" open cv_nc database.clamav.net 443
 fi

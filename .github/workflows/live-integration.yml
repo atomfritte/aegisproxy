@@ -1,10 +1,23 @@
 # Live integration tests. "public-endpoints" needs no credentials: it checks the clients against the public
-# Entra ID, Defender for Endpoint and Datadog endpoints so API changes surface within a week. "microsoft" runs
-# against real tenants through a staging installation (credentials from the "staging" environment).
-# The staging secrets are only for the default branch: the job runs only there (a manual run on another
-# branch is skipped), and the "staging" environment must additionally be restricted to the default branch
-# (Settings -> Environments -> staging -> Deployment branches and tags: "Selected branches", default branch
-# only; ideally with required reviewers), so a modified workflow on another branch cannot read the secrets.
+# Entra ID, Defender for Endpoint and Datadog endpoints so API changes surface within a week.
+#
+# "sentinel" delivers audit records to a real Microsoft Sentinel workspace WITHOUT any stored secret: the job
+# builds the control-plane, starts it on the runner and lets it authenticate with the runner's GitHub OIDC
+# token (workload identity federation). Entra ID app registration -> Certificates & secrets -> Federated
+# credentials -> "GitHub Actions deploying Azure resources":
+#   issuer   https://token.actions.githubusercontent.com
+#   subject  repo:atomfritte/aegisproxy:ref:refs/heads/aegisproxy-2.1
+#   audience api://AzureADTokenExchange
+# plus "Monitoring Metrics Publisher" on the data collection rule and (optional KQL check) "Log Analytics
+# Reader" on the workspace. Entra ID issues tokens only for that branch: a modified workflow pushed to another
+# branch (anyone with write access can push one, and this plan has no protected environments) gets nothing.
+# Repository variables (no secrets): AZURE_TENANT_ID, AZURE_CLIENT_ID, SENTINEL_DCE, SENTINEL_DCR_ID,
+# SENTINEL_STREAM, LA_WORKSPACE_ID (optional).
+#
+# Defender for Endpoint: the control-plane authenticates to it with a client secret only. Repository and
+# environment secrets of this repository are readable by any workflow pushed to any branch, so no such secret
+# is stored here. Run scripts/integration-tests/live_microsoft.py against a staging installation from an
+# administrator workstation (or a repository with protected environments) instead.
 name: live-integration
 on:
   workflow_dispatch:
@@ -26,29 +39,52 @@ jobs:
       - name: Entra ID discovery/JWKS/token errors, Defender API, Datadog intake (no credentials)
         run: go -C control-plane test -tags live -count=1 -run Live -v ./internal/oidc ./internal/defender ./internal/export
 
-  microsoft:
-    # Scheduled runs always use the default branch; manual runs only from it.
-    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+  sentinel:
+    # Convenience only - the federated credential's subject is what restricts the job to the default branch.
+    if: (github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.SENTINEL_DCE != ''
     runs-on: ubuntu-24.04
-    environment: staging
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write   # GitHub OIDC token, exchanged at Entra ID through the federated credential
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with: { python-version: "3.12" }
-      - name: Defender for Endpoint and Sentinel (live)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: control-plane/go.mod, cache-dependency-path: control-plane/go.sum }
+      - name: Sentinel through a local control-plane with workload identity federation (no stored secret)
         env:
-          AEGIS_URL: ${{ vars.AEGIS_STAGING_URL }}
-          AEGIS_USERNAME: ${{ vars.AEGIS_STAGING_USERNAME }}
-          AEGIS_PASSWORD: ${{ secrets.AEGIS_STAGING_PASSWORD }}
           AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          DEFENDER_CLIENT_ID: ${{ vars.DEFENDER_CLIENT_ID }}
-          DEFENDER_CLIENT_SECRET: ${{ secrets.DEFENDER_CLIENT_SECRET }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
           SENTINEL_DCE: ${{ vars.SENTINEL_DCE }}
           SENTINEL_DCR_ID: ${{ vars.SENTINEL_DCR_ID }}
           SENTINEL_STREAM: ${{ vars.SENTINEL_STREAM }}
-          SENTINEL_CLIENT_ID: ${{ vars.SENTINEL_CLIENT_ID }}
-          SENTINEL_CLIENT_SECRET: ${{ secrets.SENTINEL_CLIENT_SECRET }}
           LA_WORKSPACE_ID: ${{ vars.LA_WORKSPACE_ID }}
-        run: python -I scripts/integration-tests/live_microsoft.py
+        run: |
+          set -euo pipefail
+          umask 077
+          export AZURE_FEDERATED_TOKEN_FILE="$RUNNER_TEMP/azure-federated-token"
+          fetch_token() {
+            curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
+              | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["value"])' > "$AZURE_FEDERATED_TOKEN_FILE.new"
+            mv "$AZURE_FEDERATED_TOKEN_FILE.new" "$AZURE_FEDERATED_TOKEN_FILE"
+          }
+          fetch_token
+          # GitHub OIDC tokens are short-lived; the control-plane reads the file for every Entra ID request.
+          ( while sleep 120; do fetch_token || true; done ) &
+          refresher=$!
+          go -C control-plane build -o "$RUNNER_TEMP/aegis-cp" .
+          password="Live-$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          CONTROL_PLANE_PORT=8081 DATA_DIR="$RUNNER_TEMP/data" CERTS_DIR="$RUNNER_TEMP/certs" AEGIS_PUBLIC_URL=http://127.0.0.1:8081 \
+            AEGIS_JWT_SECRET="$(openssl rand -hex 32)" AEGIS_DATAPLANE_KEY="$(openssl rand -hex 32)" \
+            AEGIS_ENCRYPTION_KEY="$(openssl rand -hex 32)" AEGIS_BOOTSTRAP_ADMIN_PASSWORD="$password" \
+            AEGIS_THREATINTEL_AUTOUPDATE=false "$RUNNER_TEMP/aegis-cp" > "$RUNNER_TEMP/control-plane.log" 2>&1 &
+          cp_pid=$!
+          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8081/readyz > /dev/null && break; sleep 1; done
+          rc=0
+          AEGIS_URL=http://127.0.0.1:8081 AEGIS_USERNAME=admin AEGIS_PASSWORD="$password" SENTINEL_AUTH=workload_identity \
+            python3 -I scripts/integration-tests/live_microsoft.py || rc=$?
+          kill "$cp_pid" "$refresher" 2> /dev/null || true
+          [ "$rc" -eq 0 ] || tail -50 "$RUNNER_TEMP/control-plane.log"
+          exit "$rc"

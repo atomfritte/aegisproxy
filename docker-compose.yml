@@ -6,6 +6,10 @@
 # Console/API: http://127.0.0.1:8081 (publish via a TLS reverse proxy, see docs/deployment/docker-compose.md)
 # Proxy:       <host>:8080   (configure servers with http_proxy/https_proxy)
 #
+# The AegisProxy images are always built locally from this checkout ("pull_policy: build"), so neither
+# "up" nor "docker compose pull" fetches them from a registry. Their names are those of the signed release
+# images (ghcr.io/atomfritte, see SECURITY.md).
+#
 # For high availability (PostgreSQL, multiple replicas, load balancer) see deploy/compose/ha/.
 name: aegisproxy
 
@@ -23,15 +27,17 @@ services:
   # the data-plane only; the control-plane gets aegis-ca-public with the certificate alone.
   ca-init:
     <<: *hardening
-    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
     build: { context: ., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
+    pull_policy: build
     command: ["gen-ca", "/certs", "/public"]
     volumes: ["aegis-ca:/certs", "aegis-ca-public:/public"]
     restart: "no"
 
   control-plane:
     <<: *hardening
-    image: aegisproxy/control-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
+    pull_policy: never   # built by ca-init
     depends_on:
       ca-init: { condition: service_completed_successfully }
     environment:
@@ -55,8 +61,9 @@ services:
 
   data-plane:
     <<: *hardening
-    image: aegisproxy/data-plane:${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-data-plane:v${AEGIS_VERSION:-2.1.0}
     build: { context: ./data-plane }
+    pull_policy: build
     depends_on:
       control-plane: { condition: service_healthy }
       clamav: { condition: service_started }
@@ -74,12 +81,31 @@ services:
     ports:
       - "${AEGIS_PROXY_BIND:-0.0.0.0:8080}:8080"
 
+  # The image's /init needs root (chown, symlinks in /var). Like the Helm chart, run the same steps as the
+  # image's clamav user (uid 100, gid 101) with a read-only root filesystem and no capabilities; a new
+  # clamav-db volume takes over the clamav ownership of the image's /var/lib/clamav.
   clamav:
+    <<: *hardening
     image: clamav/clamav:1.5@sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e   # pinned by digest (tag kept for readability)
-    restart: unless-stopped
-    security_opt: ["no-new-privileges:true"]
+    user: "100:101"
+    entrypoint: ["/sbin/tini", "--", "/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -f /var/lib/clamav/main.cvd ] && [ ! -f /var/lib/clamav/main.cld ]; then
+          echo "Updating initial database"
+          sed -e 's|^\(TestDatabases \)|#\1|' -e '$$a TestDatabases no' -e 's|^\(NotifyClamd \)|#\1|' \
+            /etc/clamav/freshclam.conf > /tmp/freshclam_initial.conf
+          freshclam --foreground --stdout --config-file=/tmp/freshclam_initial.conf
+          rm -f /tmp/freshclam_initial.conf
+        fi
+        freshclam --checks="$${FRESHCLAM_CHECKS:-1}" --daemon --foreground --stdout &
+        rm -f /tmp/clamd.sock
+        exec clamd --foreground
     volumes:
       - clamav-db:/var/lib/clamav
+    tmpfs:
+      - /tmp:size=64m,uid=100,gid=101,mode=0700
+      - /var/log/clamav:size=128m,uid=100,gid=101,mode=0750
     healthcheck:
       test: ["CMD-SHELL", "clamdcheck.sh"]
       interval: 60s

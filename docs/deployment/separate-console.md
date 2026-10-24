@@ -1,7 +1,7 @@
 # Hosting the console separately
 
 The console is a static single-page application. By default it is bundled with the control-plane
-(`aegisproxy/control-plane` image, `AEGIS_UI_DIR`). It can also be hosted on its own — e.g. to serve it from a
+(`ghcr.io/atomfritte/aegisproxy-control-plane` image, `AEGIS_UI_DIR`). It can also be hosted on its own — e.g. to serve it from a
 DMZ web tier, a CDN or IIS while the API stays in an internal zone.
 
 The console reads its API location at **runtime** from `/config.js`:
@@ -14,7 +14,7 @@ window.__AEGIS_CONFIG__ = { apiBaseUrl: "" };   // "" = same origin
 
 The console host proxies `/api/` to the control-plane. No CORS, the session cookie stays first-party.
 
-- Container: `aegisproxy/console` with `AEGIS_API_UPSTREAM=http://control-plane:8081`.
+- Container: `ghcr.io/atomfritte/aegisproxy-console` with `AEGIS_API_UPSTREAM=http://control-plane:8081`.
 - Kubernetes: `console.enabled=true` (default proxies to the control-plane service).
 - nginx / IIS ARR: see `frontend/docker/nginx.conf` and `deploy/windows/iis/web.config` (disable response
   buffering for `/api/flows/stream`).

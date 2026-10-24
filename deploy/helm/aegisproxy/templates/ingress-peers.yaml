@@ -1,0 +1,17 @@
+{{- $tc := .Values.ingress.trustedController }}
+{{- if and $tc.enabled (not $tc.existingServiceFQDN) }}
+# Headless Service selecting the ingress controller pods in their namespace: its DNS name resolves to exactly
+# their pod addresses, which the control-plane trusts as proxies (AEGIS_TRUSTED_PROXY_HOSTS).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aegis.fullname" . }}-ingress-peers
+  namespace: {{ $tc.namespace }}
+  labels: {{- include "aegis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress-peers
+spec:
+  clusterIP: None
+  selector: {{- toYaml $tc.podLabels | nindent 4 }}
+  ports:
+    - { name: http, port: 80, protocol: TCP }
+{{- end }}

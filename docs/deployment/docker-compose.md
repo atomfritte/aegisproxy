@@ -4,13 +4,18 @@ The repository root contains a hardened `docker-compose.yml`:
 
 | Service | Image | Notes |
 |---|---|---|
-| `ca-init` | `aegisproxy/control-plane` | One-shot: creates the root CA in the `aegis-ca` volume (key + certificate) and copies the certificate alone to `aegis-ca-public` (`gen-ca /certs /public`). |
-| `control-plane` | `aegisproxy/control-plane` | API + bundled console, file storage in `aegis-data`, only the public CA certificate (`aegis-ca-public`, read-only); the CA key is mounted into the data-plane only. |
-| `data-plane` | `aegisproxy/data-plane` | mitmproxy worker, port 8080, waits for a healthy control-plane. |
-| `clamav` | `clamav/clamav:1.5` (pinned by digest) | Antivirus, signatures in `clamav-db`. |
+| `ca-init` | `ghcr.io/atomfritte/aegisproxy-control-plane` (built locally) | One-shot: creates the root CA in the `aegis-ca` volume (key + certificate) and copies the certificate alone to `aegis-ca-public` (`gen-ca /certs /public`). |
+| `control-plane` | same image as `ca-init` | API + bundled console, file storage in `aegis-data`, only the public CA certificate (`aegis-ca-public`, read-only); the CA key is mounted into the data-plane only. |
+| `data-plane` | `ghcr.io/atomfritte/aegisproxy-data-plane` (built locally) | mitmproxy worker, port 8080, waits for a healthy control-plane. |
+| `clamav` | `clamav/clamav:1.5` (pinned by digest) | Antivirus, signatures in `clamav-db`; runs as the image's `clamav` user (UID 100) instead of the root `/init`. |
 
-All AegisProxy containers run as non-root (UID 65532), with a read-only root filesystem, all Linux
-capabilities dropped and `no-new-privileges`.
+All AegisProxy containers run as non-root (UID 65532) and ClamAV as UID 100, all with a read-only root
+filesystem, all Linux capabilities dropped and `no-new-privileges`.
+
+The AegisProxy images are always built from the checkout (`pull_policy: build`): neither `docker compose up`
+nor `docker compose pull` fetches them from a registry. They carry the names of the signed release images, so
+`docker compose pull` cannot substitute an image from a registry namespace that AegisProxy does not control.
+The third-party images (ClamAV, and PostgreSQL/HAProxy in the HA variant) are pinned by digest.
 
 ## Installation
 
@@ -26,7 +31,8 @@ Initial admin password (if `AEGIS_BOOTSTRAP_ADMIN_PASSWORD` was left empty):
 
 ```bash
 # the control-plane image is distroless (no shell), so read the volume with a helper container
-docker run --rm -v aegisproxy_aegis-data:/data alpine cat /data/secrets/initial-admin-password
+docker run --rm -v aegisproxy_aegis-data:/data alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
+  cat /data/secrets/initial-admin-password
 ```
 
 Sign in at `AEGIS_PUBLIC_URL`, change the password (sidebar → RBAC → *Change my password*), then:
@@ -58,8 +64,8 @@ Alternatively mount a certificate and set `AEGIS_TLS_CERT_FILE`/`AEGIS_TLS_KEY_F
 
 ```bash
 docker compose logs -f control-plane data-plane
-docker compose pull && docker compose up -d          # upgrade (state + CA live in volumes)
-docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD":/backup alpine \
+docker compose up -d --build                         # upgrade after updating the checkout (state + CA live in volumes)
+docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD":/backup alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
   tar czf /backup/aegis-data-$(date +%F).tgz -C /data .  # backup
 ```
 
@@ -69,9 +75,9 @@ docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD":/backup alpine \
 
 ```bash
 docker compose up -d ca-init   # creates the volumes
-docker run --rm -v aegisproxy_aegis-ca:/certs -v "$PWD/certs":/old:ro alpine \
+docker run --rm -v aegisproxy_aegis-ca:/certs -v "$PWD/certs":/old:ro alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
   sh -c 'cp -a /old/. /certs/ && chown -R 65532:65532 /certs && chmod 600 /certs/mitmproxy-ca.pem'
-docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD/control-plane/data":/old:ro alpine \
+docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD/control-plane/data":/old:ro alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
   sh -c 'cp -a /old/. /data/ && chown -R 65532:65532 /data && chmod 600 /data/aegis_state.json'
 docker compose up -d
 ```

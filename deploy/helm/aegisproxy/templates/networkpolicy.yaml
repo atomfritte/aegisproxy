@@ -67,13 +67,7 @@ spec:
             matchLabels: {{- include "aegis.selector" (dict "root" . "component" "clamav") | nindent 14 }}
       ports:
         - { port: 3310, protocol: TCP }
-    - to:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels: { k8s-app: kube-dns }
-      ports:
-        - { port: 53, protocol: UDP }
-        - { port: 53, protocol: TCP }
+    {{- include "aegis.dnsEgress" . | nindent 4 }}
     - to: {{- include "aegis.publicEgress" . | nindent 8 }}
 ---
 # ClamAV: only the data-plane may submit scans; egress only to DNS and public HTTPS (signature updates).
@@ -98,13 +92,7 @@ spec:
         - { port: 3310, protocol: TCP }
     {{- end }}
   egress:
-    - to:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels: { k8s-app: kube-dns }
-      ports:
-        - { port: 53, protocol: UDP }
-        - { port: 53, protocol: TCP }
+    {{- include "aegis.dnsEgress" . | nindent 4 }}
     - to: {{- include "aegis.publicEgress" . | nindent 8 }}
       ports:
         - { port: 443, protocol: TCP }
