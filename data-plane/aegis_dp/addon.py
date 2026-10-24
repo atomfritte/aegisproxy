@@ -153,7 +153,7 @@ class AegisAddon:
         self.metrics = Metrics()
         self._ops = None
         buffering.install()
-        self.budget = BufferBudget(self.cfg.buffer_budget or DEFAULT_BUFFER_BUDGET)
+        self.budget = BufferBudget(self.cfg.buffer_budget or DEFAULT_BUFFER_BUDGET, self.cfg.buffer_client_share / 100)
         self.access_log = AccessLog(self.cfg.access_log, self.cfg.access_log_format,
                                     self.cfg.access_log_rotate_mb << 20, self.cfg.access_log_keep)
 
@@ -178,7 +178,8 @@ class AegisAddon:
             except ValueError:
                 limit = None
             self.budget.total = min(DEFAULT_BUFFER_BUDGET, limit or DEFAULT_BUFFER_BUDGET)
-        log.info("inspection buffer budget %d MiB (body_size_limit=%s)", self.budget.total >> 20, ctx.options.body_size_limit or "unlimited")
+        log.info("inspection buffer budget %d MiB, %d %% per client (body_size_limit=%s)", self.budget.total >> 20,
+                 self.cfg.buffer_client_share, ctx.options.body_size_limit or "unlimited")
         self.cp.start()
         if self.cfg.ops_addr and self._ops is None:
             try:
@@ -215,6 +216,8 @@ class AegisAddon:
             "aegis_dp_buffer_budget_bytes": float(self.budget.total),
             "aegis_dp_buffered_bytes": float(self.budget.used),
             "aegis_dp_buffered_bytes_peak": float(self.budget.peak),
+            "aegis_dp_buffer_clients": float(len(self.budget.clients)),
+            "aegis_dp_buffered_bytes_top_client": float(self.budget.top_client()),
             "aegis_dp_access_log_dropped_total": float(self.access_log.dropped),
             "aegis_dp_access_log_rotation_failures_total": float(self.access_log.rotation_failures),
         }
@@ -464,6 +467,8 @@ class AegisAddon:
             "suggested": f"{res.suggested_host}{res.suggested_path}", "suggested_host": res.suggested_host,
         }
         headers = {"X-Aegis-Verdict": res.verdict, "X-Aegis-Trace-ID": trace, "Cache-Control": "no-store"}
+        if status == 503:
+            headers["Retry-After"] = "5"  # transient: inspection capacity or an inspection service unavailable
         cli = is_cli_client(flow.request.headers.get("User-Agent", ""), flow.request.headers.get("Accept", ""))
         branded = None
         if policy is not None:
@@ -563,17 +568,16 @@ class AegisAddon:
                 flow.response = http.Response.make(200, body, {"Content-Type": ctype, "Cache-Control": "no-store"})
             return
         host = printable(flow.request.host, 255)
-        def digest(b: bytes) -> str:
-            return hashlib.sha256(b).hexdigest() if b else "not cached yet"
+        # No hash is printed here: one served over this (plain-http) connection could be altered together with the
+        # installer. The reference value comes from the console, opened over https.
         page = (f"AegisProxy Root CA portal\n\n  CA (PEM):   http://{host}/ca.crt\n  CA (DER):   http://{host}/ca.der\n\n"
-                "Download the installer, compare its SHA-256 with the AegisProxy console (TLS & CA), then run it:\n"
+                "Download the installer and compare its SHA-256 with the value shown in the AegisProxy console\n"
+                "(TLS & CA, opened over https) before running it:\n"
                 f"  Linux:      curl -fsSLo aegis-ca-install.sh http://{host}/install-linux.sh && sha256sum aegis-ca-install.sh\n"
                 "              sudo bash aegis-ca-install.sh\n"
-                f"              expected SHA-256: {digest(self.cp.install_sh)}\n"
                 f"  Windows:    iwr -UseBasicParsing http://{host}/install-windows.ps1 -OutFile aegis-ca-install.ps1\n"
                 "              Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n"
-                "              powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n"
-                f"              expected SHA-256: {digest(self.cp.install_ps1)}\n\n"
+                "              powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n\n"
                 f"Control-plane: {public}\n")
         flow.response = http.Response.make(200, page.encode("utf-8", "replace"), {"Content-Type": "text/plain; charset=utf-8"})
 
@@ -688,6 +692,7 @@ class AegisAddon:
         if enforce_size:
             cap = max(cap, max_upload)
         strict = (dlp_on or reqmod) and policy.policy_value("dlp_oversize_action", "allow") == "block"
+        enforcing = enforce_size or self._upload_enforcing(policy)
 
         def exceeded(reason: str, size: int) -> str:
             self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "request"), ("reason", reason)))
@@ -696,11 +701,13 @@ class AegisAddon:
                 res.block(VERDICT_POLICY, "upload_too_large", f"Security Guard: upload exceeds the {max_upload}-byte limit")
                 self._block(flow, res, peer, auth, status=413)
                 return BLOCK
-            if reason == "busy" and (strict or enforce_size):
+            if reason == "busy" and enforcing:
+                # A capacity shortage (worker budget or this client's share) is transient, not an oversize upload: an
+                # enforcing inspection is never skipped for it, whatever dlp_oversize_action says (fail closed).
                 res.block(VERDICT_POLICY, "inspection_busy", "Security Guard: the upload inspection capacity of this worker is exhausted; retry shortly")
                 self._block(flow, res, peer, auth, status=503)
                 return BLOCK
-            if strict:
+            if strict and reason == "oversize":
                 res.block(VERDICT_POLICY, "dlp_oversize", f"Data Loss Prevention: upload exceeds the {cap}-byte inspection limit")
                 self._block(flow, res, peer, auth, status=413)
                 return BLOCK
@@ -713,11 +720,23 @@ class AegisAddon:
             req.stream = True
             return STREAM
 
-        guard = buffering.attach(flow, "request", BodyGuard(self.budget, cap, exceeded))
+        guard = buffering.attach(flow, "request", BodyGuard(self.budget, cap, exceeded, self._buffer_client(meta)))
         if clen is not None:
-            reason = guard.admit(clen)
+            reason = guard.declared(clen)  # decided up front; only bytes that arrive are accounted
             if reason:
                 guard.exceed(reason, clen)
+
+    @staticmethod
+    def _buffer_client(meta: Dict[str, Any]) -> str:
+        """Whose share of the buffer budget a body counts against: the resolved server identity (a verified proxy
+        token, a registered address, else one per source address), never a name the client chooses."""
+        return meta["res"].server_id or meta["peer"]
+
+    @staticmethod
+    def _upload_enforcing(policy: Policy) -> bool:
+        """An upload inspection that can block (monitor modes only flag)."""
+        return (policy.policy_value("dlp_mode", "monitor") == "block"
+                or (bool(policy.policy_value("icap_reqmod_url", "")) and policy.policy_value("icap_mode", "block") == "block"))
 
     def _query_dlp_blocked(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> bool:
         """DLP of the query string alone, for requests whose body is streamed (never reaches the request hook's scan)."""
@@ -793,10 +812,11 @@ class AegisAddon:
             if self._upload_oversize_blocked(flow, policy, res, meta, f"{limit}-byte DLP"):
                 return
         if reqmod_url and codings and not buffering.hold(flow, "request", len(content)):
-            # The decoded copy would be kept during the ICAP call: it must fit the worker budget.
+            # The decoded copy would be kept during the ICAP call: it must fit the worker budget and the client's
+            # share. A capacity shortage never skips an enforcing ICAP REQMOD (fail closed).
             self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "request"), ("reason", "busy")))
             res.security_flags.append("ICAP_UNSCANNED:busy")
-            if policy.policy_value("dlp_oversize_action", "allow") == "block":
+            if policy.policy_value("icap_mode", "block") == "block":
                 res.block(VERDICT_POLICY, "inspection_busy", "Security Guard: the upload inspection capacity of this worker is exhausted; retry shortly")
                 self._block(flow, res, meta["peer"], meta["auth"], status=503)
             return
@@ -909,6 +929,17 @@ class AegisAddon:
                     or (self.cp.threat.hashes and policy.policy_value("threat_intel_mode", "block") != "off")
                     or yara_on or policy.policy_value("icap_respmod_url", ""))
 
+    def _download_enforcing(self, policy: Policy, groups: List[str], scanners_only: bool = False) -> bool:
+        """A download inspection that can block. ``scanners_only``: only the engines that need the decoded copy
+        (ClamAV, YARA, ICAP RESPMOD); file type and hash IOCs run on the buffered body without it."""
+        scanners = bool((policy.policy_value("av_enabled", False) and self.clamd and policy.policy_value("av_mode", "block") == "block")
+                        or (policy.policy_value("yara_mode", "off") == "block" and policy.yara_rule_sets)
+                        or (policy.policy_value("icap_respmod_url", "") and policy.policy_value("icap_mode", "block") == "block"))
+        if scanners or scanners_only:
+            return scanners
+        return bool(self._blocked_types(policy, groups)
+                    or (self.cp.threat.hashes and policy.policy_value("threat_intel_mode", "block") == "block"))
+
     @staticmethod
     def _blocked_types(policy: Policy, groups: List[str]) -> set:
         types = set(policy.policy_value("blocked_file_types", []) or [])
@@ -979,15 +1010,18 @@ class AegisAddon:
                 self._relay_unbuffered(flow, meta)
             else:
                 guard = buffering.attach(flow, "response", BodyGuard(self.budget, STREAM_WITHOUT_INSPECTION,
-                                                                     lambda _reason, _size: self._relay_unbuffered(flow, meta)))
-                if guard.admit(clen):
+                                                                     lambda _reason, _size: self._relay_unbuffered(flow, meta),
+                                                                     self._buffer_client(meta)))
+                if guard.declared(clen):
                     guard.exceed("busy", clen)
         else:
-            # Inspected: buffered up to the scan limit within the worker budget, a body of unknown length chunk by chunk.
+            # Inspected: buffered up to the scan limit within the worker budget and the client's share, accounted chunk
+            # by chunk as the body arrives (with or without Content-Length).
             guard = buffering.attach(flow, "response", BodyGuard(self.budget, max_scan,
-                                                                 lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason)))
+                                                                 lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason),
+                                                                 self._buffer_client(meta)))
             if clen is not None:
-                reason = guard.admit(clen)
+                reason = guard.declared(clen)
                 if reason:
                     guard.exceed(reason, clen)
 
@@ -997,16 +1031,17 @@ class AegisAddon:
         return STREAM
 
     def _download_exceeded(self, flow: http.HTTPFlow, policy: Policy, meta: Dict[str, Any], cap: int, reason: str) -> str:
-        """A download outgrew the scan limit (no Content-Length) or the worker budget: av_oversize_action decides."""
+        """A download outgrew the scan limit ("oversize": av_oversize_action decides) or the worker budget or the
+        client's share of it ("busy": a transient capacity shortage never skips an enforcing inspection)."""
         self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", reason)))
-        if policy.policy_value("av_oversize_action", "allow") == "block":
-            if reason == "oversize":
-                self._block_streamed(flow, meta, "av_oversize", f"Antivirus: download exceeds the {cap}-byte scan limit",
-                                     f"AegisProxy blocked this download: it exceeds the antivirus scan limit ({cap} bytes).\n"
-                                     "Contact InfoSec if this file is required.\n")
-            else:
-                self._block_streamed(flow, meta, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted",
-                                     "AegisProxy could not inspect this download: scan capacity exhausted. Retry shortly.\n", status=503)
+        if reason == "busy" and self._download_enforcing(policy, meta["res"].group_ids):
+            self._block_streamed(flow, meta, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted",
+                                 "AegisProxy could not inspect this download: scan capacity exhausted. Retry shortly.\n", status=503)
+            return BLOCK
+        if reason == "oversize" and policy.policy_value("av_oversize_action", "allow") == "block":
+            self._block_streamed(flow, meta, "av_oversize", f"Antivirus: download exceeds the {cap}-byte scan limit",
+                                 f"AegisProxy blocked this download: it exceeds the antivirus scan limit ({cap} bytes).\n"
+                                 "Contact InfoSec if this file is required.\n")
             return BLOCK
         meta["res"].security_flags.append(f"AV_UNSCANNED:{reason}")
         meta["unscanned"] = reason
@@ -1025,6 +1060,8 @@ class AegisAddon:
         resp.headers["Content-Length"] = str(len(msg))
         resp.headers["X-Aegis-Verdict"] = verdict
         resp.headers["Cache-Control"] = "no-store"
+        if status == 503:
+            resp.headers["Retry-After"] = "5"
         sent = {"done": False}
 
         def swallow(chunk: bytes) -> bytes:
@@ -1126,11 +1163,12 @@ class AegisAddon:
                 return VERDICT_POLICY, 403
         scanners = True
         if codings and inspect_on and not buffering.hold(flow, "response", len(body)):
-            # The decoded copy is kept while the scan engines run, so it must fit the worker budget too. Without room
-            # only the synchronous checks (hash IOCs, file type) run.
+            # The decoded copy is kept while the scan engines run, so it must fit the worker budget and the client's
+            # share too. Without room an enforcing engine fails closed; monitor-only engines are skipped (flagged) and
+            # the synchronous checks (hash IOCs, file type) still run.
             self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", "busy")))
             res.security_flags.append("AV_UNSCANNED:busy")
-            if policy.policy_value("av_oversize_action", "allow") == "block":
+            if self._download_enforcing(policy, res.group_ids, scanners_only=True):
                 res.block(VERDICT_POLICY, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted")
                 return VERDICT_POLICY, 503
             scanners = False

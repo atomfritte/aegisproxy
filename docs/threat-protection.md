@@ -107,9 +107,12 @@ blocked at the proxy too. Refresh interval: the sync interval, at least 15 minut
 When at least one inspection is active, the worker buffers the response body (up to `av_max_scan_bytes`, which
 is therefore the size limit for every engine — compressed and decoded; larger downloads are streamed unscanned
 with the flag `AV_UNSCANNED:oversize`, or blocked with `av_oversize_action: block`). A download without
-`Content-Length` is buffered chunk by chunk and handled the same way once it outgrows the limit; buffering is
-also bounded per worker ([memory sizing](configuration.md#data-plane-memory-sizing), flag `AV_UNSCANNED:busy`
-or 503 `inspection_busy` with `block`). The worker decodes the body as described under
+`Content-Length` is buffered chunk by chunk and handled the same way once it outgrows the limit. Buffering is
+also bounded per worker and per client ([memory sizing](configuration.md#data-plane-memory-sizing)); a download
+that does not fit is **busy**, not oversize: while an inspection that can block is active (blocked file types,
+threat-intel hashes, ClamAV / YARA / ICAP RESPMOD in `block` mode) it is answered with 503 `inspection_busy`
+(`Retry-After`) whatever `av_oversize_action` says, so exhausting the capacity never delivers a file unscanned;
+only monitor-only inspections stream it flagged `AV_UNSCANNED:busy`. The worker decodes the body as described under
 [content decoding](#content-decoding) and runs, in this order, stopping at the first block:
 
 1. **Hash** — SHA-256 against threat intelligence (feeds, TAXII/MISP, Defender, custom IOCs).
@@ -221,7 +224,9 @@ download the EICAR test file through the proxy.
 The worker streams buffered response bodies to clamd via `INSTREAM`. Configure:
 
 - `av_max_scan_bytes` (default 25 MiB) — keep in line with clamd `StreamMaxLength`.
-- `av_oversize_action` — `allow` (stream unscanned, flagged) or `block`.
+- `av_oversize_action` — `allow` (stream unscanned, flagged) or `block`. It applies to downloads larger than
+  `av_max_scan_bytes` only; padding a file beyond the limit is enough to get it past every engine with `allow`,
+  so the security posture (`scan-oversize`) warns while ClamAV or ICAP RESPMOD enforce with `allow`.
 - `av_fail_mode` — `open` (allow, `AV_ERROR` event) or `closed` (503) when clamd is unavailable or times out.
 - `av_mode` — `block` or `monitor`.
 
@@ -242,7 +247,11 @@ Bytes beyond the limit are never skipped silently: the upload is flagged `DLP_UN
 `icap_max_bytes` when ICAP REQMOD is configured (`ICAP_UNSCANNED:oversize`). Uploads larger than the worker's
 upload buffer (see [memory sizing](configuration.md#data-plane-memory-sizing)) are either rejected
 (`dlp_oversize_action: block`) or streamed unscanned with the same flags; their query string is still scanned
-before anything is sent. Compressed uploads (`Content-Encoding`) are decoded first, bounded like downloads; an
+before anything is sent. An upload that would fit the limit but not the worker's buffer budget or the client's
+share of it is **busy**: with `dlp_mode` (or the ICAP REQMOD `icap_mode`) `block` it is answered with 503
+`inspection_busy` (`Retry-After`) whatever `dlp_oversize_action` says; only monitor mode streams it flagged
+`DLP_UNSCANNED:busy`. The security posture (`dlp-oversize`) warns while DLP or ICAP REQMOD block with
+`dlp_oversize_action: allow`, because padding an upload beyond `dlp_max_scan_bytes` then gets it out unscanned. Compressed uploads (`Content-Encoding`) are decoded first, bounded like downloads; an
 upload with an undecodable coding is blocked (`undecodable_content`) when `dlp_mode` or the ICAP REQMOD
 `icap_mode` is `block`, otherwise flagged `DLP_UNSCANNED:undecodable`. Authorization headers are deliberately not scanned — servers legitimately
 authenticate to APIs. Start in `monitor` mode, review events,
@@ -255,8 +264,13 @@ then switch to `block`. An enterprise DLP engine can additionally inspect upload
 - `allowed_ports` (default 80/443).
 - `block_ip_literals`: IP destinations need an explicit rule.
 - `block_private_destinations`: internal ranges/suffixes need an explicit, non-wildcard rule; resolved
-  addresses are vetted and pinned (DNS rebinding). Loopback, link-local and metadata addresses are always
-  blocked.
+  addresses are vetted and pinned (DNS rebinding). Loopback, link-local (incl. `169.254.169.254`), unspecified,
+  multicast and the cloud metadata endpoints outside link-local — Azure WireServer `168.63.129.16`, AWS IMDS over
+  IPv6 `fd00:ec2::254`, Alibaba Cloud `100.100.100.200` — are always blocked, also when a rule allows them
+  (`forbidden_destination`) or a host name resolves to them (`dns_rebinding`). On cloud VMs the platform agents (Azure VM agent and
+  extensions, cloud-init, IMDS clients) must reach these addresses directly: put
+  `168.63.129.16,169.254.169.254` into `NO_PROXY` / `no_proxy` (and the WinHTTP / system proxy bypass list)
+  when the servers use the proxy explicitly, and exempt them from transparent redirection.
 - `punycode_mode`: monitor or block IDN host names.
 - `max_upload_bytes`: hard cap for request bodies.
 - `Host` header and TLS SNI must match the real destination (domain fronting); host names must be DNS names

@@ -9,6 +9,7 @@ import (
 
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 // ResolveServer identifies the calling server by proxy token, (IP-bound) proxy username,
@@ -113,10 +114,13 @@ func isPunycode(host string) bool {
 }
 
 // alwaysForbiddenAddr covers destinations no rule may ever open through the proxy: loopback
-// (the proxy's own services), link-local (cloud metadata 169.254.169.254) and unspecified.
+// (the proxy's own services), link-local (cloud metadata 169.254.169.254), the other cloud metadata endpoints
+// (Azure WireServer, see netguard.CloudMetadata), unspecified and multicast. Same as is_forbidden_addr in the
+// data-plane.
 func alwaysForbiddenAddr(a netip.Addr) bool {
 	a = a.Unmap()
-	return a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsUnspecified() || a.IsMulticast()
+	return a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsUnspecified() || a.IsMulticast() ||
+		netguard.CloudMetadata(a)
 }
 
 func blockResult(res engine.EvaluationResult, verdict, reason, name string) engine.EvaluationResult {

@@ -222,11 +222,25 @@ func (s *Server) postureChecks() []PostureCheck {
 			strings.Join(open, ", ")+" fail open",
 			"Fail-open lets downloads through unscanned during an engine outage. Set the fail mode to closed where availability allows.",
 			"docs/threat-protection.md")
-		add("scan-oversize", "detection", "Downloads above the scan limit are blocked", pass(p.AVOversizeAction == "block", "info"),
-			"oversize action "+p.AVOversizeAction, "Large files pass unscanned with \"allow\"; raise the scan limit or block oversize downloads for sensitive groups.",
+		// An enforcing scanner with oversize "allow" delivers everything above the scan limit unscanned: an attacker
+		// only has to pad a file. Monitor-only scanning never blocks anyway, so that stays informational.
+		avEnforces := (p.AVEnabled && p.AVMode != "monitor") || (p.ICAPRespmodURL != "" && p.ICAPMode != "monitor")
+		oversizeStatus := "info"
+		if avEnforces {
+			oversizeStatus = "warn"
+		}
+		add("scan-oversize", "detection", "Downloads above the scan limit are blocked", pass(p.AVOversizeAction == "block", oversizeStatus),
+			"oversize action "+p.AVOversizeAction+", scan limit "+strconv.FormatInt(p.AVMaxScanBytes, 10)+" bytes",
+			"Files above the scan limit pass unscanned (flagged AV_UNSCANNED:oversize) with \"allow\": set av_oversize_action to block, or raise av_max_scan_bytes.",
 			"docs/threat-protection.md")
 	}
 	add("dlp", "detection", "Data loss prevention active", pass(p.DLPMode != "off" || p.ICAPReqmodURL != "", "warn"), "mode "+p.DLPMode, "", "docs/threat-protection.md#data-loss-prevention")
+	if p.DLPMode == "block" || (p.ICAPReqmodURL != "" && p.ICAPMode != "monitor") {
+		add("dlp-oversize", "detection", "Uploads above the DLP scan limit are blocked", pass(p.DLPOversizeAction == "block", "warn"),
+			"oversize action "+p.DLPOversizeAction+", scan limit "+strconv.FormatInt(p.DLPMaxScanBytes, 10)+" bytes",
+			"Only the first dlp_max_scan_bytes of an upload are scanned; with \"allow\" a secret placed beyond them leaves (flagged DLP_UNSCANNED:oversize). Set dlp_oversize_action to block (413), or raise dlp_max_scan_bytes.",
+			"docs/threat-protection.md#data-loss-prevention")
+	}
 	failing := []string{}
 	if ti := s.store.ThreatIntel(); ti != nil {
 		for _, f := range ti.FeedsWithStatus(s.store.ThreatFeedConfigs()) {

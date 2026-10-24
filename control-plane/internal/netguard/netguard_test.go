@@ -10,7 +10,8 @@ import (
 
 func TestForbidden(t *testing.T) {
 	for addr, want := range map[string]bool{"169.254.169.254": true, "::ffff:169.254.169.254": true, "fe80::1": true, "0.0.0.0": true,
-		"224.0.0.1": true, "127.0.0.1": false, "10.1.2.3": false, "20.190.1.1": false} {
+		"224.0.0.1": true, "127.0.0.1": false, "10.1.2.3": false, "20.190.1.1": false,
+		"168.63.129.16": true, "::ffff:168.63.129.16": true, "fd00:ec2::254": true, "100.100.100.200": true, "168.63.129.17": false} {
 		if got := Forbidden(netip.MustParseAddr(addr)); got != want {
 			t.Errorf("Forbidden(%s) = %v", addr, got)
 		}

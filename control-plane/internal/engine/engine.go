@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 type RedirectGrant struct {
@@ -332,12 +333,13 @@ func SetInternalSuffixes(suffixes []string) {
 
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
-// IsInternalAddr reports loopback, RFC1918/ULA, link-local (incl. 169.254.169.254 cloud metadata),
-// CGNAT, multicast and unspecified addresses.
+// IsInternalAddr reports loopback, RFC1918/ULA, link-local (incl. 169.254.169.254 cloud metadata), other cloud
+// metadata endpoints (netguard.CloudMetadata), CGNAT, multicast and unspecified addresses.
 func IsInternalAddr(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() || cgnatPrefix.Contains(addr)
+		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() || cgnatPrefix.Contains(addr) ||
+		netguard.CloudMetadata(addr)
 }
 
 // IsInternalHost reports internal hostnames and addresses (see IsInternalAddr and SetInternalSuffixes).

@@ -92,6 +92,23 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(canonicalize_path(v["in"]), (v["out"], v["ok"]), repr(v["in"]))
         self.assertFalse(canonicalize_path("/a\udcffb")[1], "undecodable path bytes (surrogateescape)")
 
+    def test_destination_vectors_shared_with_control_plane(self):
+        # The same file drives engine.IsInternalAddr / store.alwaysForbiddenAddr tests in the control-plane.
+        from aegis_dp.policy import is_forbidden_addr, is_internal_addr, parse_ip
+        with open(os.path.join(os.path.dirname(VECTORS), "destination_vectors.json"), encoding="utf-8") as fh:
+            vectors = json.load(fh)["addresses"]
+        self.assertTrue(vectors)
+        for v in vectors:
+            addr = parse_ip(v["addr"])
+            self.assertEqual((is_internal_addr(addr), is_forbidden_addr(addr)), (v["internal"], v["forbidden"]), v["addr"])
+        # Azure WireServer: no rule opens it, by address or by an allowed name resolving to it (review round 2)
+        p = Policy({"revision": 1, "security_policy": {"allowed_ports": [80, 443]}, "groups": [{"id": "g1"}],
+                    "servers": [{"id": "s1", "ip": "10.1.0.5", "group_ids": ["g1"]}],
+                    "rules": [{"id": "r1", "action": "ALLOW", "host_pattern": "168.63.129.16", "path_pattern": "/**",
+                               "group_ids": ["g1"], "enabled": True}]})
+        res = p.evaluate("10.1.0.5", "", "GET", "168.63.129.16", 80, "/machine", "http://168.63.129.16/machine", self.t, self.g)
+        self.assertEqual((res.allowed, res.block_reason), (False, "forbidden_destination"))
+
     def test_evaluation_order_matches_control_plane(self):
         cases = [
             ("github.com", "/microsoft/vscode", 443, VERDICT_ALLOWED, ""),
@@ -766,6 +783,35 @@ class BufferingTest(unittest.TestCase):
         a.release()
         self.assertEqual(budget.used, 0)
 
+    def test_declared_size_reserves_nothing_and_clients_get_a_share(self):
+        from aegis_dp.buffering import BodyGuard, BufferBudget
+        budget = BufferBudget(1000, client_share=0.25)
+        self.assertEqual(budget.client_limit(100), 250, "a quarter of the budget ...")
+        self.assertEqual(budget.client_limit(400), 800, "... but at least one scan (body + decoded copy)")
+        self.assertEqual(budget.client_limit(4000), 1000, "never more than the budget")
+        noop = lambda reason, size: "stream"  # noqa: E731
+        # An announced Content-Length decides "too large" up front but holds nothing: idle connections that announce
+        # large bodies cannot exhaust the budget (round-2 review F1).
+        idle = [BodyGuard(budget, 100, noop, client="attacker") for _ in range(64)]
+        self.assertEqual([g.declared(100) for g in idle], [None] * 64)
+        self.assertEqual((budget.used, budget.clients), (0, {}))
+        self.assertEqual(idle[0].declared(101), "oversize")
+        self.assertEqual(BodyGuard(BufferBudget(50), 100, noop).declared(80), "busy", "can never fit the budget")
+        # Bytes that arrive count against the client's share: one client cannot take more than 250 of 1000 ...
+        for g in idle[:2]:
+            self.assertIsNone(g.admit(100))
+        self.assertEqual(idle[2].admit(100), "busy", "client share (250) exhausted")
+        self.assertIsNone(idle[2].admit(50))
+        self.assertEqual((budget.used, budget.clients), (250, {"attacker": 250}))
+        # ... while another client still gets its own share of the rest.
+        other = [BodyGuard(budget, 100, noop, client=f"srv-{i}") for i in range(3)]
+        for g in other:
+            self.assertIsNone(g.admit(100))
+        self.assertEqual(budget.top_client(), 250)
+        for g in idle + other:
+            g.release()
+        self.assertEqual((budget.used, budget.clients), (0, {}))
+
     def test_buffer_budget_config(self):
         from aegis_dp.config import Config, ConfigError
         old = dict(os.environ)
@@ -777,6 +823,15 @@ class BufferingTest(unittest.TestCase):
             self.assertEqual(Config.from_env().buffer_budget, 768 << 20)
             for bad in ("lots", "512k"):
                 os.environ["AEGIS_BUFFER_BUDGET"] = bad
+                with self.assertRaises(ConfigError):
+                    Config.from_env()
+            os.environ.pop("AEGIS_BUFFER_BUDGET", None)
+            self.assertEqual(Config.from_env().buffer_client_share, 25)
+            for value, want in (("10%", 10), ("100", 100), (" 50 % ", 50)):
+                os.environ["AEGIS_BUFFER_CLIENT_SHARE"] = value
+                self.assertEqual(Config.from_env().buffer_client_share, want, value)
+            for bad in ("0", "101", "0.25", "a quarter"):
+                os.environ["AEGIS_BUFFER_CLIENT_SHARE"] = bad
                 with self.assertRaises(ConfigError):
                     Config.from_env()
         finally:
@@ -1287,7 +1342,9 @@ class AddonSecurityTest(unittest.TestCase):
         self.assertTrue(f.response.stream)
         f = self.buffered_response(n, [("Content-Length", "100")])
         self.assertFalse(f.response.stream, "small bodies of known size may still be buffered")
-        self.assertEqual(n.budget.used, 100)
+        self.assertEqual(n.budget.used, 0, "a declared Content-Length reserves nothing")
+        self.feed(self.layer(f), [b"x" * 100])
+        self.assertEqual(n.budget.used, 100, "bytes that arrived are accounted")
         self.call(n, "response", f)
         self.assertEqual(n.budget.used, 0)
         # inspected, no Content-Length: buffered up to av_max_scan_bytes (1 MiB here), then av_oversize_action=allow
@@ -1319,20 +1376,31 @@ class AddonSecurityTest(unittest.TestCase):
         self.assertEqual(b.budget.used, 0)
 
     def test_worker_budget(self):
-        # concurrent downloads share the budget; when it is exhausted av_oversize_action decides
+        # Concurrent downloads share the budget. Exhausted, an enforcing inspection fails closed (503 with
+        # Retry-After) whatever av_oversize_action says: a capacity shortage must not deliver unscanned content.
         a = self.addon()
         a.budget.total = 300 << 10
         f1, f2 = self.buffered_response(a), self.buffered_response(a)
         s1, s2 = self.layer(f1), self.layer(f2)
         self.feed(s1, [b"x" * (200 << 10)])
         cmds = self.feed(s2, [b"y" * (200 << 10)])
-        self.assertTrue(f2.response.stream)
-        self.assertEqual(len(self.sent(cmds, "ResponseHeaders")), 1)
-        self.assertIn("AV_UNSCANNED:busy", f2.metadata["aegis"]["res"].security_flags)
+        self.assertEqual([e.response.status_code for e in self.sent(cmds, "ResponseHeaders")], [503])
+        self.assertEqual(f2.response.headers.get("Retry-After"), "5")
+        self.assertNotIn(b"yyyy", b"".join(e.data for e in self.sent(cmds, "ResponseData")))
+        self.assertEqual(self.records(a)[-1]["block_reason"], "inspection_busy")
         self.assertFalse(f1.response.stream)
         self.assertEqual(a.budget.used, 200 << 10)
         self.call(a, "error", f1)  # aborted flows return their share
-        self.assertEqual(a.budget.used, 0)
+        self.assertEqual((a.budget.used, a.budget.clients), (0, {}))
+        # monitor-only inspection (ICAP RESPMOD in monitor mode): skipped and flagged, never blocked
+        m = self.addon(blocked_file_types=[], icap_respmod_url="icap://icap.example/av", icap_mode="monitor")
+        m.budget.total = 300 << 10
+        f1, f2 = self.buffered_response(m), self.buffered_response(m)
+        self.feed(self.layer(f1), [b"x" * (200 << 10)])
+        cmds = self.feed(self.layer(f2), [b"y" * (200 << 10)])
+        self.assertTrue(f2.response.stream)
+        self.assertIn("AV_UNSCANNED:busy", f2.metadata["aegis"]["res"].security_flags)
+        self.call(m, "error", f1)
         b = self.addon(av_oversize_action="block")
         b.budget.total = 1000
         f = self.flow("dl.example", headers=[("Host", "dl.example")])
@@ -1347,6 +1415,86 @@ class AddonSecurityTest(unittest.TestCase):
         self.assertEqual((resp.status_code, self.records(c)[-1]["verdict"]), (403, "FILETYPE_BLOCKED"))
         self.assertIn("AV_UNSCANNED:busy", self.records(c)[-1]["security_flags"])
         self.assertEqual(c.budget.used, 0)
+
+    def two_servers(self, **security):
+        """An addon whose policy knows a second server (10.1.0.6, group g1) next to srv-1 (10.1.0.5)."""
+        a = self.addon(**security)
+        bundle = json.loads(json.dumps(ADDON_BUNDLE))
+        bundle["security_policy"].update(security)
+        bundle["servers"].append({"id": "srv-2", "hostname": "victim", "ip": "10.1.0.6", "group_ids": ["g1"]})
+        a.cp.policy = Policy(bundle)
+        return a
+
+    @staticmethod
+    def from_ip(f, ip):
+        f.client_conn.peername = (ip, 40001)
+        return f
+
+    def test_budget_exhaustion_does_not_disable_inspection(self):
+        """Round-2 review F1: a client that announces large uploads (or holds buffered bytes) must neither exhaust
+        the budget for others nor make the worker skip inspection."""
+        for oversize_action in ("allow", "block"):
+            a = self.two_servers(dlp_oversize_action=oversize_action, av_oversize_action=oversize_action)
+            a.budget.total = 128 << 20  # 25 % share: 32 MiB per client (upload cap 8 MiB, so 2 x cap = 16 MiB)
+            # 64 idle uploads announcing 8 MiB each (no body sent): nothing is reserved
+            idle = []
+            for _ in range(64):
+                f = self.flow("dl.example", "/up", method="POST", headers=[("Host", "dl.example"), ("Content-Length", str(8 << 20))])
+                self.call(a, "requestheaders", f)
+                self.assertIsNone(f.response)
+                idle.append(f)
+            self.assertEqual(a.budget.used, 0, oversize_action)
+            # the attacker actually sends bytes: at most its share (32 MiB) is held, then its own uploads get 503
+            held = []
+            for _ in range(9):
+                f = self.flow("dl.example", "/up", method="POST", headers=[("Host", "dl.example")])
+                self.call(a, "requestheaders", f)
+                self.feed(self.layer(f, request=True), [b"z" * (4 << 20)], request=True)
+                held.append(f)
+            self.assertEqual(a.budget.clients.get("srv-1", 0), 32 << 20)
+            self.assertEqual([f.response is None for f in held], [True] * 8 + [False])
+            self.assertEqual(held[-1].response.status_code, 503, oversize_action)
+            self.assertEqual(held[-1].response.headers.get("Retry-After"), "5")
+            # the other server is still inspected: its secret upload is blocked ...
+            f = self.from_ip(self.flow("dl.example", "/up", method="POST", headers=[("Host", "dl.example")],
+                                       body=b"x" * 1000 + b"\nAKIAIOSFODNN7EXAMPLE"), "10.1.0.6")
+            self.call(a, "requestheaders", f)
+            self.feed(self.layer(f, request=True), [f.request.raw_content], request=True)
+            self.assertIsNone(f.response)
+            self.call(a, "request", f)
+            self.assertEqual((f.response.status_code, self.records(a)[-1]["verdict"]), (403, "DLP_BLOCKED"), oversize_action)
+            self.call(a, "response", f)  # mitmproxy runs the response hook for the local block page too
+            # ... and so is its PE download
+            f = self.from_ip(self.flow("dl.example", headers=[("Host", "dl.example")]), "10.1.0.6")
+            for hook in ("requestheaders", "request"):
+                self.call(a, hook, f)
+            f.response = tutils.tresp(headers=mhttp.Headers([(b"Content-Length", str(len(PE)).encode())]), content=PE)
+            self.call(a, "responseheaders", f)
+            self.assertFalse(f.response.stream)
+            self.feed(self.layer(f), [PE])
+            self.call(a, "response", f)
+            self.assertEqual((f.response.status_code, self.records(a)[-1]["verdict"]), (403, "FILETYPE_BLOCKED"), oversize_action)
+            # every flow returns its share when it ends or is aborted
+            for f in idle + held:
+                self.call(a, "error", f)
+            self.assertEqual((a.budget.used, a.budget.clients), (0, {}), oversize_action)
+
+    def test_busy_upload_fails_closed_only_when_enforcing(self):
+        for security, status in (({}, 503), ({"dlp_oversize_action": "block"}, 503), ({"dlp_mode": "monitor"}, None)):
+            a = self.addon(**security)
+            a.budget.total = 1 << 20
+            f1 = self.flow("dl.example", "/up", method="POST", headers=[("Host", "dl.example")])
+            f2 = self.flow("dl.example", "/up", method="POST", headers=[("Host", "dl.example")])
+            for f in (f1, f2):
+                self.call(a, "requestheaders", f)
+            self.feed(self.layer(f1, request=True), [b"a" * (700 << 10)], request=True)
+            self.feed(self.layer(f2, request=True), [b"b" * (700 << 10)], request=True)
+            if status is None:  # monitor mode never blocks: the upload is streamed and flagged
+                self.assertIsNone(f2.response, security)
+                self.assertTrue(f2.request.stream)
+                self.assertIn("DLP_UNSCANNED:busy", f2.metadata["aegis"]["res"].security_flags)
+            else:
+                self.assertEqual((f2.response.status_code, self.records(a)[-1]["block_reason"]), (status, "inspection_busy"), security)
 
     def test_upload_buffering(self):
         # nothing needs the body: streamed
