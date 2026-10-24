@@ -505,15 +505,22 @@ that imports the CA into `LocalMachine\Root`, writes a PEM copy to `C:\Program F
 file is trusted machine-wide via `NODE_EXTRA_CA_CERTS`), configures Node.js/Git and - with `$env:AEGIS_PROXY` -
 the WinHTTP and machine-wide proxy:
 
+Never pipe the installer into `iex`: download it, compare its SHA-256 with the value the console shows under
+**TLS & CA** (also `windows_script_sha256` of `GET /api/public/ca/info`), then run it (elevated):
+
 ```powershell
 $env:AEGIS_PROXY = 'aegis-proxy.corp.example:8080'
-iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 | iex
+$f = Join-Path $env:TEMP 'aegis-ca-install.ps1'
+iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 -OutFile $f
+if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch' }
+powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
 ### Linux servers
 
 ```bash
-curl -fsSL https://aegis.corp.example/api/public/ca/install-linux.sh | sudo bash     # CA trust (pinned)
+curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh     # CA trust (pinned)
+echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
 sudo tee -a /etc/environment <<'EOF'
 http_proxy=http://aegis-proxy.corp.example:8080
 https_proxy=http://aegis-proxy.corp.example:8080
