@@ -230,8 +230,10 @@ paths:
         protection, bandwidth statistics, data-plane workers and work-queue counters.
 
         **Roles:** any authenticated role. **Team Leads** receive only the servers, access requests, traffic,
-        learning sessions, security events and audit events of their server groups (need-to-know); the
-        notification log and unattributable bandwidth figures are omitted.
+        learning sessions, security events, audit events and policy objects (policy sets, effective rules,
+        change requests, TLS exceptions) of their server groups (need-to-know; baseline sets and unscoped
+        TLS exceptions apply to every server and stay visible); unattributable bandwidth figures are
+        omitted. The notification log is returned to InfoSec Approvers and Super Admins only.
 
         For integrations prefer the dedicated list endpoints (`/api/requests`, `/api/servers`,
         `/api/policy-sets`, …): this document is large and its shape follows the console.
@@ -2156,7 +2158,7 @@ paths:
         enabled policy sets, with set attribution (`policy_set_id`, `policy_set_name`) and hit counters.
         Rules are edited through policy sets.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (see `GET /api/state`).
       responses:
         '200':
           description: Effective rules.
@@ -2177,7 +2179,7 @@ paths:
         All policy sets (standard, baseline and approvals sets) with computed `review_due_at` and
         `review_state`.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (see `GET /api/state`).
       responses:
         '200':
           description: Policy sets.
@@ -2236,7 +2238,7 @@ paths:
         (`format: aegisproxy.policy-sets/v1`), without hit counters, as attachment
         `aegis-policy-sets-<timestamp>.json`. Approvals sets are included for reference but skipped on import.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (see `GET /api/state`).
       parameters:
         - name: id
           in: query
@@ -2315,7 +2317,7 @@ paths:
       description: |
         The set with its version summaries, change requests and the diff between published content and draft.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (404 otherwise).
       responses:
         '200':
           description: Policy set details.
@@ -2521,7 +2523,9 @@ paths:
         verdict. Without `spec` (or with an empty body) the draft, else the published content, is simulated.
         With an explicit `spec` the set does not need to exist.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role. **Team Leads** may only simulate sets they could change (their
+        server groups for both the stored and the candidate scope, no baseline sets); only their groups'
+        servers and traffic are evaluated.
       requestBody:
         required: false
         content:
@@ -2555,7 +2559,7 @@ paths:
       description: |
         Compares two states of the set. References: a version number, `published`, `draft` or `empty`.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (404 otherwise).
       parameters:
         - name: from
           in: query
@@ -2602,7 +2606,8 @@ paths:
       description: |
         Version summaries, newest first. An unknown set returns an empty list.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups
+        (404 for unknown sets and sets outside their groups).
       responses:
         '200':
           description: Version summaries.
@@ -2614,6 +2619,8 @@ paths:
                   $ref: '#/components/schemas/PolicySetVersionSummary'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /api/policy-sets/{id}/versions/{version}:
     parameters:
       - $ref: '#/components/parameters/PolicySetId'
@@ -2625,7 +2632,7 @@ paths:
       description: |
         Full immutable version including `spec`.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (404 otherwise).
       responses:
         '200':
           description: Version.
@@ -2732,7 +2739,7 @@ paths:
       description: |
         Change requests, newest first (at most 2000 are kept).
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (see `GET /api/state`).
       parameters:
         - name: status
           in: query
@@ -2761,7 +2768,7 @@ paths:
       description: |
         Including `spec`, `diff`, `impact` and `reviews`.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** see only policy objects of their server groups (404 otherwise).
       responses:
         '200':
           description: Change request.
@@ -3774,7 +3781,7 @@ paths:
         Everything that applies to one server: static and dynamic groups, applied policy sets and rules,
         TLS exceptions, block page template and blocked file types.
 
-        **Roles:** any authenticated role.
+        **Roles:** any authenticated role; **Team Leads** only for servers of their groups (404 otherwise).
       responses:
         '200':
           description: Effective policy.
@@ -9004,7 +9011,7 @@ components:
           readOnly: true
     ExportSinkStatus:
       type: object
-      required: [id, node, state, queued, spool_bytes, spool_records, sent, failed, dropped]
+      required: [id, node, state, queued, spool_bytes, spool_records, sent, failed, dropped, discarded_batches]
       properties:
         id:
           type: string
@@ -9030,6 +9037,13 @@ components:
         dropped:
           type: integer
           format: int64
+          description: Records lost (traffic records while the queue is full, full spool, unencodable records).
+        discarded_batches:
+          type: integer
+          format: int64
+          description: |
+            Batches the destination rejected permanently (4xx). Sinks carrying audit or security records keep
+            them in `dead-letter.jsonl` in their spool directory.
         last_success_at:
           type: string
           format: date-time

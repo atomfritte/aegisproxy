@@ -23,12 +23,15 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, claims *
 	snap := s.store.GetSnapshot()
 	servers := s.store.Servers()
 	bandwidth := s.store.ComputeBandwidthSummary()
-	notifyLogs := s.notifier.GetLogs()
+	// Notification logs carry delivery details of the webhook integrations (system settings).
+	notifyLogs := []models.NotificationLog{}
+	if auth.CanManageSystem(claims) {
+		notifyLogs = s.notifier.GetLogs()
+	}
 	scope := scopeFor(claims)
 	if scope != nil {
 		snap, servers = scope.snapshot(snap, servers)
 		bandwidth = scope.bandwidth(bandwidth)
-		notifyLogs = nil
 	}
 
 	totalFleetServers := 0

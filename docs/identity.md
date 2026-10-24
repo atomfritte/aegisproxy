@@ -20,8 +20,8 @@ ITSM connectors, scripts) uses **service accounts** with API keys. Both get one 
 |---|---|---|
 | `SUPER_ADMIN` | everything, incl. users, service accounts, SSO, log export and Defender settings | platform owners (2–5 people) |
 | `INFOSEC_APPROVER` | all server groups; BLOCK rules, threat protection, fleet, requests | security team, SOAR |
-| `TEAM_LEAD_APPROVER` | only the groups in `allowed_groups`; ALLOW rules, requests, learning sessions | application/team leads |
-| `OPERATOR_AUDITOR` | read-only | auditors, NOC, reporting jobs |
+| `TEAM_LEAD_APPROVER` | only the groups in `allowed_groups`; ALLOW rules, requests, learning sessions. Reads only their groups' servers, traffic, requests, sessions, security and audit events and policy objects (sets scoped to their groups or servers, baseline sets, the resulting rules, change requests, TLS exceptions); foreign objects answer 404 | application/team leads |
+| `OPERATOR_AUDITOR` | read-only (not the notification log of the webhook integrations) | auditors, NOC, reporting jobs |
 
 The full permission matrix is in [security.md](security.md#roles-rbac) and
 [policy-management.md](policy-management.md#roles-and-permissions). Roles are re-read from the live account on

@@ -76,12 +76,38 @@ func (s *Server) policyRoutes() {
 // Policy sets
 // ---------------------------------------------------------------------------
 
+// policyViewFor returns nil for callers that may read every policy object (see policyView).
+func (s *Server) policyViewFor(claims *auth.TokenClaims) *policyView {
+	scope := scopeFor(claims)
+	if scope == nil {
+		return nil
+	}
+	return scope.policyView(s.store.Servers(), s.store.PolicySets())
+}
+
+// policySetVisible answers 404 for sets outside a Team Lead's scope.
+func (s *Server) policySetVisible(w http.ResponseWriter, claims *auth.TokenClaims, id string) bool {
+	if v := s.policyViewFor(claims); v != nil && !v.set(id) {
+		writeError(w, http.StatusNotFound, "policy set not found")
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleEffectiveRules(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
-	writeJSON(w, http.StatusOK, s.store.GetSnapshot().Rules)
+	rules := s.store.GetSnapshot().Rules
+	if v := s.policyViewFor(claims); v != nil {
+		rules = filterSlice(rules, v.rule)
+	}
+	writeJSON(w, http.StatusOK, rules)
 }
 
 func (s *Server) handleListPolicySets(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
-	writeJSON(w, http.StatusOK, s.store.PolicySets())
+	sets := s.store.PolicySets()
+	if v := s.policyViewFor(claims); v != nil {
+		sets = filterSlice(sets, func(p models.PolicySet) bool { return v.set(p.ID) })
+	}
+	writeJSON(w, http.StatusOK, sets)
 }
 
 func (s *Server) handleCreatePolicySet(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
@@ -112,6 +138,9 @@ func stripServerFields(spec *models.PolicySetSpec) {
 // handleExportPolicySets downloads policy sets as a JSON bundle (?id=…&id=… selects sets).
 func (s *Server) handleExportPolicySets(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	b := s.store.ExportPolicySets(r.URL.Query()["id"], claims)
+	if v := s.policyViewFor(claims); v != nil {
+		b.PolicySets = filterSlice(b.PolicySets, func(d models.PolicySetDocument) bool { return v.set(d.ID) })
+	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="aegis-policy-sets-%s.json"`, time.Now().UTC().Format("20060102-150405")))
 	writeJSON(w, http.StatusOK, b)
 }
@@ -146,6 +175,9 @@ func (s *Server) handleGetPolicySet(w http.ResponseWriter, r *http.Request, clai
 	set, ok := s.store.PolicySet(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "policy set not found")
+		return
+	}
+	if !s.policySetVisible(w, claims, id) {
 		return
 	}
 	var crs []models.ChangeRequest
@@ -298,7 +330,7 @@ func (s *Server) handleSimulateSet(w http.ResponseWriter, r *http.Request, claim
 		}
 		spec = &cp
 	}
-	impact, err := s.store.SimulateSpec(id, spec)
+	impact, err := s.store.SimulateSpec(id, spec, claims)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -312,6 +344,9 @@ func (s *Server) handleDiffSet(w http.ResponseWriter, r *http.Request, claims *a
 	set, ok := s.store.PolicySet(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "policy set not found")
+		return
+	}
+	if !s.policySetVisible(w, claims, id) {
 		return
 	}
 	versions := s.store.PolicyVersions(id)
@@ -355,6 +390,9 @@ func (s *Server) handleDiffSet(w http.ResponseWriter, r *http.Request, claims *a
 }
 
 func (s *Server) handleListVersions(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
+		return
+	}
 	writeJSON(w, http.StatusOK, versionSummaries(s.store.PolicyVersions(r.PathValue("id"))))
 }
 
@@ -362,6 +400,9 @@ func (s *Server) handleGetVersion(w http.ResponseWriter, r *http.Request, claims
 	n, err := strconv.Atoi(r.PathValue("version"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid version")
+		return
+	}
+	if !s.policySetVisible(w, claims, r.PathValue("id")) {
 		return
 	}
 	for _, v := range s.store.PolicyVersions(r.PathValue("id")) {
@@ -407,9 +448,10 @@ func (s *Server) handleRecertifySet(w http.ResponseWriter, r *http.Request, clai
 
 func (s *Server) handleListChangeRequests(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	status := r.URL.Query().Get("status")
+	v := s.policyViewFor(claims)
 	out := []models.ChangeRequest{}
 	for _, cr := range s.store.ChangeRequests() {
-		if status == "" || cr.Status == status {
+		if (status == "" || cr.Status == status) && (v == nil || v.changeRequest(cr)) {
 			out = append(out, cr)
 		}
 	}
@@ -418,7 +460,7 @@ func (s *Server) handleListChangeRequests(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleGetChangeRequest(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	cr, ok := s.store.ChangeRequest(r.PathValue("id"))
-	if !ok {
+	if v := s.policyViewFor(claims); !ok || (v != nil && !v.changeRequest(cr)) {
 		writeError(w, http.StatusNotFound, "change request not found")
 		return
 	}
@@ -492,10 +534,14 @@ func (s *Server) handleDiscoveredServers(w http.ResponseWriter, r *http.Request,
 
 func (s *Server) handleEffectivePolicy(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	ep, err := s.store.EffectivePolicy(r.PathValue("id"))
+	if scope := scopeFor(claims); err == nil && scope != nil && !scope.serverVisible(ep.Server) {
+		err = errors.New("server not found") // same answer as for unknown servers
+	}
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
+	ep.Server = ep.Server.Public()
 	writeJSON(w, http.StatusOK, ep)
 }
 

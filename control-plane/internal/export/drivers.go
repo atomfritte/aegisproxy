@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -186,7 +187,7 @@ func (h *httpBase) post(ctx context.Context, target string, body []byte, content
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, &permanentError{err.Error()}
+		return nil, &permanentError{fmt.Sprintf("%s: %v", h.redact(target), stripURL(err))}
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "AegisProxy-Exporter/"+h.meta.Version)
@@ -201,7 +202,7 @@ func (h *httpBase) post(ctx context.Context, target string, body []byte, content
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %v", redactURL(target), err)
+		return nil, fmt.Errorf("%s: %w", h.redact(target), stripURL(err))
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -209,19 +210,31 @@ func (h *httpBase) post(ctx context.Context, target string, body []byte, content
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return respBody, nil
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, redactURL(target), snippet(respBody))
+		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, h.redact(target), snippet(respBody))
 	default:
-		return nil, &permanentError{fmt.Sprintf("HTTP %d from %s: %s", resp.StatusCode, redactURL(target), snippet(respBody))}
+		return nil, &permanentError{fmt.Sprintf("HTTP %d from %s: %s", resp.StatusCode, h.redact(target), snippet(respBody))}
 	}
 }
 
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
+// redact names a request target in errors without credentials: no user info or query and, for
+// webhooks, no path (see models.MaskSinkEndpoint).
+func (h *httpBase) redact(target string) string {
+	u, err := url.Parse(target)
 	if err != nil {
 		return "endpoint"
 	}
-	u.User, u.RawQuery = nil, ""
-	return u.String()
+	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+	return models.MaskSinkEndpoint(h.cfg.Type, u.String())
+}
+
+// stripURL drops the request URL that net/http quotes in transport errors (*url.Error): it may
+// carry a token in its query or path. Callers name the destination themselves.
+func stripURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 func snippet(b []byte) string {
@@ -458,10 +471,60 @@ func (d *otlpDriver) send(ctx context.Context, recs [][]byte) error {
 type splunkDriver struct {
 	httpBase
 	channel string
+	// Progress of the batch being retried (a retry may have grown by records spooled meanwhile): its
+	// confirmed leading records are indexed, the pending ones after them await their acknowledgement.
+	mu        sync.Mutex
+	confirmed hecRecords
+	pending   *hecPending
+}
+
+// hecRecords identifies the first n records of a batch.
+type hecRecords struct {
+	n      int
+	digest [32]byte
+}
+
+// hecPending are records HEC accepted whose indexer acknowledgement is still outstanding.
+type hecPending struct {
+	hecRecords
+	id     int64
+	sentAt time.Time
 }
 
 // splunkAckTimeout bounds the wait for an indexer acknowledgement; the batch is resent afterwards.
 var splunkAckTimeout = 2 * time.Minute
+
+func recordsOf(recs [][]byte) hecRecords {
+	h := sha256.New()
+	var l [8]byte
+	for _, r := range recs {
+		binary.BigEndian.PutUint64(l[:], uint64(len(r)))
+		h.Write(l[:])
+		h.Write(r)
+	}
+	out := hecRecords{n: len(recs)}
+	copy(out.digest[:], h.Sum(nil))
+	return out
+}
+
+// leads reports whether recs start with the identified records.
+func (r hecRecords) leads(recs [][]byte) bool {
+	return r.n > 0 && len(recs) >= r.n && recordsOf(recs[:r.n]) == r
+}
+
+func (d *splunkDriver) clearPending(id int64) {
+	d.mu.Lock()
+	if d.pending != nil && d.pending.id == id {
+		d.pending = nil
+	}
+	d.mu.Unlock()
+}
+
+func (d *splunkDriver) reset() {
+	d.mu.Lock()
+	d.confirmed, d.pending = hecRecords{}, nil
+	d.mu.Unlock()
+}
 
 // hecChannel is the HEC request channel (a GUID) of a destination: stable across restarts, so Splunk
 // keeps one acknowledgement queue per destination. Unsaved destinations (connection test) get a random one.
@@ -516,10 +579,34 @@ func (d *splunkDriver) encode(ev Event) ([]byte, error) {
 
 // send posts a batch. Tokens with indexer acknowledgement require a request channel and answer with an
 // ackId; the batch then counts as delivered only once Splunk confirms it was indexed.
+//
+// A delivery attempt is shorter than splunkAckTimeout. When it ends while an acknowledgement is still
+// outstanding, the retried batch is not posted again: the next attempts keep polling the same ackId,
+// and only an acknowledgement that does not arrive within splunkAckTimeout leads to a resend.
 func (d *splunkDriver) send(ctx context.Context, recs [][]byte) error {
 	hdr := map[string]string{"Authorization": "Splunk " + string(d.cfg.Secret), "X-Splunk-Request-Channel": d.channel}
 	target := endpointWithPath(d.cfg.Endpoint, "/services/collector/event")
-	resp, err := d.post(ctx, target, bytes.Join(recs, []byte("\n")), "application/json", true, hdr)
+	d.mu.Lock()
+	if !d.confirmed.leads(recs) {
+		d.confirmed = hecRecords{}
+	}
+	skip, p := d.confirmed.n, d.pending
+	d.mu.Unlock()
+	if p != nil && time.Since(p.sentAt) < splunkAckTimeout && p.leads(recs[skip:]) {
+		if err := d.awaitAck(ctx, target, *p, hdr); err != nil {
+			return err
+		}
+		skip += p.n
+		d.mu.Lock()
+		d.confirmed = recordsOf(recs[:skip])
+		d.mu.Unlock()
+	}
+	rest := recs[skip:]
+	if len(rest) == 0 {
+		d.reset()
+		return nil
+	}
+	resp, err := d.post(ctx, target, bytes.Join(rest, []byte("\n")), "application/json", true, hdr)
 	if err != nil {
 		return err
 	}
@@ -527,14 +614,25 @@ func (d *splunkDriver) send(ctx context.Context, recs [][]byte) error {
 		AckID *int64 `json:"ackId"`
 	}
 	if json.Unmarshal(resp, &r) != nil || r.AckID == nil {
+		d.reset()
 		return nil // indexer acknowledgement is disabled for this token
 	}
-	return d.awaitAck(ctx, target, *r.AckID, hdr)
+	p = &hecPending{hecRecords: recordsOf(rest), id: *r.AckID, sentAt: time.Now()}
+	d.mu.Lock()
+	d.pending = p
+	d.mu.Unlock()
+	if err := d.awaitAck(ctx, target, *p, hdr); err != nil {
+		return err
+	}
+	d.reset()
+	return nil
 }
 
-// awaitAck polls /services/collector/ack until the batch is indexed. Without a confirmation in time the
-// batch is resent (at-least-once delivery, as Splunk recommends for acknowledged HEC).
-func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, id int64, hdr map[string]string) error {
+// awaitAck polls /services/collector/ack until the batch is indexed. Without a confirmation within
+// splunkAckTimeout of sending, the batch is resent (at-least-once delivery, as Splunk recommends for
+// acknowledged HEC); when the attempt's context ends first, the acknowledgement stays pending.
+func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, p hecPending, hdr map[string]string) error {
+	id := p.id
 	u, err := url.Parse(eventURL)
 	if err != nil {
 		return &permanentError{err.Error()}
@@ -549,7 +647,7 @@ func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, id int64, 
 	u.RawQuery = q.Encode()
 	body := []byte(fmt.Sprintf(`{"acks":[%d]}`, id))
 	key := strconv.FormatInt(id, 10)
-	deadline := time.Now().Add(splunkAckTimeout)
+	deadline := p.sentAt.Add(splunkAckTimeout)
 	wait := 200 * time.Millisecond
 	for {
 		if resp, err := d.post(ctx, u.String(), body, "application/json", false, hdr); err == nil {
@@ -557,15 +655,18 @@ func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, id int64, 
 				Acks map[string]bool `json:"acks"`
 			}
 			if json.Unmarshal(resp, &r) == nil && r.Acks[key] {
+				d.clearPending(id)
 				return nil
 			}
 		}
 		if time.Now().After(deadline) {
+			d.clearPending(id)
 			return fmt.Errorf("Splunk HEC: no indexer acknowledgement for ackId %d within %s on channel %s; the batch will be resent", id, splunkAckTimeout, d.channel)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("Splunk HEC: indexer acknowledgement for ackId %d on channel %s still outstanding after %s; polling again before resending",
+				id, d.channel, time.Since(p.sentAt).Round(time.Second))
 		case <-time.After(wait):
 		}
 		if wait < 5*time.Second {
@@ -755,11 +856,11 @@ func (d *sentinelDriver) accessToken(ctx context.Context) (string, error) {
 		}
 	}
 	if err != nil {
-		return "", &permanentError{err.Error()}
+		return "", &permanentError{stripURL(err).Error()}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("Entra ID token request: %v", err)
+		return "", fmt.Errorf("Entra ID token request: %w", stripURL(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

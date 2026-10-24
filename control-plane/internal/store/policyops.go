@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"aegisproxy/control-plane/internal/auth"
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
 )
@@ -252,10 +254,33 @@ func ruleDecision(idx *engine.CompiledPolicyIndex, host, path, method, srvID str
 
 // SimulateSpec replays the recorded traffic window against the current policy and against the
 // policy that would result from publishing spec for set setID ("" = a new set of the given spec).
-func (s *Store) SimulateSpec(setID string, spec *models.PolicySetSpec) (models.ImpactSummary, error) {
+// Team Leads may only simulate sets they could change and only see their groups' servers and traffic.
+func (s *Store) SimulateSpec(setID string, spec *models.PolicySetSpec, actor *auth.TokenClaims) (models.ImpactSummary, error) {
+	if actor == nil {
+		return models.ImpactSummary{}, errors.New("unauthenticated")
+	}
+	scoped := actor.Role == models.RoleTeamLead && !slices.Contains(actor.AllowedGroups, "*")
 	s.mu.RLock()
+	if scoped {
+		kind, scopes := models.PolicySetKindStandard, []models.PolicySetSpec{*spec}
+		if i := s.setIndexLocked(setID); i >= 0 {
+			kind = s.state.PolicySets[i].Kind
+			scopes = append(scopes, s.state.PolicySets[i].PolicySetSpec)
+		}
+		if err := s.canManageSetLocked(actor, kind, scopes...); err != nil {
+			s.mu.RUnlock()
+			return models.ImpactSummary{}, err
+		}
+	}
 	in := s.simulationInputLocked(setID, spec)
 	s.mu.RUnlock()
+	if scoped {
+		mine := func(groups []string) bool {
+			return slices.ContainsFunc(groups, func(g string) bool { return slices.Contains(actor.AllowedGroups, g) })
+		}
+		in.servers = slices.DeleteFunc(in.servers, func(srv models.Server) bool { return !mine(srv.EffectiveGroupIDs) && !mine(srv.GroupIDs) })
+		in.flows = slices.DeleteFunc(in.flows, func(f models.TrafficFlow) bool { return !mine(f.GroupIDs) })
+	}
 	return simulate(in), nil
 }
 

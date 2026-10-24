@@ -1,6 +1,8 @@
 package export
 
 import (
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +28,11 @@ type fakeHEC struct {
 	pending  map[string]map[int64]int // channel -> ackId -> remaining "not yet indexed" polls
 	channels []string
 	events   int
+	records  int
 	ackPolls int
 	never    bool
+	ackAfter time.Duration // acknowledge only this long after the event request (slow indexers)
+	sentAt   map[int64]time.Time
 }
 
 func (f *fakeHEC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,12 +53,24 @@ func (f *fakeHEC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.channels = append(f.channels, ch)
 		f.events++
+		var body io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			if zr, err := gzip.NewReader(r.Body); err == nil {
+				body = zr
+			}
+		}
+		b, _ := io.ReadAll(body)
+		f.records += len(strings.Split(strings.TrimSpace(string(b)), "\n"))
 		if f.pending[ch] == nil {
 			f.pending[ch] = map[int64]int{}
 		}
 		id := f.nextAck
 		f.nextAck++
 		f.pending[ch][id] = 2
+		if f.sentAt == nil {
+			f.sentAt = map[int64]time.Time{}
+		}
+		f.sentAt[id] = time.Now()
 		http.SetCookie(w, &http.Cookie{Name: "hec_lb", Value: "indexer-7"})
 		fmt.Fprintf(w, `{"text":"Success","code":0,"ackId":%d}`, id)
 	case "/services/collector/ack":
@@ -73,7 +90,7 @@ func (f *fakeHEC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if left > 0 {
 				f.pending[r.URL.Query().Get("channel")][id] = left - 1
 			}
-			out[fmt.Sprint(id)] = left <= 1 && !f.never
+			out[fmt.Sprint(id)] = left <= 1 && !f.never && time.Since(f.sentAt[id]) >= f.ackAfter
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"acks": out})
 	default:
@@ -125,6 +142,91 @@ func TestSplunkIndexerAcknowledgement(t *testing.T) {
 	var perm *permanentError
 	if errors.As(err, &perm) {
 		t.Fatal("a missing acknowledgement must be retried, not dropped as permanent")
+	}
+}
+
+// An indexer that acknowledges later than one delivery attempt lasts must not get the batch again on
+// every retry: the retries poll the outstanding ackId, and only splunkAckTimeout triggers a resend.
+func TestSplunkSlowAcknowledgementNotDuplicated(t *testing.T) {
+	oldAck, oldDeliver := splunkAckTimeout, deliveryTimeout
+	splunkAckTimeout, deliveryTimeout = 4*time.Second, 300*time.Millisecond
+	defer func() { splunkAckTimeout, deliveryTimeout = oldAck, oldDeliver }()
+	hec := &fakeHEC{pending: map[string]map[int64]int{}, ackAfter: 1500 * time.Millisecond}
+	srv := httptest.NewServer(hec)
+	defer srv.Close()
+	counts := func() (int, int) {
+		hec.mu.Lock()
+		defer hec.mu.Unlock()
+		return hec.events, hec.records
+	}
+	s := models.ExportSink{ID: "exp-slow", Name: "splunk", Type: "splunk_hec", Enabled: true, Streams: []string{"audit"}, Endpoint: srv.URL,
+		Secret: "hec-token", BatchSize: 2, FlushSeconds: 1}
+	if err := Validate(&s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Through the runtime: attempts end after 300 ms, the acknowledgement comes after 1.5 s.
+	m := New(Options{SpoolDir: t.TempDir(), Node: "n1", Version: "t"})
+	m.Configure([]models.ExportSink{s})
+	for i := 0; i < 2; i++ {
+		m.Publish(AuditEvent(models.AuditEvent{ID: fmt.Sprintf("slow-%d", i), Timestamp: time.Now(), Actor: "admin", Action: "LOGIN"}))
+	}
+	waitFor(t, "slowly acknowledged batch delivered", func() bool { return m.Status()[0].Sent == 2 })
+	m.Close()
+	if events, records := counts(); events != 1 || records != 2 {
+		t.Fatalf("batch resent while its acknowledgement was outstanding: %d event requests, %d records", events, records)
+	}
+
+	// A retried batch that grew by spooled records: the accepted prefix is polled, only the rest is sent.
+	drv, err := newDriver(s, meta, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := func(id string) []byte {
+		rec, err := drv.encode(AuditEvent(models.AuditEvent{ID: id, Timestamp: time.Now(), Actor: "admin", Action: "LOGIN"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+	first := [][]byte{enc("g1"), enc("g2")}
+	attempt := func(recs [][]byte) error {
+		ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+		defer cancel()
+		return drv.send(ctx, recs)
+	}
+	if err := attempt(first); err == nil || !strings.Contains(err.Error(), "still outstanding") {
+		t.Fatalf("first attempt: %v", err)
+	}
+	var perm *permanentError
+	grown := append(append([][]byte{}, first...), enc("g3"))
+	for i := 0; ; i++ {
+		err := attempt(grown)
+		if err == nil {
+			break
+		}
+		if errors.As(err, &perm) || i > 40 {
+			t.Fatalf("retry %d: %v", i, err)
+		}
+	}
+	if events, records := counts(); events != 3 || records != 5 {
+		t.Fatalf("grown batch: %d event requests, %d records (want the prefix polled and only g3 sent)", events, records)
+	}
+
+	// An acknowledgement that never comes: resent once per splunkAckTimeout, not once per attempt.
+	splunkAckTimeout = time.Second
+	hec.mu.Lock()
+	hec.never = true
+	hec.mu.Unlock()
+	lost := [][]byte{enc("never")}
+	start, before := time.Now(), hec.events
+	for time.Since(start) < 3200*time.Millisecond {
+		if err := attempt(lost); err == nil || errors.As(err, &perm) {
+			t.Fatalf("unacknowledged batch: %v", err)
+		}
+	}
+	if events, _ := counts(); events-before < 2 || events-before > 5 {
+		t.Fatalf("unacknowledged batch sent %d times in 3.2 s (want one resend per second)", events-before)
 	}
 }
 
@@ -181,6 +283,35 @@ func TestSentinelSovereignClouds(t *testing.T) {
 		}
 		if gotURL != want[0] || gotScope != want[1] {
 			t.Errorf("%s: token from %s with scope %s, want %s with %s", endpoint, gotURL, gotScope, want[0], want[1])
+		}
+	}
+}
+
+// Managed and workload identity tokens belong to the platform, not to the sink's author: they may
+// only be sent to Azure Monitor and Entra ID (loopback stays open for test doubles).
+func TestSentinelAmbientIdentityPinnedToMicrosoft(t *testing.T) {
+	base := models.ExportSink{Name: "s", Type: "sentinel", Streams: []string{"audit"}, DCRImmutableID: "dcr-1", TenantID: "t", ClientID: "c"}
+	for _, c := range []struct {
+		auth, endpoint, authority string
+		ok                        bool
+	}{
+		{"workload_identity", "https://attacker.example", "", false},
+		{"managed_identity", "https://attacker.example/dataCollectionRules", "", false},
+		{"managed_identity", "https://monitor.azure.com.attacker.example", "", false},
+		{"workload_identity", "https://dce-1.westeurope-1.ingest.monitor.azure.com", "https://attacker.example", false},
+		{"workload_identity", "https://dce-1.westeurope-1.ingest.monitor.azure.com", "", true},
+		{"workload_identity", "https://dce-1.usgovvirginia-1.ingest.monitor.azure.us", "https://login.microsoftonline.us", true},
+		{"managed_identity", "https://dce-1.chinanorth3-1.ingest.privatelink.monitor.azure.cn", "", true},
+		{"workload_identity", "https://localhost:8443", "https://127.0.0.1:8443", true},
+		{"client_secret", "https://collector.corp.example", "https://login.microsoftonline.com", true}, // the author supplies the secret
+	} {
+		s := base
+		s.AzureAuth, s.Endpoint, s.AuthorityURL = c.auth, c.endpoint, c.authority
+		if c.auth == "client_secret" {
+			s.Secret = "secret"
+		}
+		if err := Validate(&s); (err == nil) != c.ok {
+			t.Errorf("%s %s %s: %v", c.auth, c.endpoint, c.authority, err)
 		}
 	}
 }

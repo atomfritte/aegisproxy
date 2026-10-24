@@ -88,10 +88,11 @@ func (s *Store) exportSinkLocked(id string) *models.ExportSink {
 	return nil
 }
 
-// unmaskEndpoint restores the stored endpoint when the masked form (query values hidden) is sent back.
+// unmaskEndpoint restores the stored endpoint when the masked form (query values or webhook path
+// hidden) is sent back.
 func unmaskEndpoint(in *models.ExportSink, prev *models.ExportSink) {
 	if prev != nil && in.Endpoint != prev.Endpoint && strings.Contains(in.Endpoint, models.MaskedSecretMarker) &&
-		in.Endpoint == models.MaskURLQuery(prev.Endpoint) {
+		in.Endpoint == models.MaskSinkEndpoint(prev.Type, prev.Endpoint) {
 		in.Endpoint = prev.Endpoint
 	}
 }

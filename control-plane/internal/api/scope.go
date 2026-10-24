@@ -9,7 +9,8 @@ import (
 )
 
 // teamScope implements need-to-know for Team Leads: they see requests, traffic, sessions, security
-// events, servers and audit entries of their own server groups only. Other roles see everything.
+// events, servers, policy objects and audit entries of their own server groups only. Other roles see
+// everything.
 type teamScope struct {
 	groups map[string]bool
 	user   string
@@ -50,8 +51,9 @@ func filterSlice[T any](in []T, keep func(T) bool) []T {
 
 // snapshot restricts a state snapshot and the server list to the Team Lead's groups.
 func (t *teamScope) snapshot(snap store.StateSnapshot, servers []models.Server) (store.StateSnapshot, []models.Server) {
-	servers = filterSlice(servers, func(s models.Server) bool { return t.anyOf(s.EffectiveGroupIDs, s.GroupIDs) })
-	snap.Servers = filterSlice(snap.Servers, func(s models.Server) bool { return t.anyOf(s.EffectiveGroupIDs, s.GroupIDs) })
+	snap = t.policies(snap, servers)
+	servers = filterSlice(servers, t.serverVisible)
+	snap.Servers = filterSlice(snap.Servers, t.serverVisible)
 	snap.Requests = filterSlice(snap.Requests, func(r models.AccessRequest) bool { return t.anyOf(r.TargetGroupIDs, r.GroupIDs) })
 	snap.Flows = filterSlice(snap.Flows, func(f models.TrafficFlow) bool { return t.anyOf(f.GroupIDs) })
 	snap.Sessions = filterSlice(snap.Sessions, func(s models.LearningSession) bool { return t.anyOf(s.GroupIDs) })
@@ -63,6 +65,72 @@ func (t *teamScope) snapshot(snap store.StateSnapshot, servers []models.Server) 
 			(u.Role == models.RoleTeamLead && t.anyOf(u.AllowedGroups))
 	})
 	return snap, servers
+}
+
+// serverVisible reports whether a server belongs to one of the Team Lead's groups.
+func (t *teamScope) serverVisible(srv models.Server) bool {
+	return t.anyOf(srv.EffectiveGroupIDs, srv.GroupIDs)
+}
+
+// policyView decides which policy objects a Team Lead may read: baseline sets (they apply to every
+// server), sets scoped to their groups or servers, sets they created and the rules, change requests
+// and TLS bypass entries that belong to them.
+type policyView struct {
+	t       *teamScope
+	servers map[string]bool // in-scope server IDs
+	sets    map[string]bool // visible policy set IDs
+}
+
+func (t *teamScope) policyView(servers []models.Server, sets []models.PolicySet) *policyView {
+	v := &policyView{t: t, servers: map[string]bool{}, sets: map[string]bool{}}
+	for _, srv := range servers {
+		if t.serverVisible(srv) {
+			v.servers[srv.ID] = true
+		}
+	}
+	for _, set := range sets {
+		if set.Kind == models.PolicySetKindBaseline || set.CreatedBy == t.user || v.scoped(set.GroupIDs, set.ServerIDs) ||
+			(set.Draft != nil && v.scoped(set.Draft.Spec.GroupIDs, set.Draft.Spec.ServerIDs)) {
+			v.sets[set.ID] = true
+		}
+	}
+	return v
+}
+
+// scoped reports whether a group/server scope reaches one of the Team Lead's servers ("*" reaches all).
+func (v *policyView) scoped(groups, servers []string) bool {
+	if slices.Contains(groups, "*") || slices.Contains(servers, "*") || v.t.anyOf(groups) {
+		return true
+	}
+	return slices.ContainsFunc(servers, func(id string) bool { return v.servers[id] })
+}
+
+func (v *policyView) set(id string) bool { return v.sets[id] }
+
+func (v *policyView) rule(r models.PolicyRule) bool {
+	if r.PolicySetID != "" {
+		return v.sets[r.PolicySetID]
+	}
+	return v.scoped(r.GroupIDs, r.ServerIDs)
+}
+
+func (v *policyView) changeRequest(cr models.ChangeRequest) bool {
+	return v.sets[cr.PolicySetID] || cr.SubmittedBy == v.t.user
+}
+
+// tlsBypass: entries without a scope apply to every server.
+func (v *policyView) tlsBypass(b models.TLSBypassRule) bool {
+	return (len(b.GroupIDs) == 0 && len(b.ServerIDs) == 0) || v.scoped(b.GroupIDs, b.ServerIDs)
+}
+
+// policies restricts the policy part of a state snapshot (servers must be the unfiltered list).
+func (t *teamScope) policies(snap store.StateSnapshot, servers []models.Server) store.StateSnapshot {
+	v := t.policyView(servers, snap.PolicySets)
+	snap.PolicySets = filterSlice(snap.PolicySets, func(p models.PolicySet) bool { return v.set(p.ID) })
+	snap.Rules = filterSlice(snap.Rules, v.rule)
+	snap.ChangeRequests = filterSlice(snap.ChangeRequests, v.changeRequest)
+	snap.TLSBypass = filterSlice(snap.TLSBypass, v.tlsBypass)
+	return snap
 }
 
 func (t *teamScope) bandwidth(b models.BandwidthSummary) models.BandwidthSummary {

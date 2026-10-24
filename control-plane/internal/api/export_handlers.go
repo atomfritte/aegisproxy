@@ -17,6 +17,12 @@ func (s *Server) handleListExports(w http.ResponseWriter, r *http.Request, claim
 	if status == nil {
 		status = []models.ExportSinkStatus{}
 	}
+	if claims.Role != models.RoleSuperAdmin {
+		// Destination responses may echo request details; only the sink owner sees them in full.
+		for i := range status {
+			status[i].LastError = export.ShortError(status[i].LastError)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sinks": s.store.ExportSinks(), "status": status, "types": export.Types,
 		"export_dir": s.cfg.ExportDir, "can_edit": claims.Role == models.RoleSuperAdmin,

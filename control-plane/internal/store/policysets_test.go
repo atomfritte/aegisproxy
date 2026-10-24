@@ -271,12 +271,61 @@ func TestImpactSimulation(t *testing.T) {
 	}
 	spec := set.PolicySetSpec
 	spec.Rules = []models.PolicyRule{{Name: "pypi", Action: "ALLOW", HostPattern: "pypi.org", PathPattern: "/**", Enabled: true}}
-	imp, err := st.SimulateSpec(set.ID, &spec)
+	imp, err := st.SimulateSpec(set.ID, &spec, adminClaims)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if imp.FlowsEvaluated != 2 || imp.NewlyAllowed != 1 || imp.NewlyBlocked != 1 || imp.AffectedServers != 1 || imp.TargetServers != 1 {
 		t.Fatalf("impact: %+v", imp)
+	}
+}
+
+// A Team Lead may only simulate sets of their groups and only sees their groups' servers and traffic.
+func TestImpactSimulationTeamLeadScope(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), false)
+	setupFleet(t, st)
+	ciSet := publishSet(t, st, adminClaims, "CI", []string{"grp-ci"}, models.PolicyRule{Name: "gh", Action: "ALLOW", HostPattern: "github.com", PathPattern: "/**", Enabled: true})
+	vaultSet := publishSet(t, st, adminClaims, "Vault", []string{"grp-vault"}, models.PolicyRule{Name: "hv", Action: "ALLOW", HostPattern: "releases.hashicorp.com", PathPattern: "/**", Enabled: true})
+	for _, f := range []models.TrafficFlow{
+		{ServerIP: "10.1.0.5", Method: "GET", Host: "pypi.org", Path: "/simple/", FullURL: "https://pypi.org/simple/", Verdict: models.VerdictBlocked, BlockReason: "default_deny"},
+		{ServerIP: "10.9.0.5", Method: "GET", Host: "secret.vault.example", Path: "/v1/token", FullURL: "https://secret.vault.example/v1/token?x=1", Verdict: models.VerdictBlocked, BlockReason: "default_deny"},
+	} {
+		st.RecordFlow(f)
+	}
+	tl := &auth.TokenClaims{UserID: "u-tl", Username: "tl", Role: models.RoleTeamLead, AllowedGroups: []string{"grp-ci"}}
+	catchAll := []models.PolicyRule{{Name: "all", Action: "ALLOW", HostPattern: "*", PathPattern: "/**", Enabled: true}}
+
+	foreign := vaultSet.PolicySetSpec
+	foreign.Rules = catchAll
+	if _, err := st.SimulateSpec(vaultSet.ID, &foreign, tl); err == nil {
+		t.Fatal("Team Lead simulated a set of a foreign group")
+	}
+	if _, err := st.SimulateSpec("new", &models.PolicySetSpec{Name: "x", GroupIDs: []string{"grp-vault"}, Rules: catchAll}, tl); err == nil {
+		t.Fatal("Team Lead simulated a new set for a foreign group")
+	}
+	if _, err := st.SimulateSpec(ciSet.ID, &models.PolicySetSpec{Name: "x", GroupIDs: []string{"grp-vault"}, Rules: catchAll}, tl); err == nil {
+		t.Fatal("Team Lead re-scoped their own set to a foreign group in a simulation")
+	}
+	if _, err := st.SimulateSpec("", &models.PolicySetSpec{Name: "x", Rules: catchAll}, tl); err == nil {
+		t.Fatal("Team Lead simulated an unscoped set")
+	}
+
+	own := ciSet.PolicySetSpec
+	own.Rules = catchAll
+	imp, err := st.SimulateSpec(ciSet.ID, &own, tl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imp.FlowsEvaluated != 1 || imp.TargetServers != 1 {
+		t.Fatalf("Team Lead impact covers foreign traffic or servers: %+v", imp)
+	}
+	for _, s := range imp.Samples {
+		if strings.Contains(s.URL, "vault") || s.ServerIP == "10.9.0.5" {
+			t.Fatalf("foreign sample leaked: %+v", s)
+		}
+	}
+	if full, err := st.SimulateSpec(ciSet.ID, &own, adminClaims); err != nil || full.FlowsEvaluated != 2 {
+		t.Fatalf("admin impact: %+v %v", full, err)
 	}
 }
 

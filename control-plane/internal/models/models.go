@@ -1015,9 +1015,22 @@ type ExportSink struct {
 	UpdatedBy string     `json:"updated_by,omitempty"`
 }
 
+// MaskSinkEndpoint hides credentials a sink URL may carry: query values always and, for webhooks,
+// the path (many webhook receivers embed their token there).
+func MaskSinkEndpoint(sinkType, endpoint string) string {
+	if sinkType == "webhook" {
+		if i := strings.Index(endpoint, "://"); i >= 0 {
+			if j := strings.IndexAny(endpoint[i+3:], "/?#"); j >= 0 && endpoint[i+3+j:] != "/" {
+				return MaskURL(endpoint)
+			}
+		}
+	}
+	return MaskURLQuery(endpoint)
+}
+
 // Public returns a copy with secrets redacted (header names are kept, values blanked).
 func (s ExportSink) Public() ExportSink {
-	s.Endpoint = MaskURLQuery(s.Endpoint)
+	s.Endpoint = MaskSinkEndpoint(s.Type, s.Endpoint)
 	s.HasSecret, s.HasClientKey = s.Secret != "", s.ClientKeyPEM != ""
 	s.Secret, s.ClientKeyPEM, s.ClearSecret = "", "", false
 	if s.Headers != nil {
@@ -1032,18 +1045,21 @@ func (s ExportSink) Public() ExportSink {
 
 // ExportSinkStatus is the delivery state of a sink on one control-plane node.
 type ExportSinkStatus struct {
-	ID            string     `json:"id"`
-	Node          string     `json:"node"`
-	State         string     `json:"state"` // ok | retrying | error | disabled | idle
-	Queued        int        `json:"queued"`
-	SpoolBytes    int64      `json:"spool_bytes"`
-	SpoolRecords  int64      `json:"spool_records"`
-	Sent          uint64     `json:"sent"`
-	Failed        uint64     `json:"failed"`
-	Dropped       uint64     `json:"dropped"`
-	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
-	LastError     string     `json:"last_error,omitempty"`
-	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
+	ID           string `json:"id"`
+	Node         string `json:"node"`
+	State        string `json:"state"` // ok | retrying | error | disabled | idle
+	Queued       int    `json:"queued"`
+	SpoolBytes   int64  `json:"spool_bytes"`
+	SpoolRecords int64  `json:"spool_records"`
+	Sent         uint64 `json:"sent"`
+	Failed       uint64 `json:"failed"`
+	Dropped      uint64 `json:"dropped"`
+	// DiscardedBatches counts batches the destination rejected permanently (4xx); sinks carrying audit
+	// or security records keep them in dead-letter.jsonl in their spool directory.
+	DiscardedBatches uint64     `json:"discarded_batches"`
+	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
+	LastError        string     `json:"last_error,omitempty"`
+	LastErrorAt      *time.Time `json:"last_error_at,omitempty"`
 }
 
 // PolicySetDocument is the portable representation of a policy set (policy as code).
