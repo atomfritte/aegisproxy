@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+from .addresses import embedded_ipv4
+
 
 @dataclass(frozen=True)
 class ThreatMatch:
@@ -121,10 +123,16 @@ class ThreatSnapshot:
         return None
 
     def match_ip(self, addr) -> Optional[ThreatMatch]:
+        """Matches the address and the IPv4 address it embeds (IPv4-mapped, NAT64, 6to4, IPv4-compatible): an indicator
+        for 198.51.100.23 also covers 64:ff9b::c633:6417 behind a NAT64 gateway. Same as Snapshot.MatchIP."""
         if getattr(addr, "ipv4_mapped", None):
             addr = addr.ipv4_mapped
-        if addr in self.exc_ips:
+        embedded = embedded_ipv4(addr)
+        if addr in self.exc_ips or (embedded is not None and embedded in self.exc_ips):
             return None
+        return self._match_addr(addr) or (self._match_addr(embedded) if embedded is not None else None)
+
+    def _match_addr(self, addr) -> Optional[ThreatMatch]:
         if addr in self.ips:
             return self._match("ip", str(addr), self.ips[addr])
         for length in self.net_lengths:

@@ -184,6 +184,8 @@ func TestEvaluatePolicyOrder(t *testing.T) {
 		{"8.8.8.8", "/", 443, models.VerdictPolicyBlocked, "ip_literal"},
 		{"169.254.169.254", "/latest/meta-data", 80, models.VerdictPolicyBlocked, "forbidden_destination"},
 		{"localhost", "/", 80, models.VerdictPolicyBlocked, "forbidden_destination"},
+		{"[64:ff9b::a9fe:a9fe]", "/latest/meta-data", 80, models.VerdictPolicyBlocked, "forbidden_destination"}, // NAT64
+		{"[2002:a83f:8110::1]", "/machine", 80, models.VerdictPolicyBlocked, "forbidden_destination"},           // 6to4 WireServer
 		{"db.internal.corp", "/", 443, models.VerdictPolicyBlocked, "internal_destination"},
 		{"10.0.0.1", "/", 443, models.VerdictPolicyBlocked, "ip_literal"},
 		{"example.org", "/", 8443, models.VerdictPolicyBlocked, "port_not_allowed"},

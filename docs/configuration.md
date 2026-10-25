@@ -250,7 +250,7 @@ control-plane (and `AEGIS_COOKIE_SAMESITE=none` if console and API are on differ
 | `blocked_file_types` | – | File types blocked globally (magic bytes): `pe`, `elf`, `macho`, `java_class`, `msi_ole`, `script`, `jar`, `apk`, `zip`, `archive`, `office_macro`, `iso`. |
 | `group_blocked_file_types` | – | Additional per-group blocks, e.g. `{"grp-db-vault": ["pe","elf","script"]}`. |
 | `block_ip_literals` | `true` | Bare IP destinations require an explicit rule. |
-| `block_private_destinations` | `true` | Internal destinations (RFC 1918, ULA, CGNAT, internal suffixes) require an explicit rule; DNS-rebinding protection. Loopback, link-local and cloud metadata are **always** blocked. |
+| `block_private_destinations` | `true` | Internal destinations (RFC 1918, ULA, CGNAT, documentation and reserved ranges, internal suffixes, also embedded in NAT64/6to4 addresses; [table](threat-protection.md#protocol-and-destination-hygiene)) require an explicit rule; DNS-rebinding protection. Loopback, link-local and cloud metadata are **always** blocked. |
 | `block_raw_tcp` | `true` | No non-HTTP protocols through CONNECT tunnels. |
 | `allowed_ports` | `80, 443` | Allowed destination ports. |
 | `punycode_mode` | `monitor` | IDN homograph protection. |

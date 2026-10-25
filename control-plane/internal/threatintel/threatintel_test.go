@@ -67,6 +67,9 @@ func TestSnapshotMatching(t *testing.T) {
 		{"203.0.113.77", true},        // CIDR
 		{"198.51.100.9", true},
 		{"[::ffff:198.51.100.9]", true},
+		{"[64:ff9b::c633:6409]", true}, // NAT64 of 198.51.100.9 (review round 3)
+		{"[2002:cb00:714d::1]", true},  // 6to4 of 203.0.113.77 (CIDR)
+		{"[64:ff9b::808:808]", false},  // NAT64 of an address without indicator
 		{"good.example", false},
 		{"example", false},
 	}

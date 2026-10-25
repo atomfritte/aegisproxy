@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 )
 
 // Source identifies where an indicator came from (a feed or the custom IOC list).
@@ -248,11 +249,25 @@ func (s *Snapshot) MatchURL(rawURL string) (Match, bool) {
 	return Match{}, false
 }
 
+// MatchIP matches the address and the IPv4 address it embeds (IPv4-mapped, NAT64, 6to4, IPv4-compatible): an
+// indicator for 198.51.100.23 also covers 64:ff9b::c633:6417 behind a NAT64 gateway. Same as match_ip in the
+// data-plane.
 func (s *Snapshot) MatchIP(a netip.Addr) (Match, bool) {
-	a = a.Unmap()
+	a = a.Unmap().WithZone("")
+	v4, embedded := netguard.EmbeddedIPv4(a)
 	if _, ex := s.excIPs[a]; ex {
 		return Match{}, false
 	}
+	if _, ex := s.excIPs[v4]; embedded && ex {
+		return Match{}, false
+	}
+	if m, ok := s.matchAddr(a); ok || !embedded {
+		return m, ok
+	}
+	return s.matchAddr(v4)
+}
+
+func (s *Snapshot) matchAddr(a netip.Addr) (Match, bool) {
 	if idx, ok := s.ips[a]; ok {
 		return s.match("ip", a.String(), idx), true
 	}

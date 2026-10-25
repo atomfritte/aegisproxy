@@ -160,6 +160,16 @@ class PolicyTests(unittest.TestCase):
                                "group_ids": ["g1"], "enabled": True}]})
         res = p.evaluate("10.1.0.5", "", "GET", "168.63.129.16", 80, "/machine", "http://168.63.129.16/machine", self.t, self.g)
         self.assertEqual((res.allowed, res.block_reason), (False, "forbidden_destination"))
+        # ... nor its NAT64 / 6to4 encodings, and a wildcard rule never opens them either (review round 3)
+        wide = Policy({"revision": 1, "security_policy": {"allowed_ports": [80, 443], "block_ip_literals": False},
+                       "groups": [{"id": "g1"}], "servers": [{"id": "s1", "ip": "10.1.0.5", "group_ids": ["g1"]}],
+                       "rules": [{"id": "r1", "action": "ALLOW", "host_pattern": "*", "path_pattern": "/**",
+                                  "group_ids": ["g1"], "enabled": True}]})
+        for host, reason in (("[64:ff9b::a83f:8110]", "forbidden_destination"), ("[2002:a9fe:a9fe::1]", "forbidden_destination"),
+                             ("[64:ff9b::a00:5]", "internal_destination"), ("[::a00:5]", "internal_destination")):
+            res = wide.evaluate("10.1.0.5", "", "GET", host, 80, "/", "", self.t, self.g)
+            self.assertEqual((res.allowed, res.block_reason), (False, reason), host)
+        self.assertTrue(wide.evaluate("10.1.0.5", "", "GET", "[64:ff9b::808:808]", 80, "/", "", self.t, self.g).allowed)
 
     def test_evaluation_order_matches_control_plane(self):
         cases = [
@@ -235,6 +245,10 @@ class ThreatTests(unittest.TestCase):
         t = ThreatSnapshot(THREATS)
         self.assertIsNotNone(t.match_hash("A" * 64))
         self.assertEqual(t.match_host("198.51.100.9").category, "hijacked_network")
+        # IPv4 indicators also cover their NAT64 / 6to4 encodings (review round 3), like Snapshot.MatchIP
+        self.assertEqual(t.match_host("[64:ff9b::c633:6409]").category, "hijacked_network")
+        self.assertIsNotNone(t.match_host("[2002:c000:207::1]"))  # 6to4 of 192.0.2.7 (CIDR)
+        self.assertIsNone(t.match_host("[64:ff9b::808:808]"))
         self.assertIsNone(t.match_host("good.example"))
 
 
