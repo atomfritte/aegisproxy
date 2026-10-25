@@ -22,6 +22,7 @@ is versioned and recorded in the audit trail.
 | `AEGIS_TLS_CERT_FILE` / `AEGIS_TLS_KEY_FILE` | – | Native HTTPS (TLS ≥ 1.2). Alternatively terminate TLS at a reverse proxy or ingress controller. |
 | `AEGIS_TRUSTED_PROXIES` | – | CIDRs of reverse proxies / load balancers whose `X-Forwarded-For` header is trusted (login and SCIM throttling, CIDR-bound service accounts, audit IPs). Empty = the TCP peer is the client. List exactly the proxy addresses (e.g. `127.0.0.1/32,::1/128` for a local nginx), never whole private ranges: any client inside a trusted range could choose its own address. The right-most untrusted `X-Forwarded-For` entry is used, so appending proxies (`$proxy_add_x_forwarded_for`, HAProxy `option forwardfor`) are safe. See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
 | `AEGIS_TRUSTED_PROXY_HOSTS` | – | Comma-separated DNS names whose current addresses are trusted like `AEGIS_TRUSTED_PROXIES`, for proxies with changing IPs: a headless Service selecting the ingress controller (or console) pods in Kubernetes, service names in Compose. Resolved every 30 s; names containing a dot are resolved as absolute names, so write them fully qualified. A name whose lookup fails keeps its last good addresses for at most 5 minutes. Names only (no IPs or ports). See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
+| `AEGIS_TRUSTED_PROXY_SECRET` (`_FILE`) | – | Shared secret of the trusted reverse proxies (≥ 32 characters of `A-Z a-z 0-9 -._~+/=`). When set, forwarding headers count only from trusted peers that also send `X-Aegis-Proxy-Auth: <secret>`; requests without it are attributed to the peer itself. Required whenever the trusted address is shared with other local accounts (loopback, a Docker bridge gateway). See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
 | `AEGIS_CORS_ORIGINS` | – | Comma-separated origins of a **separately hosted console**, e.g. `https://console.corp.example`. Credentials (the session cookie) are allowed for these origins. |
 | `AEGIS_INTERNAL_DOMAINS` | `.internal.corp,.local,.localdomain,.internal,.lan,.home.arpa,.corp` | DNS suffixes of internal destinations. Internal destinations are reachable only through an explicit (non-wildcard) rule; learning sessions and redirect grants never open them. |
 | `AEGIS_SHUTDOWN_DELAY` | `3s` | After SIGTERM, `/readyz` fails and the server keeps serving for this long, so load balancers / Kubernetes endpoints stop routing requests before the listener closes (zero-downtime rollouts; the Helm chart uses `10s`). |
@@ -30,6 +31,16 @@ is versioned and recorded in the audit trail.
 
 The client address drives login and SCIM throttling, CIDR-bound service accounts and the audit trail. The
 control-plane takes it from `X-Forwarded-For` only when the TCP peer is a trusted proxy.
+
+- **Shared addresses need the proxy secret:** trusting an address trusts everybody who can connect from it.
+  Loopback (`127.0.0.1/32,::1/128` for nginx on the same host) is shared by every local account, and the
+  gateway of a Docker network by every local account and container that reaches a published port. Trusting
+  such an address without `AEGIS_TRUSTED_PROXY_SECRET` lets any of them choose its client address: use a
+  stolen CIDR-bound API key from anywhere, escape the per-source sign-in lockout, or lock out somebody else's
+  address. Set the secret and let the proxy send it (`deploy/nginx/aegis-console.conf` includes
+  `/etc/aegis/nginx-proxy-auth.conf`, which `install-linux.sh` generates); forwarding headers from a trusted
+  address without it are ignored and logged once. The posture report warns about loopback or broad ranges
+  (/16 or larger, IPv6 /48) trusted without the secret.
 
 - **Kubernetes ingress:** trust the ingress controller by name instead of by a pod CIDR. A regular Service name
   resolves to its ClusterIP, not to the pod addresses that actually connect to the control-plane. Add a

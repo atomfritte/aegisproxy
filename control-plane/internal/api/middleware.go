@@ -2,6 +2,8 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net"
 	"net/http"
@@ -168,7 +170,7 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // clientIP returns the TCP peer, or the right-most untrusted X-Forwarded-For hop when the peer
-// is a configured trusted reverse proxy.
+// is a configured trusted reverse proxy (that sends the proxy secret, when one is configured).
 func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
@@ -179,7 +181,7 @@ func (s *Server) clientIP(r *http.Request) string {
 		return host
 	}
 	peer = peer.Unmap()
-	if !s.isTrustedProxy(peer) {
+	if !s.isTrustedProxy(peer) || !s.proxySecretOK(r, peer) {
 		return peer.String()
 	}
 	xff := r.Header.Values("X-Forwarded-For")
@@ -204,6 +206,33 @@ func (s *Server) isTrustedProxy(a netip.Addr) bool {
 		}
 	}
 	return s.proxyHosts.contains(a)
+}
+
+// proxyAuthHeader carries AEGIS_TRUSTED_PROXY_SECRET from the trusted reverse proxies.
+const proxyAuthHeader = "X-Aegis-Proxy-Auth"
+
+// proxySecretOK reports whether a request from a trusted peer may assert the client address: always
+// without a configured proxy secret, otherwise only with exactly that secret in X-Aegis-Proxy-Auth. Other
+// local accounts share the proxy's address (loopback, a bridge gateway) but not the secret; their
+// forwarding headers are ignored and the peer counts as the client.
+func (s *Server) proxySecretOK(r *http.Request, peer netip.Addr) bool {
+	if s.cfg.TrustedProxySecret == "" {
+		return true
+	}
+	got := r.Header.Values(proxyAuthHeader)
+	want := sha256.Sum256([]byte(s.cfg.TrustedProxySecret))
+	var have [sha256.Size]byte
+	if len(got) == 1 {
+		have = sha256.Sum256([]byte(strings.TrimSpace(got[0])))
+	}
+	if len(got) == 1 && subtle.ConstantTimeCompare(have[:], want[:]) == 1 {
+		return true
+	}
+	if _, forwarded := forwardedClient(r.Header); forwarded && !s.proxySecretWarned.Swap(true) {
+		s.log.Warn("forwarding headers from a trusted proxy address without the proxy secret are ignored: configure the proxy to send "+
+			proxyAuthHeader+" with AEGIS_TRUSTED_PROXY_SECRET (deploy/nginx/aegis-console.conf)", "peer", peer.String())
+	}
+	return false
 }
 
 // rateLimiter is a fixed-window per-key limiter with bounded memory: expired windows are swept once per

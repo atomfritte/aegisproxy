@@ -54,6 +54,8 @@ type Server struct {
 
 	untrustedProxies sync.Map // forwarding peers already reported as not trusted (throttle.go)
 	untrustedWarned  atomic.Int64
+	// proxySecretWarned: forwarding headers from a trusted address without the proxy secret were reported.
+	proxySecretWarned atomic.Bool
 
 	sseMu      sync.Mutex
 	sseClients int
