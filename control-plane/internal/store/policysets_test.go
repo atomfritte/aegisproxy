@@ -486,10 +486,19 @@ func TestBlockPageTemplateValidation(t *testing.T) {
 		"bad scope":  {Name: "d", AllowedScopes: []string{"everything"}},
 		"empty form": {Name: "e", ShowRequestForm: true},
 		"bad email":  {Name: "f", Support: models.SupportContact{Email: "a@b.c\nBcc: x@y.z"}},
+		// R3-5: "%%" delimits data-plane placeholders and is refused in every text field.
+		"marker in company":    {Name: "g", CompanyName: "ACME %%%AEGIS:data_json%%%"},
+		"marker in message":    {Name: "h", Message: "see %%AEGIS:nonce%%"},
+		"marker in support":    {Name: "i", Support: models.SupportContact{Label: "Help %%"}},
+		"marker in link label": {Name: "j", Links: []models.LinkItem{{Label: "%%AEGIS:logo%%", URL: "https://wiki.example/"}}},
+		"marker in link query": {Name: "k", Links: []models.LinkItem{{Label: "x", URL: "https://wiki.example/?q=%%AEGIS:data_json%%"}}},
+		"marker in cli footer": {Name: "l", CLIFooter: "%%%"},
 	}
 	for name, tpl := range cases {
 		if _, err := st.UpsertBlockPage(tpl, adminClaims); err == nil {
 			t.Errorf("%s accepted", name)
+		} else if strings.HasPrefix(name, "marker") && !strings.Contains(err.Error(), `must not contain "%%"`) {
+			t.Errorf("%s refused for another reason: %v", name, err)
 		}
 	}
 	ok := DefaultBlockPageTemplate()

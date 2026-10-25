@@ -336,7 +336,7 @@ class PolicySetSemanticsTest(unittest.TestCase):
 class BrandedBlockPageTest(unittest.TestCase):
     SHELL = ('<html lang="x"><style nonce="%%AEGIS:nonce%%"></style><h1>%%AEGIS:server_hostname%%</h1>'
              '<a href="%%AEGIS:portal_url%%">p</a><img src="%%AEGIS:logo%%"><p>%%AEGIS:url%%</p>'
-             '<script type="application/json">%%AEGIS:data_json%%</script>')
+             '<script type="application/json" id="aegis-data">%%AEGIS:data_json%%</script>')
 
     def bundle(self):
         shells = lambda tag: {"request_html": tag + self.SHELL, "threat_html": tag + "THREAT %%AEGIS:reason%%",
@@ -377,6 +377,19 @@ class BrandedBlockPageTest(unittest.TestCase):
         threat, _ = render_branded(self.bundle(), self.ctx("QUARANTINED"), ["grp-ci"], "en", False)
         self.assertEqual(threat, "ENTHREAT &lt;b&gt;r&lt;/b&gt;")
         self.assertIsNone(render_branded({}, self.ctx(), [], "en", False))
+        self.assertIn('id="aegis-data">{"endpoint": "https://aegis.example/api/public/requests", "block_token": "v1.a.b"}</script>', body)
+
+    def test_raw_values_only_in_their_context(self):
+        # R3-5: a raw placeholder smuggled into another spot of a shell (template text) is escaped like any value:
+        # the JSON's quotes must not break out of an attribute.
+        from aegis_dp.blockpage import fill
+        values = {"nonce": "n0", "logo": "data:image/png;base64,AA==", "data_json": '{"a": "x\\u003c"}'}
+        out = fill('<a title="%%AEGIS:data_json%%" href="%%AEGIS:logo%%">%%AEGIS:nonce%%</a>'
+                   '<i nonce="%%AEGIS:data_json%%"></i><img src="%%AEGIS:logo%%">'
+                   '<script type="application/json" id="aegis-data">%%AEGIS:data_json%%</script>', values, True)
+        self.assertEqual(out, '<a title="{&quot;a&quot;: &quot;x\\u003c&quot;}" href="data:image/png;base64,AA==">n0</a>'
+                              '<i nonce="{&quot;a&quot;: &quot;x\\u003c&quot;}"></i><img src="data:image/png;base64,AA==">'
+                              '<script type="application/json" id="aegis-data">{"a": "x\\u003c"}</script>')
 
 
 class AccessLogTest(unittest.TestCase):
