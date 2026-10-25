@@ -310,6 +310,25 @@ incremented — alert on it. A request that reaches the body, response-header or
 completed evaluation is blocked as `unevaluated`. Untrusted bytes in credentials, `Host` and URLs are
 hashed and rendered safely (percent-encoded in pages, logs and telemetry).
 
+## Credentials in recorded URLs (query redaction)
+
+Download links, API calls and pre-signed object URLs often carry credentials in the query string. The security
+policy setting `telemetry_query_redaction` (**Threat Protection → Policy**) decides what is recorded:
+
+| Mode | Recorded URL |
+|---|---|
+| `sensitive` (default, also after an upgrade) | values of credential-like parameters replaced by `REDACTED`: `token`, `access_token`, `id_token`, `refresh_token`, `code`, `sig`, `signature`, `key`, `apikey`, `api_key`, `password`, `passwd`, `pwd`, `secret`, `client_secret`, `session`, `sessionid`, `session_id`, `auth`, `assertion`, `jwt`, the AWS/GCS signature parameters (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`, `X-Goog-Signature`, `X-Goog-Credential`), names made of several words of which one is a credential word (`upload_token`, `x-api-key`, `sessionKey`, ...), and the companions of signed URLs (`sv`/`se` next to an Azure SAS `sig`; `Expires`, `Policy`, `Key-Pair-Id` next to a CloudFront `Signature`) |
+| `all` | the query string is dropped |
+| `none` | the URL as requested |
+
+In every mode except `none`, `user:password@` in the URL is replaced by `REDACTED@`. Names are compared
+case-insensitively after percent-decoding. The worker redacts before a URL leaves it: traffic records, its access
+log, block pages and the block token. The control-plane applies the same function again when it stores flows
+(`full_url`, redirect parent and location), so records from older workers are covered as well. Both
+implementations are tested against the shared vectors in `testdata/redaction_vectors.json`. Policy evaluation
+always sees the complete URL; the recorded `path` never contains the query. Records stored before the setting
+was changed are not rewritten, and log export destinations receive what was stored.
+
 ## Anomaly detection
 
 `blocked_burst_threshold` (default 30/min per server) raises a `BLOCK_BURST` event — typical for malware

@@ -6,7 +6,7 @@ The repository root contains a hardened `docker-compose.yml`:
 |---|---|---|
 | `ca-init` | `ghcr.io/atomfritte/aegisproxy-control-plane` (built locally) | One-shot: creates the root CA in the `aegis-ca` volume (key + certificate) and copies the certificate alone to `aegis-ca-public` (`gen-ca /certs /public`). |
 | `control-plane` | same image as `ca-init` | API + bundled console, file storage in `aegis-data`, only the public CA certificate (`aegis-ca-public`, read-only); the CA key is mounted into the data-plane only. |
-| `data-plane` | `ghcr.io/atomfritte/aegisproxy-data-plane` (built locally) | mitmproxy worker, port 8080, waits for a healthy control-plane. |
+| `data-plane` | `ghcr.io/atomfritte/aegisproxy-data-plane` (built locally) | mitmproxy worker, port 8080, waits for a healthy control-plane. Traffic records not yet acknowledged by the control-plane are spooled in the `flow-spool` volume (`AEGIS_FLOW_SPOOL_DIR`), so they survive restarts and control-plane outages; the worker fails closed once its policy is older than `AEGIS_POLICY_MAX_AGE` (`.env`, default `10m`, `0` = no limit). |
 | `clamav` | `clamav/clamav:1.5` (pinned by digest) | Antivirus, signatures in `clamav-db`; runs as the image's `clamav` user (UID 100) instead of the root `/init`. |
 
 All AegisProxy containers run as non-root (UID 65532) and ClamAV as UID 100, all with a read-only root
@@ -64,7 +64,7 @@ Alternatively mount a certificate and set `AEGIS_TLS_CERT_FILE`/`AEGIS_TLS_KEY_F
 
 ```bash
 docker compose logs -f control-plane data-plane
-docker compose up -d --build                         # upgrade after updating the checkout (state + CA live in volumes)
+docker compose up -d --build                         # upgrade after updating the checkout (state, CA and spooled records live in volumes)
 docker run --rm -v aegisproxy_aegis-data:/data -v "$PWD":/backup alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
   tar czf /backup/aegis-data-$(date +%F).tgz -C /data .  # backup
 ```

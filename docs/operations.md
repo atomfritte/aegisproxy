@@ -112,10 +112,11 @@ Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prom
 
 - `increase(aegis_dp_hook_errors_total[10m]) > 0` — a worker blocked traffic after an internal error (fail-closed)
 - `aegis_dataplanes_healthy < expected` (control-plane view of worker heartbeats)
-- `aegis_dp_policy_sync_age_seconds > 120`; `aegis_dp_policy_stale == 1` (the worker fails closed)
-- `increase(aegis_dp_flows_dropped_total[1h]) > 0` or `increase(aegis_flows_dropped_total[1h]) > 0` —
+- `aegis_dp_policy_sync_age_seconds > 120`; `aegis_dp_policy_stale == 1` for 2 minutes (the worker fails closed:
+  its policy is older than `AEGIS_POLICY_MAX_AGE`)
+- `increase(aegis_dp_flows_dropped_total[30m]) > 0` or `increase(aegis_flows_dropped_total[30m]) > 0` —
   traffic records were lost ([telemetry delivery](#traffic-telemetry-delivery)); `aegis_dp_telemetry_queue`
-  growing for 15 minutes (the control-plane does not accept records)
+  growing for 15 minutes (the control-plane does not accept records; not part of the shipped `PrometheusRule`)
 - `aegis_dp_clamd_available == 0`
 - `increase(aegis_dp_icap_scans_total{result="error"}[15m]) > 0`, or a data-plane reporting `icap_status`
   `…=down` / `yara_status` `error:…` (**Settings → Data planes**)
@@ -125,11 +126,9 @@ Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prom
 - `aegis_export_spool_bytes > 0` for 15 minutes or `increase(aegis_export_records_dropped_total[1h]) > 0`
   (a log export destination is unreachable or rejecting records)
 - `aegis_audit_log_writable == 0` — the audit log cannot be written (disk full, replaced file); with file
-  storage configuration changes are refused until it recovers ([audit trail](#audit-trail); not yet part of the
-  shipped `PrometheusRule`)
+  storage configuration changes are refused until it recovers ([audit trail](#audit-trail))
 - `aegis_audit_trail_intact == 0` — an audit trail integrity violation was detected; `aegis_audit_legacy_pending
-  == 1` — unkeyed pre-2.1 events await acceptance ([audit trail](#audit-trail); not yet part of the shipped
-  `PrometheusRule`)
+  == 1` for an hour — unkeyed pre-2.1 events await acceptance ([audit trail](#audit-trail))
 
 Logs are structured JSON (`AEGIS_LOG_FORMAT=json`). Audit events are written as `msg="audit"` log lines and to
 `audit.jsonl`. To forward audit, traffic ("browsing") and security records to a SIEM or observability platform
@@ -174,7 +173,20 @@ check *Traffic records delivered completely* warns while any of these counters i
 **Control-plane outage.** Workers keep enforcing the last policy and queue records. Without a spool, at most
 20,000 records per worker are kept, which is minutes on a busy worker. Enable the spool for an outage budget
 (about 1 KiB per record: 256 MiB holds roughly 250,000 records). After `AEGIS_POLICY_MAX_AGE`, workers fail closed
-([configuration](configuration.md#data-plane-mitmproxy-worker)).
+([configuration](configuration.md#data-plane-mitmproxy-worker)): plan control-plane maintenance (or run several
+replicas) so that no outage lasts longer, or raise the limit.
+
+The shipped deployments enable both by default:
+
+| Deployment | Spool (`AEGIS_FLOW_SPOOL_DIR`) | `AEGIS_POLICY_MAX_AGE` |
+|---|---|---|
+| Helm | `emptyDir` on the node's disk per pod (`dataPlane.flowSpool`, limit 320 Mi): survives container restarts and control-plane outages, **not** the deletion of the pod (rolling update, eviction, node loss) | `dataPlane.policyMaxAge: 10m` |
+| Docker Compose | named volume per worker (`flow-spool`, HA: `flow-spool-1`/`-2`) | `${AEGIS_POLICY_MAX_AGE:-10m}` |
+| systemd | `/var/lib/aegis-dataplane/flow-spool` (`StateDirectory=`, 0700) | `10m` in the unit; override in `/etc/aegis/dataplane.env` |
+| Windows | `<DataRoot>\flow-spool` (service account: modify; SYSTEM/Administrators) | `-PolicyMaxAge 10m` |
+
+Records spooled when a worker is removed for good (Helm pod deleted, Windows uninstall, volume deleted) are lost
+without being counted; drain a worker by letting it run until `aegis_dp_telemetry_queue` and the spool are empty.
 
 ### Connection termination on revocation
 

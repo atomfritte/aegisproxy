@@ -206,6 +206,8 @@ Both units run without any capabilities (`CapabilityBoundingSet=`), with `NoNewP
 | `ReadOnlyPaths=/var/lib/aegis/certs` (control-plane) | a missing certificate makes the service fail loudly instead of silently generating a new, untrusted CA |
 | CA key only via `LoadCredential=ca:` to the data-plane | the control-plane process cannot read the CA private key |
 | CA staged to `/run/aegis-dataplane/confdir` by `ExecStartPre` | mitmproxy needs a writable confdir (it writes `mitmproxy-dhparam.pem`); tmpfs, 0700, removed on stop |
+| `StateDirectory=aegis-dataplane` (0700), `AEGIS_FLOW_SPOOL_DIR=/var/lib/aegis-dataplane/flow-spool` | the only persistent writable path of the worker under `ProtectSystem=strict`: traffic records not yet acknowledged by the control-plane survive restarts and control-plane outages ([telemetry delivery](../operations.md#traffic-telemetry-delivery)); an empty `AEGIS_FLOW_SPOOL_DIR=` in `dataplane.env` keeps them in memory only |
+| `AEGIS_POLICY_MAX_AGE=10m` (data-plane) | a worker cut off from the control-plane fails closed after 10 minutes instead of enforcing a policy without later quarantines or revocations; override in `dataplane.env` (`0` = no limit) |
 | `MemoryDenyWriteExecute=yes` (control-plane) | static Go binary, no W+X memory |
 | **`MemoryDenyWriteExecute=no` (data-plane)** | mitmproxy's TLS layer uses pyOpenSSL callbacks created with cffi `ffi.callback()`, which need writable+executable memory with the pip-installed cffi wheels. With W^X enforced the worker stays "ready" but every intercepted TLS handshake fails with `MemoryError: Cannot allocate write+execute memory for ffi.callback()` (verified with mitmproxy 12.3.0 / cffi 2.1.1). CPython itself needs no W+X memory |
 | `ProcSubset=pid` only on the control-plane | the Go binary needs nothing from `/proc` besides its own process |
@@ -424,6 +426,7 @@ Version: `aegis-control-plane version`, `GET /api/public/meta`, `aegis_build_inf
 | Secrets | `/etc/aegis/secrets/` | JWT, data-plane key, DSN, TLS key, ... |
 | CA | `/etc/aegis/ca/` (`mitmproxy-ca.pem` = private key) | loss = new CA on every client |
 | Configuration | `/etc/aegis/*.env`, `/etc/systemd/system/aegis-*` | |
+| Worker spool | `/var/lib/aegis-dataplane/flow-spool/` | traffic records not yet delivered; transient, no backup needed |
 | PostgreSQL | database `aegis` | `pg_dump -Fc -d aegis -f aegis-$(date +%F).dump` |
 
 ```bash
@@ -458,7 +461,10 @@ scrape_configs:
     static_configs: [{ targets: ['dp-01.corp.example:9091', 'dp-02.corp.example:9091'] }]
 ```
 
-Suggested alerts: target down; worker `/readyz` failing; `aegis_dp_policy_sync_age_seconds > 300`;
+Suggested alerts (the Helm chart's `PrometheusRule` lists them all, see [operations](../operations.md#monitoring)):
+target down; worker `/readyz` failing; `aegis_dp_policy_sync_age_seconds > 300`; `aegis_dp_policy_stale == 1`
+(fails closed); `increase(aegis_dp_flows_dropped_total[30m]) > 0`; `aegis_audit_log_writable == 0`;
+`aegis_audit_trail_intact == 0`;
 `increase(aegis_dataplane_auth_failures_total[5m]) > 0`; `aegis_dp_clamd_available == 0`;
 `aegis_threatintel_feed_age_seconds` too old; rising `aegis_security_events_open`; systemd unit in `failed` state
 (node_exporter `node_systemd_unit_state`).

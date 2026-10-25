@@ -134,6 +134,8 @@ search list. The trailing dot avoids both, independent of the pod's resolver opt
 | `dataPlane.replicas` / `dataPlane.autoscaling.*` | 3 / off | |
 | `dataPlane.service.*` | LoadBalancer, Local, ClientIP | see [architecture](../architecture.md#server-identity) |
 | `dataPlane.service.loadBalancerSourceRanges` / `.allowPublicProxy` | [] / false | a `LoadBalancer` needs source ranges, `networkPolicy.proxyClientCIDRs` or `allowPublicProxy=true` (see [Exposing the proxy](#exposing-the-proxy)) |
+| `dataPlane.policyMaxAge` | `10m` | `AEGIS_POLICY_MAX_AGE`: workers whose last policy sync is older fail closed (503 `policy_stale`, `/readyz` fails, so the Service has no ready endpoints until the control-plane is back); `""` = no limit |
+| `dataPlane.flowSpool.enabled` / `.maxSize` / `.sizeLimit` | true / `256m` / `320Mi` | traffic-record spool (`AEGIS_FLOW_SPOOL_DIR`) on an `emptyDir` on the node's disk: survives container restarts and control-plane outages, not the deletion of the pod (records still spooled then are lost); the data-plane requests `ephemeral-storage: 576Mi` for it and `/tmp`. Pod-independent storage would need a StatefulSet, which the chart does not provide ([telemetry delivery](../operations.md#traffic-telemetry-delivery)) |
 | `clamav.enabled` / `clamav.replicas` | true / 2 | |
 | `clamav.image.digest` | pinned | ClamAV image digest (tag kept for readability); `*.image.digest` also pins the AegisProxy images |
 | `clamav.podSecurityContext` / `clamav.containerSecurityContext` | uid 100, read-only root fs, no capabilities, RuntimeDefault seccomp | clamd and freshclam run as the image's `clamav` user ("restricted" Pod Security Standard); `/tmp` and `/var/log/clamav` are emptyDirs |
@@ -149,7 +151,7 @@ search list. The trailing dot avoids both, independent of the pod's resolver opt
 | `networkPolicy.cnpgOperatorNamespace` | `cnpg-system` | with CloudNativePG: PostgreSQL (5432) only from the control-plane and the other instances, the instance manager (8000) only from the operator namespace |
 | `probes.mode` | `http` | `exec` runs every health probe inside the container (no node → pod traffic), for CNIs that enforce policy on kubelet traffic |
 | `metrics.serviceMonitor.enabled` | false | Prometheus Operator |
-| `metrics.prometheusRule.enabled` | false | `PrometheusRule` with the recommended alerts: worker failed closed, policy sync stale, ClamAV/ICAP unavailable, too few healthy workers, log export failing or dropping, login failures, stale threat intelligence (thresholds under `metrics.prometheusRule.*`) |
+| `metrics.prometheusRule.enabled` | false | `PrometheusRule` with the recommended alerts: worker failed closed, policy sync stale, policy older than `policyMaxAge` (worker failing closed), traffic records lost (worker or control-plane), ClamAV/ICAP unavailable, too few healthy workers, log export failing or dropping, audit log unwritable, audit integrity violation, legacy audit events pending, login failures, stale threat intelligence (thresholds under `metrics.prometheusRule.*`) |
 
 See `values.yaml` for the complete list.
 
