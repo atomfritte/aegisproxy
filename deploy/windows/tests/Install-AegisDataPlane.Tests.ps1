@@ -45,6 +45,7 @@ Describe 'Install-AegisDataPlane.ps1' {
         $script:SecretsDir = Join-Path $DataRoot 'secrets'
         $script:LogsDir = Join-Path $DataRoot 'logs'
         $script:RuntimeDir = Join-Path $DataRoot 'runtime'
+        $script:SpoolDir = Join-Path $DataRoot 'flow-spool'
         $script:StagedKey = Join-Path $SecretsDir 'dataplane.key'
         $script:StagedCa = Join-Path $ConfDir 'mitmproxy-ca.pem'
 
@@ -83,7 +84,8 @@ Describe 'Install-AegisDataPlane.ps1' {
             @{ Name = 'ControlPlaneUrl'; Value = 'aegis.corp.example' }, @{ Name = 'ListenHost'; Value = 'a b' },
             @{ Name = 'OpsAddr'; Value = '127.0.0.1' }, @{ Name = 'BodySizeLimit'; Value = '1t' },
             @{ Name = 'MitmLogLevel'; Value = 'trace' }, @{ Name = 'FailMode'; Value = 'ignore' },
-            @{ Name = 'ServiceAccount'; Value = 'LocalSystem' }, @{ Name = 'WinSWSha256'; Value = 'abc' }
+            @{ Name = 'ServiceAccount'; Value = 'LocalSystem' }, @{ Name = 'WinSWSha256'; Value = 'abc' },
+            @{ Name = 'PolicyMaxAge'; Value = '10 minutes' }, @{ Name = 'PolicyMaxAge'; Value = '-5m' }
         ) {
             $p = $Base.Clone(); $p[$Name] = $Value
             { & $Installer @p } | Should -Throw -ExceptionType ([System.Management.Automation.ParameterBindingException])
@@ -237,9 +239,15 @@ Describe 'Install-AegisDataPlane.ps1' {
 
         It 'refuses -ExtraEnvironment for the managed variable <Name>' -TestCases @(
             @{ Name = 'AEGIS_DATAPLANE_KEY' }, @{ Name = 'CONTROL_PLANE_URL' }, @{ Name = 'AEGIS_FAIL_MODE' }, @{ Name = 'AEGIS_PROXY_MODE' },
-            @{ Name = 'AEGIS_CLAMD_ADDRESS' }, @{ Name = 'AEGIS_WORKER_ID' }, @{ Name = 'PYTHONNOUSERSITE' }
+            @{ Name = 'AEGIS_CLAMD_ADDRESS' }, @{ Name = 'AEGIS_WORKER_ID' }, @{ Name = 'PYTHONNOUSERSITE' },
+            @{ Name = 'AEGIS_POLICY_MAX_AGE' }, @{ Name = 'AEGIS_FLOW_SPOOL_DIR' }
         ) {
             { & $Installer @Base -ExtraEnvironment @{ $Name = 'x' } } | Should -Throw "*$Name is managed by this script*"
+        }
+
+        It 'refuses a -PolicyMaxAge below 30 seconds before changing anything' {
+            { & $Installer @Base -PolicyMaxAge '20s' } | Should -Throw '*-PolicyMaxAge*too short*'
+            $FakeWin.Services.Count | Should -Be 0
         }
 
         It 'rejects invalid variable names' {
@@ -329,6 +337,8 @@ Describe 'Install-AegisDataPlane.ps1' {
             $Svc.Env['AEGIS_LOG_LEVEL'] | Should -Be 'DEBUG'
             $Svc.Env['AEGIS_MAGIC_HOSTS'] | Should -Be 'a&b<c>"d''e'
             $Svc.Env['PYTHONNOUSERSITE'] | Should -Be '1'
+            $Svc.Env['AEGIS_POLICY_MAX_AGE'] | Should -Be '10m'
+            $Svc.Env['AEGIS_FLOW_SPOOL_DIR'] | Should -Be $SpoolDir
         }
 
         It 'never writes or prints the data-plane key itself' {
@@ -366,6 +376,9 @@ Describe 'Install-AegisDataPlane.ps1' {
             (Get-FakeAccess $ConfDir)['NT SERVICE\AegisDataPlane'] | Should -Be 'M'
             (Get-FakeAccess $LogsDir)['NT SERVICE\AegisDataPlane'] | Should -Be 'M'
             (Get-FakeAccess $RuntimeDir)['NT SERVICE\AegisDataPlane'] | Should -Be 'M'
+            Get-PrincipalList $SpoolDir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'NT SERVICE\AegisDataPlane')
+            (Get-FakeAccess $SpoolDir)['NT SERVICE\AegisDataPlane'] | Should -Be 'M'
+            Test-FakeWritable $SpoolDir | Should -BeFalse -Because 'users must not inject traffic records'
             Get-PrincipalList $DataRoot | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544')
         }
 
@@ -523,6 +536,18 @@ Describe 'Install-AegisDataPlane.ps1' {
             foreach ($name in $accessLog.Keys) { $rendered[$name] | Should -Be $accessLog[$name] }
         }
 
+        It 'sets no policy age limit with -PolicyMaxAge <Value> and warns' -TestCases @(@{ Value = '' }, @{ Value = '0' }) {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PolicyMaxAge = $Value })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'No -PolicyMaxAge'
+            (Get-RenderedService).Env.Contains('AEGIS_POLICY_MAX_AGE') | Should -BeFalse
+        }
+
+        It 'passes -PolicyMaxAge <Value> to the worker' -TestCases @(@{ Value = '1H30M'; Expected = '1h30m' }, @{ Value = '900'; Expected = '900' }) {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PolicyMaxAge = $Value })).ExitCode | Should -Be 0
+            (Get-RenderedService).Env['AEGIS_POLICY_MAX_AGE'] | Should -Be $Expected
+        }
+
         It 'disables antivirus with an empty -ClamdAddress' {
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ ClamdAddress = '' })
             $run.ExitCode | Should -Be 0
@@ -597,7 +622,8 @@ Describe 'Install-AegisDataPlane.ps1' {
             @{ Name = 'staged CA'; PlantIn = 'ConfDir'; PlantFile = 'mitmproxy-ca.pem' },
             @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' },
             @{ Name = 'venv'; PlantIn = 'VenvDir'; PlantFile = 'Lib\site-packages\evil.pth' },
-            @{ Name = '.NET extraction cache'; PlantIn = 'RuntimeDir'; PlantFile = 'aegis-dataplane\x\hostfxr.dll' }
+            @{ Name = '.NET extraction cache'; PlantIn = 'RuntimeDir'; PlantFile = 'aegis-dataplane\x\hostfxr.dll' },
+            @{ Name = 'traffic record spool segment'; PlantIn = 'SpoolDir'; PlantFile = 'seg-000000000001-1.jsonl' }
         ) {
             $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
             New-Item -ItemType Directory -Path (Split-Path -Parent $planted) -Force | Out-Null
@@ -721,7 +747,8 @@ Describe 'Install-AegisDataPlane.ps1' {
 
         It 'refuses a <Name> planted after the inspection, before the directories were locked' -TestCases @(
             @{ Name = 'staged CA'; PlantIn = 'ConfDir'; PlantFile = 'mitmproxy-ca.pem' },
-            @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' }
+            @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' },
+            @{ Name = 'traffic record spool segment'; PlantIn = 'SpoolDir'; PlantFile = 'seg-000000000001-1.jsonl' }
         ) {
             # The planter writes the file right after the inspection, before the first icacls call locks the directories.
             $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
@@ -759,6 +786,13 @@ Describe 'Install-AegisDataPlane.ps1' {
             $FakeWin.Services['AegisDataPlane'].ObjectName | Should -Be 'NT SERVICE\AegisDataPlane'
         }
 
+        It 'keeps traffic records the worker spooled before the upgrade' {
+            $segment = Join-Path $SpoolDir 'seg-000000000007-25.jsonl'
+            Set-Content -LiteralPath $segment -Value '{"id":"f1"}'
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            Test-Path -LiteralPath $segment | Should -BeTrue
+        }
+
         It 'keeps the CA when -CaFile points at the staged file itself' {
             $p = $Base.Clone(); $p.CaFile = $StagedCa
             (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
@@ -791,11 +825,12 @@ Describe 'Install-AegisDataPlane.ps1' {
         It 'removes service, firewall rules, program files and the staged CA/key copies, but keeps the logs' {
             (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ OpsAddr = '0.0.0.0:9091'; MonitoringRemoteAddress = @('10.99.0.5') })).ExitCode | Should -Be 0
             Set-Content -LiteralPath (Join-Path $LogsDir 'aegisdataplane.out.log') -Value 'log'
+            Set-Content -LiteralPath (Join-Path $SpoolDir 'seg-000000000001-1.jsonl') -Value '{"id":"f1"}'
             $run = Invoke-Installer -Path $Installer -Parameters @{ Uninstall = $true; Confirm = $false }
             $run.ExitCode | Should -Be 0
             $FakeWin.Services.ContainsKey('AegisDataPlane') | Should -BeFalse
             $FakeWin.Firewall.Count | Should -Be 0
-            foreach ($path in @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir)) { Test-Path -LiteralPath $path | Should -BeFalse -Because $path }
+            foreach ($path in @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir, $SpoolDir)) { Test-Path -LiteralPath $path | Should -BeFalse -Because $path }
             Test-Path -LiteralPath (Join-Path $LogsDir 'aegisdataplane.out.log') | Should -BeTrue
             (Get-FakeCall 'winsw')[-1].Args[0] | Should -Be 'uninstall'
         }

@@ -61,7 +61,7 @@ docker start aegis-ha-control-plane-1-1    # rejoins with the current revision
 | Failure | Effect |
 |---|---|
 | One control-plane replica | Load balancer removes it (`/readyz`); no impact. |
-| All control-plane replicas | Workers keep enforcing the last policy; telemetry is buffered in memory (20,000 flows) and retried; console unavailable. |
+| All control-plane replicas | Workers keep enforcing the last policy for up to `AEGIS_POLICY_MAX_AGE` (default `10m`), then fail closed (503 `policy_stale`) until the control-plane is back; telemetry is spooled per worker (`flow-spool-1`/`-2` volumes, beyond the 20,000-flow memory queue) and retried; console unavailable. |
 | Database | `/readyz` fails; control-plane writes are rejected (no silent loss); workers keep enforcing. |
 | One data-plane worker | Clients on that worker reconnect to another worker (affinity re-hashes). |
 | ClamAV | `av_fail_mode=open`: downloads pass with `AV_ERROR` events; `closed`: downloads are blocked (503). |

@@ -327,12 +327,16 @@ The script:
    `gzip`, `ssl` and the addon import correctly. Existing program and data directories are taken over like on the
    control-plane (top-down, owner Administrators, foreign ACEs removed, links and hard-linked files refused, files
    planted during the run refused, ACLs verified after the installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
-   `confdir\config.yaml` (mitmdump options and scripts), a prepared venv or .NET extraction cache - are refused
-   unless `-AdoptExistingSecrets` is given. Logs are kept either way.
+   `confdir\config.yaml` (mitmdump options and scripts), a prepared venv or .NET extraction cache, spooled
+   traffic records (they would be uploaded as this worker's records) - are refused unless `-AdoptExistingSecrets`
+   is given. Logs are kept either way.
 2. Copies `aegis_addon.py` and `aegis_dp\` to `...\data-plane\app` (byte-compiled; the program directory is
    read-only for the service).
 3. Stages the key (`C:\ProgramData\AegisProxy\data-plane\secrets\dataplane.key`, read-only for the service) and
-   the CA (`...\confdir\mitmproxy-ca.pem`; mitmproxy needs a writable confdir for its dhparam file).
+   the CA (`...\confdir\mitmproxy-ca.pem`; mitmproxy needs a writable confdir for its dhparam file), and creates
+   the traffic-record spool `...\flow-spool` (`AEGIS_FLOW_SPOOL_DIR`; the service can modify it, users have no
+   access): records the control-plane has not acknowledged survive service restarts and control-plane outages
+   ([telemetry delivery](../operations.md#traffic-telemetry-delivery)). An upgrade keeps spooled records.
 4. Renders `aegis-dataplane.xml` from the template, copies WinSW into the admin-only program directory and
    verifies the SHA-256 of that copy (the file the SCM runs; `-WinSWExe` may have changed after the early check),
    installs it as `aegis-dataplane.exe` and the service `AegisDataPlane`, and switches its logon account to
@@ -351,14 +355,17 @@ virtual accounts differently across WinSW versions. The script therefore leaves 
 services). The worker never needs LocalSystem.
 
 Further parameters: `-ListenPort` (8080), `-ListenHost` (0.0.0.0), `-OpsAddr` (127.0.0.1:9091),
-`-FailMode` (closed), `-WorkerId`, `-PublicUrl`/`-DashboardUrl` (block-page fallbacks), `-ExtraEnvironment`,
+`-FailMode` (closed), `-PolicyMaxAge` (`10m`: `AEGIS_POLICY_MAX_AGE`, the worker fails closed once its last policy
+sync is older; at least 30 s, `''` or `0` = no limit), `-WorkerId`, `-PublicUrl`/`-DashboardUrl` (block-page fallbacks), `-ExtraEnvironment`,
 `-PipArgs`/`-RequirementsFile` (offline, hash-pinned installation from an internal wheel share - recommended
 for production; see below), `-WinSWSha256` (hash of a different WinSW build), `-NoYara` (do not install
 the YARA-X engine, which is otherwise installed as `yara-x==1.22.0` binary wheel), `-RecreateVenv`,
 `-AllowWritablePython`, `-AllowUnencryptedImport`, `-AdoptExistingSecrets` (see above), `-Uninstall` (removes
-service, rules, program files and the staged key/CA copies - links inside are removed as links, their targets are
-never touched; keeps logs). `-ExtraEnvironment` refuses the variables the template or a dedicated parameter sets
-(`CONTROL_PLANE_URL`, `AEGIS_DATAPLANE_KEY[_FILE]`, `AEGIS_OPS_ADDR`, `AEGIS_FAIL_MODE`, ...).
+service, rules, program files, the staged key/CA copies and records still in the spool - links inside are removed
+as links, their targets are never touched; keeps logs). `-ExtraEnvironment` refuses the variables the template or a
+dedicated parameter sets (`CONTROL_PLANE_URL`, `AEGIS_DATAPLANE_KEY[_FILE]`, `AEGIS_OPS_ADDR`, `AEGIS_FAIL_MODE`,
+`AEGIS_POLICY_MAX_AGE`, `AEGIS_FLOW_SPOOL_DIR`, ...); the spool size limit is `AEGIS_FLOW_SPOOL_MAX` (default `256m`)
+through `-ExtraEnvironment`.
 
 **Hash-pinned installation.** `-RequirementsFile` takes a complete lock file with hashes for every package,
 including `yara-x` and the security baseline. Generate it on a build host with uv, whose `--override` raises
@@ -610,6 +617,8 @@ scrape_configs:
 ```
 
 Suggested alerts: target down; worker `/readyz` failing; `aegis_dp_policy_sync_age_seconds` > 300;
+`aegis_dp_policy_stale == 1` (fails closed); `increase(aegis_dp_flows_dropped_total[30m]) > 0`;
+`aegis_audit_log_writable == 0`; `aegis_audit_trail_intact == 0`;
 `increase(aegis_dataplane_auth_failures_total[5m]) > 0`; `aegis_dp_clamd_available == 0`;
 `aegis_threatintel_feed_age_seconds` older than twice the feed interval; `aegis_security_events_open` rising;
 disk space on `C:\ProgramData`. Windows-side: SCM events 7031/7034 (unexpected service termination) in the

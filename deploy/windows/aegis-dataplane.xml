@@ -24,7 +24,8 @@
     @@DATAPLANE_KEY_FILE@@  AEGIS_DATAPLANE_KEY_FILE (<DataRoot>\secrets\dataplane.key, service-readable only)
     @@OPS_ADDR@@            AEGIS_OPS_ADDR (/healthz, /readyz, /metrics)
     @@FAIL_MODE@@           AEGIS_FAIL_MODE (closed | open)
-    @@EXTRA_ENV@@           optional <env/> elements: AEGIS_CLAMD_ADDRESS, AEGIS_CONTROL_PLANE_CA_FILE,
+    @@EXTRA_ENV@@           <env/> elements: AEGIS_FLOW_SPOOL_DIR (<DataRoot>\flow-spool), AEGIS_POLICY_MAX_AGE
+                            (-PolicyMaxAge), optional AEGIS_CLAMD_ADDRESS, AEGIS_CONTROL_PLANE_CA_FILE,
                             AEGIS_PUBLIC_URL, DASHBOARD_URL, AEGIS_WORKER_ID, -ExtraEnvironment
 
   Service account: WinSW installs the service as LocalSystem; Install-AegisDataPlane.ps1 switches the

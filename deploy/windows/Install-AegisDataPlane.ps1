@@ -33,6 +33,8 @@
       <DataRoot>\confdir\                private mitmproxy confdir (staged CA, dhparam) - service: modify
       <DataRoot>\secrets\dataplane.key   shared secret with the control-plane         - service: read
       <DataRoot>\logs\                   WinSW + mitmdump logs (rolled by size)        - service: modify
+      <DataRoot>\flow-spool\             traffic records not yet acknowledged by the control-plane
+                                         (AEGIS_FLOW_SPOOL_DIR)                       - service: modify
 
 .PARAMETER PythonExe
     Explicit python.exe (python.org CPython >= 3.12, installed for all users). Default: detected with the
@@ -68,6 +70,12 @@
     this run although no intact installation vouches for them (no AegisDataPlane service, or directories whose
     owner/ACL differ from what this script sets). Not for files of unknown origin: a local user may have planted
     them (a confdir\config.yaml, for example, configures mitmdump).
+
+.PARAMETER PolicyMaxAge
+    AEGIS_POLICY_MAX_AGE (default 10m): once the last successful policy sync is older, the worker fails closed
+    (503 policy_stale, open connections closed, /readyz fails) until it reaches the control-plane again, so a cut-off
+    worker cannot keep enforcing a policy without later quarantines or revocations. Durations such as 900s, 15m,
+    1h (at least 30 seconds and 5 x AEGIS_SYNC_INTERVAL_SECONDS); '' or 0 = no limit (posture warning).
 
 .PARAMETER ClamdAddress
     AEGIS_CLAMD_ADDRESS, e.g. tcp://127.0.0.1:3310 (ClamAV for Windows). Empty string disables antivirus.
@@ -205,6 +213,10 @@ param(
     [string]$BodySizeLimit = '1g',
 
     [Parameter(ParameterSetName = 'Install')]
+    [ValidatePattern('^(\d+|(\d+[smhdSMHD])+)?$')]
+    [string]$PolicyMaxAge = '10m',
+
+    [Parameter(ParameterSetName = 'Install')]
     [ValidateSet('error', 'warn', 'info', 'alert', 'debug')]
     [string]$MitmLogLevel = 'info',
 
@@ -267,6 +279,7 @@ $ConfDir     = Join-Path $DataRoot 'confdir'
 $SecretsDir  = Join-Path $DataRoot 'secrets'
 $LogsDir     = Join-Path $DataRoot 'logs'
 $RuntimeDir  = Join-Path $DataRoot 'runtime'
+$SpoolDir    = Join-Path $DataRoot 'flow-spool'
 $StagedCa    = Join-Path $ConfDir 'mitmproxy-ca.pem'
 $StagedKey   = Join-Path $SecretsDir 'dataplane.key'
 $StagedCpCa  = Join-Path $SecretsDir 'control-plane-ca.pem'
@@ -617,7 +630,7 @@ function Get-InstallationAclProblem {
     $checks = [ordered]@{}
     foreach ($path in @($InstallDir, $WrapperExe, $VenvPython)) { $checks[$path] = $program }
     $checks[$DataRoot] = $AclAdmins
-    foreach ($path in @($ConfDir, $StagedCa, $RuntimeDir)) { $checks[$path] = $modify }
+    foreach ($path in @($ConfDir, $StagedCa, $RuntimeDir, $SpoolDir)) { $checks[$path] = $modify }
     $checks[$SecretsDir] = $read
     if (Test-Path -LiteralPath $SecretsDir) {
         foreach ($file in @(Get-ChildItem -LiteralPath $SecretsDir -Force -File)) { $checks[$file.FullName] = $read }
@@ -671,14 +684,14 @@ if ($Uninstall) {   # parameter set 'Uninstall'
         }
     }
     # Links below these directories are removed as links; their targets are never touched.
-    if ($PSCmdlet.ShouldProcess("$ConfDir, $SecretsDir", 'Delete staged CA private key and data-plane key copies')) {
-        foreach ($dir in @($ConfDir, $SecretsDir, $RuntimeDir)) { Remove-DirectoryTree $dir }
+    if ($PSCmdlet.ShouldProcess("$ConfDir, $SecretsDir, $SpoolDir", 'Delete staged CA private key and data-plane key copies and undelivered traffic records')) {
+        foreach ($dir in @($ConfDir, $SecretsDir, $RuntimeDir, $SpoolDir)) { Remove-DirectoryTree $dir }
     }
     if ((Test-Path -LiteralPath $InstallDir) -and $PSCmdlet.ShouldProcess($InstallDir, 'Remove program files (venv, addon, WinSW)')) {
         Remove-DirectoryTree $InstallDir
     }
     Write-Ok 'AegisProxy data-plane uninstalled.'
-    Write-Note "Logs were kept in $LogsDir. The staged CA key / data-plane key copies were deleted; the originals remain on the control-plane."
+    Write-Note "Logs were kept in $LogsDir. The staged CA key / data-plane key copies (the originals remain on the control-plane) and traffic records not yet delivered to the control-plane (flow-spool) were deleted."
     Write-Note 'Remember to remove the proxy settings from client servers or point them to another worker.'
     return
 }
@@ -756,13 +769,21 @@ if (-not $ClamdAddress) { Write-Note 'No -ClamdAddress: antivirus scanning is di
 # Set by the template or by dedicated parameters - a second <env> element with the same name would be ambiguous.
 $reservedEnv = @('AEGIS_DATAPLANE_KEY', 'AEGIS_DATAPLANE_KEY_FILE', 'CONTROL_PLANE_URL', 'AEGIS_OPS_ADDR', 'AEGIS_FAIL_MODE',
     'AEGIS_PROXY_MODE', 'AEGIS_CLAMD_ADDRESS', 'AEGIS_CONTROL_PLANE_CA_FILE', 'AEGIS_PUBLIC_URL', 'DASHBOARD_URL', 'AEGIS_WORKER_ID',
-    'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE', 'PYTHONUNBUFFERED', 'PYTHONUTF8')
+    'AEGIS_POLICY_MAX_AGE', 'AEGIS_FLOW_SPOOL_DIR', 'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE', 'PYTHONUNBUFFERED', 'PYTHONUTF8')
 if ($ExtraEnvironment) {
     foreach ($key in $ExtraEnvironment.Keys) {
         if ($key -notmatch '^[A-Z_][A-Z0-9_]*$') { throw "Invalid environment variable name '$key'." }
         if ($reservedEnv -contains $key) { throw "$key is managed by this script (template or dedicated parameter)." }
     }
 }
+
+# Policy max age: the worker's minimum of 30 seconds (it also checks 5 x AEGIS_SYNC_INTERVAL_SECONDS itself).
+$policyMaxAgeSeconds = 0
+foreach ($m in [regex]::Matches($PolicyMaxAge.ToLowerInvariant(), '(\d+)([smhd]?)')) {
+    $policyMaxAgeSeconds += [long]$m.Groups[1].Value * @{ '' = 1; 's' = 1; 'm' = 60; 'h' = 3600; 'd' = 86400 }[$m.Groups[2].Value]
+}
+if ($policyMaxAgeSeconds -gt 0 -and $policyMaxAgeSeconds -lt 30) { throw "-PolicyMaxAge '$PolicyMaxAge' is too short (at least 30 seconds, or 0 for no limit)." }
+if (-not $policyMaxAgeSeconds) { Write-Note 'No -PolicyMaxAge: a worker cut off from the control-plane keeps enforcing its last policy indefinitely (no later quarantines or revocations).' }
 
 # Python (python.org CPython >= 3.12, all-users installation)
 $pythonBase = $null
@@ -817,7 +838,7 @@ try {
     if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { $trustIssues += "service $ServiceName is not installed (first installation)" }
     else { $trustIssues += @(Get-InstallationAclProblem -Principal @((Get-ServiceSid $ServiceName), $SidLocalService.TrimStart('*'))) }
     $preExisting = @()
-    if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir)) }
+    if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir, $SpoolDir)) }
 }
 catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
 if ($links.Count) { throw "Junctions/symbolic links and hard-linked files are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
@@ -833,7 +854,7 @@ if ($preExisting.Count) { Write-Note "-AdoptExistingSecrets: keeping $($preExist
 if ($PSCmdlet.ShouldProcess($ServiceName, 'Stop service for upgrade')) { Stop-DataPlaneService }
 
 if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and restrict ACL to SYSTEM/Administrators')) {
-    foreach ($dir in @($InstallDir, $AppDir, $DataRoot, $ConfDir, $SecretsDir, $LogsDir, $RuntimeDir)) {
+    foreach ($dir in @($InstallDir, $AppDir, $DataRoot, $ConfDir, $SecretsDir, $LogsDir, $RuntimeDir, $SpoolDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
     # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
@@ -844,7 +865,7 @@ if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and r
     Protect-Directory -Root $DataRoot -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F") -Allowed $AclAdmins -AllChildren -Trusted:$intact
     # Nobody else can add files from here on; files that appeared since the inspection above were planted meanwhile.
     if (-not $intact) {
-        $planted = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir) | Where-Object { $preExisting -notcontains $_ })
+        $planted = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir, $SpoolDir) | Where-Object { $preExisting -notcontains $_ })
         if ($planted.Count) {
             throw ("{0} file(s) appeared in the installation directories while this script ran:`n  {1}`nA local user may have planted them. Delete them and re-run." -f
                 $planted.Count, (($planted | Select-Object -First 10) -join "`n  "))
@@ -956,6 +977,8 @@ if ($ControlPlaneCaFile -or (Test-Path -LiteralPath $StagedCpCa)) { $extraEnv['A
 if ($PublicUrl)    { $extraEnv['AEGIS_PUBLIC_URL'] = $PublicUrl.TrimEnd('/') }
 if ($DashboardUrl) { $extraEnv['DASHBOARD_URL'] = $DashboardUrl.TrimEnd('/') }
 if ($WorkerId)     { $extraEnv['AEGIS_WORKER_ID'] = $WorkerId }
+if ($policyMaxAgeSeconds) { $extraEnv['AEGIS_POLICY_MAX_AGE'] = $PolicyMaxAge.ToLowerInvariant() }
+$extraEnv['AEGIS_FLOW_SPOOL_DIR'] = $SpoolDir
 if ($ExtraEnvironment) { foreach ($key in $ExtraEnvironment.Keys) { $extraEnv[$key] = [string]$ExtraEnvironment[$key] } }
 $extraEnvXml = (@(foreach ($key in $extraEnv.Keys) {
     '<env name="{0}" value="{1}"/>' -f (ConvertTo-XmlText $key), (ConvertTo-XmlText $extraEnv[$key])
@@ -1019,12 +1042,13 @@ if ($PSCmdlet.ShouldProcess($DataRoot, "Grant $LogonAccount access")) {
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SecretsDir, '/inheritance:r', '/grant:r', "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${AclPrincipal}:(OI)(CI)R", '/L', '/Q')
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($LogsDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/L', '/Q')
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($RuntimeDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/L', '/Q')
+    $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SpoolDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/L', '/Q')
     # Read the result back: only SYSTEM, Administrators, the service (and users: read program files) may have access.
     $aclProblems = @(Get-InstallationAclProblem -Principal @($AclSid) -IncludeLogs)
     if ($aclProblems.Count) {
         throw ("ACL verification failed - the service was not started:`n  {0}" -f ($aclProblems -join "`n  "))
     }
-    Write-Ok 'ACLs verified: program files = read, confdir/logs = modify, secrets = read (no inheritance); everything else SYSTEM/Administrators only.'
+    Write-Ok 'ACLs verified: program files = read, confdir/logs/flow-spool = modify, secrets = read (no inheritance); everything else SYSTEM/Administrators only.'
 }
 
 # --- firewall ----------------------------------------------------------------------------------------
