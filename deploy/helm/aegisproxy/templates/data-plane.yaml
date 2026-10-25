@@ -45,6 +45,13 @@ spec:
             - { name: AEGIS_FAIL_MODE, value: {{ $dp.failMode | quote }} }
             - { name: AEGIS_BODY_SIZE_LIMIT, value: {{ $dp.bodySizeLimit | quote }} }
             - { name: AEGIS_CLAMD_TIMEOUT_SECONDS, value: {{ $dp.clamdTimeoutSeconds | quote }} }
+            {{- with $dp.policyMaxAge }}
+            - { name: AEGIS_POLICY_MAX_AGE, value: {{ . | quote }} }
+            {{- end }}
+            {{- if $dp.flowSpool.enabled }}
+            - { name: AEGIS_FLOW_SPOOL_DIR, value: /var/lib/aegis/flow-spool }
+            - { name: AEGIS_FLOW_SPOOL_MAX, value: {{ $dp.flowSpool.maxSize | quote }} }
+            {{- end }}
             {{- with $dp.accessLog }}
             - { name: AEGIS_ACCESS_LOG, value: {{ . | quote }} }
             - { name: AEGIS_ACCESS_LOG_FORMAT, value: {{ $dp.accessLogFormat | default "squid" | quote }} }
@@ -60,6 +67,9 @@ spec:
           volumeMounts:
             - { name: ca, mountPath: /certs, readOnly: true }
             - { name: tmp, mountPath: /tmp }
+            {{- if $dp.flowSpool.enabled }}
+            - { name: flow-spool, mountPath: /var/lib/aegis/flow-spool }
+            {{- end }}
           livenessProbe:
             {{- if eq .Values.probes.mode "exec" }}
             exec: { command: ["python3", "/opt/aegis/healthcheck.py", "healthz"] }
@@ -83,6 +93,10 @@ spec:
           secret: { secretName: {{ include "aegis.caSecretName" . }}, defaultMode: 0440 }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
+        {{- if $dp.flowSpool.enabled }}
+        - name: flow-spool
+          emptyDir: { sizeLimit: {{ $dp.flowSpool.sizeLimit }} }
+        {{- end }}
       {{- with $dp.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

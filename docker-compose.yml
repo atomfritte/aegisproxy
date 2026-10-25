@@ -74,8 +74,13 @@ services:
       DASHBOARD_URL: ${AEGIS_PUBLIC_URL:-http://localhost:8081}
       AEGIS_CLAMD_ADDRESS: tcp://clamav:3310
       AEGIS_FAIL_MODE: closed
+      # Fail closed when the policy is older (control-plane unreachable); "0" = no limit.
+      AEGIS_POLICY_MAX_AGE: ${AEGIS_POLICY_MAX_AGE:-10m}
+      # Traffic records survive worker restarts and control-plane outages.
+      AEGIS_FLOW_SPOOL_DIR: /var/lib/aegis/flow-spool
     volumes:
       - aegis-ca:/certs:ro
+      - flow-spool:/var/lib/aegis/flow-spool
     tmpfs:
       - /tmp:size=128m,mode=1777
     ports:
@@ -117,3 +122,4 @@ volumes:
   aegis-ca:
   aegis-ca-public:
   clamav-db:
+  flow-spool:

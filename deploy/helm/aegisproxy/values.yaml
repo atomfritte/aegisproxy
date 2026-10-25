@@ -181,6 +181,21 @@ dataPlane:
   accessLog: ""
   accessLogFormat: squid
   failMode: closed
+  # AEGIS_POLICY_MAX_AGE: a worker whose last successful policy sync is older fails closed (503 policy_stale,
+  # long-lived connections closed, /readyz fails) until the control-plane is reachable again. Without a limit, a
+  # worker cut off from the control-plane never learns of quarantines or revocations (posture warning).
+  # At least max(30s, 5 x the sync interval); "" = no limit.
+  policyMaxAge: 10m
+  # Durable traffic-record spool (AEGIS_FLOW_SPOOL_DIR, AEGIS_FLOW_SPOOL_MAX): records that the control-plane has
+  # not acknowledged yet are written to disk instead of only the 20,000-record memory queue. The volume is an
+  # emptyDir on the node's disk: it survives container restarts (crash, OOM kill) and control-plane outages,
+  # but not the deletion of the pod (rolling update, eviction, node loss) - records still spooled then are lost
+  # and not counted. Durability across pod replacement would need a volume per pod that outlives it (a
+  # StatefulSet with volumeClaimTemplates), which this chart does not provide.
+  flowSpool:
+    enabled: true
+    maxSize: 256m       # AEGIS_FLOW_SPOOL_MAX: oldest records are discarded beyond it (counted as spool_full)
+    sizeLimit: 320Mi    # emptyDir limit, above maxSize (one batch in flight); the kubelet evicts the pod beyond it
   # Largest request/response body a worker relays at all (mitmproxy body_size_limit). Not a memory figure:
   # bodies are streamed unless an inspection needs them, and buffered bodies share the worker's inspection
   # buffer budget (AEGIS_BUFFER_BUDGET, default min(512m, bodySizeLimit); one client holds at most
@@ -206,7 +221,8 @@ dataPlane:
     loadBalancerSourceRanges: []
     annotations: {}
   resources:
-    requests: { cpu: 250m, memory: 384Mi }
+    # ephemeral-storage: /tmp (256Mi) + flow spool (flowSpool.sizeLimit), so the scheduler reserves the disk
+    requests: { cpu: 250m, memory: 384Mi, ephemeral-storage: 576Mi }
     limits: { memory: 2Gi }
   autoscaling:
     enabled: false

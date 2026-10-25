@@ -8,6 +8,7 @@
 #   /etc/aegis/dataplane.env                    non-secret settings (CONTROL_PLANE_URL, AEGIS_CLAMD_ADDRESS, ...)
 #   /etc/aegis/secrets/dataplane.key            shared secret with the control-plane (root:root 0600)
 #   /etc/aegis/ca/mitmproxy-ca.pem              enterprise CA private key + certificate (root:root 0600)
+#   /var/lib/aegis-dataplane/flow-spool/        traffic records not yet acknowledged by the control-plane
 #
 # Both secrets are passed with LoadCredential= (copied by PID 1 into a ramfs readable only by this unit).
 # mitmproxy needs a *writable* confdir (it writes mitmproxy-dhparam.pem next to the CA), so ExecStartPre
@@ -40,6 +41,8 @@ Environment=AEGIS_BODY_SIZE_LIMIT=1g
 Environment=AEGIS_MITM_LOG_LEVEL=info
 Environment=AEGIS_OPS_ADDR=127.0.0.1:9091
 Environment=AEGIS_FAIL_MODE=closed
+Environment=AEGIS_POLICY_MAX_AGE=10m
+Environment=AEGIS_FLOW_SPOOL_DIR=%S/aegis-dataplane/flow-spool
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 HOME=%t/aegis-dataplane
 EnvironmentFile=/etc/aegis/dataplane.env
 
@@ -49,6 +52,9 @@ Environment=AEGIS_DATAPLANE_KEY_FILE=%d/dataplane
 
 RuntimeDirectory=aegis-dataplane
 RuntimeDirectoryMode=0700
+# Traffic-record spool (AEGIS_FLOW_SPOOL_DIR): /var/lib/aegis-dataplane, kept across restarts and upgrades.
+StateDirectory=aegis-dataplane
+StateDirectoryMode=0700
 # Optional access log file: AEGIS_ACCESS_LOG=/var/log/aegis-dataplane/access.log
 LogsDirectory=aegis-dataplane
 LogsDirectoryMode=0750

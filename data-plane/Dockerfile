@@ -16,7 +16,10 @@ COPY requirements-extra.txt /opt/aegis/requirements-extra.txt
 RUN pip install --no-cache-dir --only-binary=:all: --require-hashes --no-deps -r /opt/aegis/requirements-extra.txt
 COPY aegis_addon.py healthcheck.py entrypoint.sh /opt/aegis/
 COPY aegis_dp/ /opt/aegis/aegis_dp/
+# /var/lib/aegis/flow-spool: mount point of the optional traffic-record spool (AEGIS_FLOW_SPOOL_DIR). Owned by the
+# runtime user so a new named volume mounted there inherits a writable, private directory.
 RUN chmod 0755 /opt/aegis/entrypoint.sh /opt/aegis/healthcheck.py \
+ && install -d -o 65532 -g 65532 -m 0700 /var/lib/aegis/flow-spool \
  && python3 -m compileall -q /opt/aegis \
  && chmod -R a+rX /opt/aegis \
  && { pip check | grep -vi -e "^mitmproxy .* has requirement brotli" -e "no broken requirements" | (! grep .); } \

@@ -21,6 +21,42 @@ spec:
           labels: { severity: warning }
           annotations:
             summary: "AegisProxy worker {{`{{ $labels.pod }}`}} cannot sync policy from the control-plane"
+        - alert: AegisDataPlanePolicyExpired
+          expr: aegis_dp_policy_stale == 1
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "AegisProxy worker {{`{{ $labels.pod }}`}} fails closed: its policy is older than AEGIS_POLICY_MAX_AGE"
+            description: "The worker answers 503 policy_stale and is not ready until it syncs with the control-plane again."
+        - alert: AegisDataPlaneTelemetryLoss
+          expr: increase(aegis_dp_flows_dropped_total[30m]) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "AegisProxy worker {{`{{ $labels.pod }}`}} lost traffic records ({{`{{ $labels.reason }}`}})"
+            description: "Traffic records were discarded before the control-plane acknowledged them (memory queue or spool full, rejected batches). See docs/operations.md, Traffic telemetry delivery."
+        - alert: AegisControlPlaneTelemetryLoss
+          expr: increase(aegis_flows_dropped_total[30m]) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "The AegisProxy control-plane lost traffic records ({{`{{ $labels.reason }}`}})"
+        - alert: AegisAuditLogUnwritable
+          expr: aegis_audit_log_writable == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "The AegisProxy audit log cannot be written: configuration changes are refused"
+        - alert: AegisAuditIntegrityViolation
+          expr: aegis_audit_trail_intact == 0
+          labels: { severity: critical }
+          annotations:
+            summary: "AegisProxy audit trail integrity violation (missing or invalid anchor or checkpoint, diverged trail)"
+            description: "Compare the trail with the SIEM copy and investigate before accepting or restoring anything; see docs/operations.md."
+        - alert: AegisAuditLegacyPending
+          expr: aegis_audit_legacy_pending == 1
+          for: 1h
+          labels: { severity: warning }
+          annotations:
+            summary: "Unkeyed pre-2.1 audit events await review and acceptance by a Super Admin"
         - alert: AegisClamdUnavailable
           expr: aegis_dp_clamd_available == 0
           for: 5m
