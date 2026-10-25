@@ -150,13 +150,9 @@ func isPunycode(host string) bool {
 
 // alwaysForbiddenAddr covers destinations no rule may ever open through the proxy: loopback
 // (the proxy's own services), link-local (cloud metadata 169.254.169.254), the other cloud metadata endpoints
-// (Azure WireServer, see netguard.CloudMetadata), unspecified and multicast. Same as is_forbidden_addr in the
-// data-plane.
-func alwaysForbiddenAddr(a netip.Addr) bool {
-	a = a.Unmap()
-	return a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsUnspecified() || a.IsMulticast() ||
-		netguard.CloudMetadata(a)
-}
+// (Azure WireServer, see netguard.CloudMetadata), unspecified and multicast, also embedded in IPv6 (NAT64, 6to4,
+// IPv4-compatible). Same as is_forbidden_addr in the data-plane.
+func alwaysForbiddenAddr(a netip.Addr) bool { return netguard.IsForbiddenDestination(a) }
 
 func blockResult(res engine.EvaluationResult, verdict, reason, name string) engine.EvaluationResult {
 	res.Allowed = false

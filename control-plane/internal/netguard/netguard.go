@@ -12,7 +12,7 @@ import (
 )
 
 // cloudMetadata are cloud platform endpoints outside the link-local range (169.254.0.0/16 is link-local).
-// Same list as _CLOUD_METADATA in the data-plane (data-plane/aegis_dp/policy.py); shared vectors in
+// Same list as _CLOUD_METADATA in the data-plane (data-plane/aegis_dp/addresses.py); shared vectors in
 // testdata/destination_vectors.json.
 var cloudMetadata = []netip.Prefix{
 	netip.MustParsePrefix("168.63.129.16/32"),   // Azure WireServer (goal state, extension configuration, health)
@@ -20,23 +20,13 @@ var cloudMetadata = []netip.Prefix{
 	netip.MustParsePrefix("100.100.100.200/32"), // Alibaba Cloud instance metadata
 }
 
-// CloudMetadata reports cloud platform metadata endpoints that are not link-local addresses.
-func CloudMetadata(a netip.Addr) bool {
-	a = a.Unmap()
-	for _, p := range cloudMetadata {
-		if p.Contains(a) {
-			return true
-		}
-	}
-	return false
-}
+// CloudMetadata reports cloud platform metadata endpoints that are not link-local addresses, also embedded in
+// IPv6 (NAT64, 6to4, IPv4-compatible, IPv4-mapped).
+func CloudMetadata(a netip.Addr) bool { return classify(a, cloudMetadata) }
 
-// Forbidden reports whether an outbound integration must never connect to a.
-func Forbidden(a netip.Addr) bool {
-	a = a.Unmap()
-	return a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsMulticast() || a.IsUnspecified() || a.IsInterfaceLocalMulticast() ||
-		CloudMetadata(a)
-}
+// Forbidden reports whether an outbound integration must never connect to a: the forbidden proxy destinations
+// (IsForbiddenDestination) except loopback, which local integrations (a collector on the same host) may use.
+func Forbidden(a netip.Addr) bool { return IsForbiddenDestination(a) && !IsLoopback(a) }
 
 // Dialer returns a dialer that refuses forbidden destinations.
 func Dialer(timeout time.Duration) *net.Dialer {

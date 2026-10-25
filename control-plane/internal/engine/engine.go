@@ -344,16 +344,11 @@ func SetInternalSuffixes(suffixes []string) {
 	internalSuffixes.Store(&cp)
 }
 
-var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
-
-// IsInternalAddr reports loopback, RFC1918/ULA, link-local (incl. 169.254.169.254 cloud metadata), other cloud
-// metadata endpoints (netguard.CloudMetadata), CGNAT, multicast and unspecified addresses.
-func IsInternalAddr(addr netip.Addr) bool {
-	addr = addr.Unmap()
-	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() || cgnatPrefix.Contains(addr) ||
-		netguard.CloudMetadata(addr)
-}
+// IsInternalAddr reports addresses that are not globally reachable: loopback, private, link-local (incl.
+// 169.254.169.254 cloud metadata), other cloud metadata endpoints, CGNAT, documentation, reserved, multicast and
+// unspecified ranges, also embedded in IPv6 (NAT64, 6to4, IPv4-compatible). The table is netguard.IsInternal,
+// mirrored by is_internal_addr in the data-plane.
+func IsInternalAddr(addr netip.Addr) bool { return netguard.IsInternal(addr) }
 
 // IsInternalHost reports internal hostnames and addresses (see IsInternalAddr and SetInternalSuffixes).
 func IsInternalHost(host string) bool {

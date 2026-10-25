@@ -12,6 +12,7 @@ import (
 
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/netguard"
 	"aegisproxy/control-plane/internal/threatintel"
 )
 
@@ -68,8 +69,8 @@ func validICAPURL(field, raw string) error {
 	if err != nil || (u.Scheme != "icap" && u.Scheme != "icaps") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || len(raw) > 300 {
 		return fmt.Errorf("%s must look like icap://host:1344/service or icaps://host:11344/service", field)
 	}
-	if a, err := netip.ParseAddr(u.Hostname()); err == nil && (a.IsLinkLocalUnicast() || a.IsUnspecified()) {
-		return fmt.Errorf("%s must not point to a link-local address", field)
+	if a, err := netip.ParseAddr(u.Hostname()); err == nil && netguard.Forbidden(a) {
+		return fmt.Errorf("%s must not point to a link-local, metadata, multicast or unspecified address", field)
 	}
 	return nil
 }
