@@ -151,7 +151,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// Emergency access must survive an attacker who knows the name: failures lock the account only
 		// for their own source, and account-wide only for a short, bounded time under a sustained flood.
 		perSource := acctKey + "@" + src.label
-		keys = append(keys, auth.Key{Name: perSource}, auth.Key{Name: acctKey, Factor: breakGlassFactor, MaxLock: breakGlassMaxLock})
+		keys = append(keys, auth.Key{Name: perSource, Shed: src.proxy != ""}, auth.Key{Name: acctKey, Factor: breakGlassFactor, MaxLock: breakGlassMaxLock})
 		reset = append(reset, perSource)
 	} else {
 		keys = append(keys, auth.Key{Name: acctKey})

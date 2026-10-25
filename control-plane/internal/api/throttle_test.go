@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -145,11 +146,13 @@ func TestThrottleSourceKeys(t *testing.T) {
 		label, proxy string
 	}{
 		{"direct client", "198.51.100.4:5000", nil, "198.51.100.4", ""},
+		{"direct IPv6 client (per /64)", "[2001:db8:1:2::5]:5000", nil, "2001:db8:1:2::/64", ""},
 		{"trusted proxy", "10.96.4.12:5000", map[string]string{"X-Forwarded-For": "203.0.113.5"}, "203.0.113.5", ""},
 		{"untrusted proxy, X-Forwarded-For (right-most)", "10.20.1.15:5000", map[string]string{"X-Forwarded-For": "1.1.1.1, 203.0.113.5"}, "10.20.1.15|203.0.113.5", "10.20.1.15"},
-		{"untrusted proxy, Forwarded", "10.20.1.15:5000", map[string]string{"Forwarded": `for=192.0.2.1, for="[2001:db8::7]:4711";proto=https`}, "10.20.1.15|2001:db8::7", "10.20.1.15"},
+		{"untrusted proxy, Forwarded", "10.20.1.15:5000", map[string]string{"Forwarded": `for=192.0.2.1, for="[2001:db8::7]:4711";proto=https`}, "10.20.1.15|2001:db8::/64", "10.20.1.15"},
 		{"untrusted proxy, X-Real-IP", "10.20.1.15:5000", map[string]string{"X-Real-IP": "203.0.113.9"}, "10.20.1.15|203.0.113.9", "10.20.1.15"},
 		{"untrusted proxy, junk", "10.20.1.15:5000", map[string]string{"X-Forwarded-For": "<script>"}, "10.20.1.15|unparsed", "10.20.1.15"},
+		{"untrusted IPv6 proxy", "[2001:db8:9::15]:5000", map[string]string{"X-Forwarded-For": "2001:db8:5:6::1"}, "2001:db8:9::/64|2001:db8:5:6::/64", "2001:db8:9::/64"},
 	}
 	for _, c := range cases {
 		got := src(c.peer, c.hdr)
@@ -157,12 +160,111 @@ func TestThrottleSourceKeys(t *testing.T) {
 			t.Errorf("%s: %+v, want label %q proxy %q", c.name, got, c.label, c.proxy)
 		}
 		keys := got.keys("")
-		if (c.proxy != "") != (len(keys) == 2) || keys[0].Factor != auth.FactorSource {
+		if (c.proxy != "") != (len(keys) == 2) || keys[0].Factor != auth.FactorSource || keys[0].Shed != (c.proxy != "") {
 			t.Errorf("%s: keys %+v", c.name, keys)
 		}
-		if c.proxy != "" && (keys[1].Name != "proxy:"+c.proxy || keys[1].Factor != auth.FactorProxy) {
+		// The ceiling is shared by break-glass sign-ins behind the proxy: it never locks longer than they may be.
+		if c.proxy != "" && (keys[1].Name != "proxy:"+c.proxy || keys[1].Factor != auth.FactorProxy || keys[1].MaxLock != breakGlassMaxLock || keys[1].Shed) {
 			t.Errorf("%s: proxy ceiling key %+v", c.name, keys[1])
 		}
+	}
+}
+
+// R3-3: a direct client that invents X-Forwarded-For addresses is treated like an untrusted proxy. It lifts
+// its public rate limit at most to the per-proxy ceiling and gets at most 5 × FactorProxy failed sign-ins;
+// break-glass sign-ins behind the same peer are then delayed by at most one minute.
+func TestSpoofedForwardingHeadersAreBoundedByTheCeiling(t *testing.T) {
+	h := newHarness(t)
+	spoofed := func(i int) string { return fmt.Sprintf("198.51.%d.%d", i/250, i%250) }
+	public := 20 * publicProxyFactor // publicLimit is 20 per minute
+	got := map[int]int{}
+	for i := 0; i < public+30; i++ {
+		req, _ := http.NewRequest("GET", h.srv.URL+"/api/public/request-options", nil)
+		req.Header.Set("X-Forwarded-For", spoofed(i))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		got[resp.StatusCode]++
+	}
+	if got[http.StatusOK] != public || got[http.StatusTooManyRequests] != 30 {
+		t.Fatalf("%d public requests with invented client addresses → %v; want %d allowed", public+30, got, public)
+	}
+
+	got = map[int]int{}
+	for i := 0; i < 5*auth.FactorProxy+10; i++ {
+		st, err := rawLogin(h, fmt.Sprintf("nobody%d", i), "wrong", map[string]string{"X-Forwarded-For": spoofed(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[st]++
+	}
+	if got[http.StatusUnauthorized] != 5*auth.FactorProxy || got[http.StatusTooManyRequests] != 10 {
+		t.Fatalf("failed sign-ins with invented client addresses → %v; want %d password checks", got, 5*auth.FactorProxy)
+	}
+
+	b, _ := json.Marshal(map[string]string{"username": "admin", "password": h.adminPW})
+	req, _ := http.NewRequest("POST", h.srv.URL+"/api/auth/login", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "192.0.2.200")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if retry, _ := strconv.Atoi(resp.Header.Get("Retry-After")); resp.StatusCode != http.StatusTooManyRequests || retry < 1 || retry > 60 {
+		t.Fatalf("break-glass sign-in behind the locked peer: %d Retry-After %q; want 429 for at most 60 s", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+// R3-3: the rate limiter sweeps expired windows once per window and tracks at most maxRateKeys keys;
+// clients a full limiter does not track share the per-proxy ceiling (proxied ones: their proxy's).
+func TestRateLimiterMemoryIsBounded(t *testing.T) {
+	l := newRateLimiter(3, time.Minute)
+	for i := 0; i < maxRateKeys; i++ {
+		l.allowSource(throttleSource{label: fmt.Sprintf("k%d", i)})
+	}
+	if len(l.hits) != maxRateKeys {
+		t.Fatalf("%d keys, want %d", len(l.hits), maxRateKeys)
+	}
+	allowed := 0
+	for i := 0; i < 100; i++ {
+		if l.allowSource(throttleSource{label: fmt.Sprintf("new%d", i)}) {
+			allowed++
+		}
+	}
+	if allowed != 3*publicProxyFactor || len(l.hits) != maxRateKeys+1 {
+		t.Fatalf("untracked direct clients: %d allowed, %d keys; want %d allowed in one shared bucket", allowed, len(l.hits), 3*publicProxyFactor)
+	}
+	allowed = 0
+	for i := 0; i < 100; i++ {
+		if l.allowSource(throttleSource{label: fmt.Sprintf("10.20.1.15|198.51.100.%d", i), proxy: "10.20.1.15"}) {
+			allowed++
+		}
+	}
+	if allowed != 3*publicProxyFactor || len(l.hits) != maxRateKeys+2 {
+		t.Fatalf("untracked proxied clients: %d allowed, %d keys; want the proxy ceiling %d", allowed, len(l.hits), 3*publicProxyFactor)
+	}
+	if !l.allowSource(throttleSource{label: "k7"}) {
+		t.Fatal("a tracked client was refused")
+	}
+
+	// A sweep runs at most once per window and drops only expired windows.
+	for k, e := range l.hits {
+		if k != "k7" {
+			e.start = e.start.Add(-2 * time.Minute)
+		}
+	}
+	l.lastSweep = time.Now()
+	l.allowSource(throttleSource{label: "k8"}) // starts a new window for k8
+	if len(l.hits) != maxRateKeys+2 {
+		t.Fatalf("swept %d keys before the window ended", maxRateKeys+2-len(l.hits))
+	}
+	l.lastSweep = time.Now().Add(-2 * time.Minute)
+	l.allowSource(throttleSource{label: "k9"})
+	if len(l.hits) != 3 {
+		t.Fatalf("%d keys after the sweep, want the live windows k7, k8 and k9", len(l.hits))
 	}
 }
 
@@ -185,13 +287,13 @@ func TestPublicRateLimitBehindUntrustedProxy(t *testing.T) {
 		t.Fatal("another client behind the same proxy was refused")
 	}
 	allowed := 4 // 3 + 1 above
-	for i := 0; i < 10*auth.FactorProxy; i++ {
+	for i := 0; i < 10*publicProxyFactor; i++ {
 		if l.allowSource(proxied(fmt.Sprintf("198.51.100.%d", i))) {
 			allowed++
 		}
 	}
-	if allowed != 3*auth.FactorProxy {
-		t.Fatalf("%d requests behind one untrusted proxy, want the ceiling %d", allowed, 3*auth.FactorProxy)
+	if allowed != 3*publicProxyFactor {
+		t.Fatalf("%d requests behind one untrusted proxy, want the ceiling %d", allowed, 3*publicProxyFactor)
 	}
 	if !l.allowSource(throttleSource{label: "198.51.100.200"}) {
 		t.Fatal("a direct client was refused")

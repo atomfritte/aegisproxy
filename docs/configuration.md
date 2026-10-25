@@ -60,8 +60,12 @@ control-plane takes it from `X-Forwarded-For` only when the TCP peer is a truste
   not trusted are logged once per proxy address. Sign-in and SCIM throttling then count failures per proxy
   *and* claimed client (`throttle_source` in the `login failed` log line), so one client's failures behind a
   misconfigured ingress do not lock out everybody else behind it. A client that rotates the claimed address
-  still hits the account lockout and a ceiling of 200 failures per proxy address. This is a fallback, not a
-  configuration: audit IPs and CIDR-bound service accounts still see the proxy address.
+  still hits the account lockout and a ceiling of 50 failures per proxy address; that ceiling locks for at
+  most one minute at a time, as break-glass sign-ins behind the proxy depend on it too. Public endpoints (CA
+  download, self-service requests) allow everything behind one such proxy 5 times the per-client rate limit.
+  Any client can send these headers, so a client that connects directly gets at most these ceilings. This is
+  a fallback, not a configuration: audit IPs and CIDR-bound service accounts still see the proxy address.
+  IPv6 clients and proxies are throttled per /64.
 - **Break-glass accounts:** failures lock a break-glass account only for the source they come from (5
   failures, then exponential up to 15 minutes). Account-wide, the lock applies only after 1,000 failures and
   lasts at most 1 minute, so an attacker who knows the name cannot keep emergency access locked.
