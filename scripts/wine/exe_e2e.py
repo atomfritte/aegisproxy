@@ -111,7 +111,7 @@ try:
     ossl = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", "-subject", "-ext", "basicConstraints"], input=der, capture_output=True)
     check("exe: enterprise root CA generated on Windows paths (DER parses, CA:TRUE)", st == 200 and b"CA:TRUE" in ossl.stdout, ossl.stdout + ossl.stderr)
     st, ps1 = c.call("GET", "/api/public/ca/install-windows.ps1", raw=True)
-    check("exe: Windows CA install script served", st == 200 and b"Import-Certificate" in ps1 or b"certutil" in ps1, ps1[:200])
+    check("exe: Windows CA install script served", st == 200 and b"X509Store" in ps1 and b"StoreLocation]::LocalMachine" in ps1, ps1[:200])
 
     # Built-in audit rotation: grow the audit trail past 2 x 1 MB.
     cidrs = [f"10.{i // 256}.{i % 256}.0/24" for i in range(120)]

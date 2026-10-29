@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +23,8 @@ func telemetryBatch(prefix string, n int) map[string]any {
 // The batch endpoint acknowledges only stored flows: 503 + Retry-After while the flow journal cannot be written,
 // and a resend is recognized by flow ID.
 func TestFlowBatchAcknowledgedOnlyWhenStored(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not apply to root")
+	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("the test makes the journal unwritable with Unix directory permissions (not for root, not on Windows)")
 	}
 	h := newHarness(t)
 	dp := map[string]string{"X-Aegis-DataPlane-Key": testDPKey, "X-Aegis-DataPlane-ID": "dp-1"}
