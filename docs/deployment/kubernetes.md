@@ -67,18 +67,30 @@ create the Secret yourself and set `secrets.existingSecret`. Without `ca.existin
 
 The chart defaults to the release images of this repository, `ghcr.io/atomfritte/aegisproxy-control-plane`,
 `-data-plane` and `-console`, tag `v<appVersion>` (e.g. `v2.1.0`). They are built by
-`.github/workflows/release.yml` from the tag, signed keyless with cosign and carry an SBOM and SLSA build
-provenance. Verify the image and pin the digest you verified, so a re-pushed tag cannot change what runs:
+`.github/workflows/release.yml` from the tag, scanned after the push, signed keyless with cosign and carry an
+SBOM and SLSA build provenance. Each GitHub release carries `aegisproxy-vX.Y.Z-image-digests.txt` (the digest of
+every image) and `aegisproxy-X.Y.Z.tgz`, this chart with `controlPlane.image.digest`, `dataPlane.image.digest`
+and `console.image.digest` filled in, both attested by the release workflow. Verify them and the images against
+the exact signer (the release workflow at this tag) and deploy by digest, so a re-pushed tag cannot change what
+runs:
 
 ```bash
-IMG=ghcr.io/atomfritte/aegisproxy-control-plane:v2.1.0
-cosign verify "$IMG" \
-  --certificate-identity-regexp '^https://github.com/atomfritte/aegisproxy/.github/workflows/release.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-crane digest "$IMG"     # or: docker buildx imagetools inspect "$IMG"
-helm upgrade ... --set controlPlane.image.digest=sha256:<digest> \
-  --set dataPlane.image.digest=sha256:<digest> --set console.image.digest=sha256:<digest>
+V=v2.1.0 SIGNER=atomfritte/aegisproxy/.github/workflows/release.yml
+gh release download "$V" --repo atomfritte/aegisproxy --pattern 'aegisproxy-*'
+for f in "aegisproxy-$V-image-digests.txt" "aegisproxy-${V#v}.tgz"; do
+  gh attestation verify "$f" --repo atomfritte/aegisproxy --signer-workflow "$SIGNER" --source-ref "refs/tags/$V"
+done
+for ref in $(cat "aegisproxy-$V-image-digests.txt"); do   # ghcr.io/atomfritte/aegisproxy-<component>@sha256:...
+  cosign verify "$ref" --certificate-identity "https://github.com/$SIGNER@refs/tags/$V" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null && echo "signed: $ref"
+  gh attestation verify "oci://$ref" --repo atomfritte/aegisproxy --signer-workflow "$SIGNER" --source-ref "refs/tags/$V"
+done
+helm upgrade --install aegis "./aegisproxy-${V#v}.tgz" -n aegis ...   # the images are pinned by digest
 ```
+
+Every command must succeed. With the chart from the checkout instead, pin the verified digests yourself:
+`--set controlPlane.image.digest=sha256:<digest> --set dataPlane.image.digest=sha256:<digest>
+--set console.image.digest=sha256:<digest>`.
 
 `global.imageRegistry` replaces the registry host of every image for a mirror or pull-through cache
 (`harbor.corp.example/ghcr-proxy` → `harbor.corp.example/ghcr-proxy/atomfritte/aegisproxy-control-plane`); the
