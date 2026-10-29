@@ -16,6 +16,9 @@ The AegisProxy images are always built from the checkout (`pull_policy: build`):
 nor `docker compose pull` fetches them from a registry. They carry the names of the signed release images, so
 `docker compose pull` cannot substitute an image from a registry namespace that AegisProxy does not control.
 The third-party images (ClamAV, and PostgreSQL/HAProxy in the HA variant) are pinned by digest.
+A build sends only the tracked files of each build context (the `.dockerignore` files are allowlists), but it
+sends their working-copy content: build from a clean checkout that nobody else can write to and check that
+`git status` shows no changes first (see `SECURITY.md`, *Building images yourself*).
 
 ## Installation
 
@@ -64,7 +67,10 @@ The HA variant (`deploy/compose/ha`) works this way (`AEGIS_TRUSTED_PROXY_HOSTS=
 and container that connects to the published port arrives from the same gateway address, so trusting it
 alone equals trusting all of them. Trust it only together with the proxy secret (appended to `.env` by
 `gen-secrets.sh`) and let the proxy send it (`proxy_set_header X-Aegis-Proxy-Auth "<AEGIS_TRUSTED_PROXY_SECRET>";`
-in nginx):
+in nginx). The proxy must also replace `X-Forwarded-For` with the address it sees
+(`proxy_set_header X-Forwarded-For $remote_addr;`, as in `deploy/nginx/aegis-console.conf`): a local user who
+connects to the host proxy on the gateway address would otherwise arrive as the trusted gateway, and an appending
+proxy would forward that user's forged entries in front of it:
 
 ```
 AEGIS_PUBLIC_URL=https://aegis.corp.example

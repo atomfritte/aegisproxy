@@ -1532,6 +1532,16 @@ export interface ExportSinkStatus {
   last_success_at?: string;
   last_error?: string;
   last_error_at?: string;
+  /** Delivery state per stream (audit, traffic, ...): one stream may be rejected while another is delivered. */
+  streams?: Record<string, ExportStreamStatus>;
+}
+
+export interface ExportStreamStatus {
+  last_success_at?: string;
+  last_error_at?: string;
+  last_error?: string;
+  /** The last failure was a rejection (dead-lettered or lost), not an unavailable destination. */
+  rejected?: boolean;
 }
 
 /** Catalog entry describing a destination type (GET /api/integrations/exports → types[]). */

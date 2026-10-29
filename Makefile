@@ -10,7 +10,7 @@ WINE_WORK ?= /tmp/aegis-wine
 CONFORMANCE_WORK ?= /tmp/aegis-conformance
 PWSH_IMAGE ?= mcr.microsoft.com/powershell:7.5-ubuntu-24.04
 
-.PHONY: all build build-control-plane build-windows build-console test test-go test-go-cluster test-python test-frontend test-console-e2e lint-helm test-installers test-windows-wine test-conformance images clean
+.PHONY: all build build-control-plane build-windows build-console test test-go test-go-cluster test-python test-frontend test-console-e2e lint-helm test-installers test-windows-wine test-conformance images dockerignore clean
 
 all: test build
 
@@ -63,11 +63,16 @@ lint-helm:
 	$(HELM) lint deploy/helm/aegisproxy --set storage.postgres.url=postgres://u:p@db/aegis --set 'networkPolicy.proxyClientCIDRs={10.0.0.0/8}'
 	$(HELM) lint deploy/helm/aegisproxy --set storage.type=file --set console.enabled=true --set 'dataPlane.service.loadBalancerSourceRanges={10.0.0.0/8}'
 
+# Images are built from the committed tree (git archive of IMAGE_REV), never from the working copy: files planted
+# in the checkout and uncommitted changes do not reach them. Commit first. See scripts/build-images.sh.
+IMAGE_REV ?= HEAD
 images:
-	docker build -t $(REGISTRY)/aegisproxy-control-plane:$(IMAGE_TAG) --build-arg VERSION=$(VERSION) .
-	docker build -t $(REGISTRY)/aegisproxy-control-plane-api:$(IMAGE_TAG) --build-arg VERSION=$(VERSION) control-plane
-	docker build -t $(REGISTRY)/aegisproxy-data-plane:$(IMAGE_TAG) data-plane
-	docker build -t $(REGISTRY)/aegisproxy-console:$(IMAGE_TAG) frontend
+	scripts/build-images.sh "$(REGISTRY)" "$(IMAGE_TAG)" "$(VERSION)" "$(IMAGE_REV)"
+
+# The .dockerignore files are allowlists of the tracked files: regenerate them after adding, renaming or deleting
+# a file in control-plane/, data-plane/ or frontend/ (CI fails while they are out of date).
+dockerignore:
+	scripts/gen-dockerignore.sh
 
 clean:
 	rm -rf dist frontend/dist

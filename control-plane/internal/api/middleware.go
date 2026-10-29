@@ -171,6 +171,12 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) bool {
 
 // clientIP returns the TCP peer, or the right-most untrusted X-Forwarded-For hop when the peer
 // is a configured trusted reverse proxy (that sends the proxy secret, when one is configured).
+//
+// A loopback address in X-Forwarded-For is never skipped as a proxy hop, even when loopback is trusted:
+// it is what a proxy that appends to the header records for a client on its own host, i.e. any local
+// account that connects through it. The walk stops there and the request counts as coming from that
+// loopback address; otherwise a local user who sends "X-Forwarded-For: <any address>" through the proxy
+// would have the trusted loopback hop skipped and choose the client address.
 func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
@@ -191,8 +197,8 @@ func (s *Server) clientIP(r *http.Request) string {
 		if err != nil {
 			break
 		}
-		a = a.Unmap()
-		if !s.isTrustedProxy(a) {
+		a = a.Unmap() // ::ffff:127.0.0.1 is 127.0.0.1
+		if a.IsLoopback() || !s.isTrustedProxy(a) {
 			return a.String()
 		}
 	}

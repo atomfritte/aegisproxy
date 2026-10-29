@@ -47,12 +47,14 @@ topology or add integrations.
 | Sign-in to another person's provisioned account (chosen `preferred_username`, a `userName` the IdP gave to someone new, a subject differing only in case or Unicode folding) | Accounts are linked by the immutable user ID only: the token subject must equal the SCIM `externalId` exactly; names and e-mail addresses never link. A SCIM delete removes the link, a changed `externalId` removes it and revokes the sessions, a deleted record is revived only by its own `externalId` (never by `userName`: the new person gets a new account and console name), and a SCIM-managed account refuses every subject other than its `externalId`, also through an existing link; every link and unlink is audited ([identity](identity.md#scim-provisioning)) |
 | Stolen service-account key | Shown once, stored as SHA-256, mandatory expiry, optional source CIDR allowlist, last-use tracking, immediate rotation; cannot hold Super Admin or approve changes |
 | Credential guessing | Login throttling per account and source IP; password policy; SSO for people |
+| A client or local account chooses its client address (`X-Forwarded-For`) to use a CIDR-bound key, escape or misdirect the sign-in lockout, or falsify audit IPs | The header counts only from trusted proxies (`AEGIS_TRUSTED_PROXIES` / `AEGIS_TRUSTED_PROXY_HOSTS`), and with `AEGIS_TRUSTED_PROXY_SECRET` only when the proxy sends the secret; the walk takes the right-most untrusted entry and never skips a loopback entry, which is the proxy's local client; the shipped nginx configuration replaces the header with the address nginx sees; the posture check warns about loopback or broad ranges without the secret and broad ranges with it ([configuration](configuration.md#trusted-proxies-and-sign-in-throttling)) |
 | Spoofed TLS sites via the CA | CA key only on the data-plane (control-plane needs the certificate only in Kubernetes), RSA-3072 with path length 0 (`gen-ca`) or issued by the corporate PKI (`gen-csr` / `import-ca`) |
 
 ### Tampering
 
 | Threat | Mitigation |
 |---|---|
+| Unreviewed code in a built image (files planted in the build checkout, hidden from `git status` by `.gitignore` or `.git/info/exclude`: a module shadowing a reviewed one, a `vendor/` directory, a file Vite copies into the console) | The `.dockerignore` files are generated allowlists of the tracked files (`scripts/gen-dockerignore.sh`, checked in CI); Go builds use `-mod=readonly` and `GOWORK=off`; `make images` builds from `git archive HEAD`; CI and release images are built from a fresh checkout ([SECURITY.md](../SECURITY.md)) |
 | Unreviewed policy change | Drafts, impact simulation, optional four-eyes review (author and last editor cannot approve), immutable versions, rollback |
 | Privilege escalation through configuration | User management, SSO mapping, service accounts, log export and Defender settings are Super Admin only; Team Leads cannot create BLOCK rules, catch-all hosts or baseline sets, nor change other roles' BLOCK guardrails |
 | Manipulated audit history | Keyed hash chain (HMAC-SHA256, audit chain key encrypted with `AEGIS_ENCRYPTION_KEY`) that is never recomputed; sealed anchor (start, pre-2.1 prefix) and head checkpoint (newest event, event count, configuration revision) saved atomically with the configuration; append-only JSONL sink and database table; seal checks at start-up and on every cluster reload, complete verification of every event at start-up, every `AEGIS_AUDIT_VERIFY_INTERVAL` (6 h), after rotations and on request; removed or forged seals, cut-off ends, changed, inserted or deleted events and hash downgrades are sticky integrity violations with high-severity alerts (a cut-off start is alerted until a retention point is applied); unkeyed prefixes stay untrusted until a Super Admin accepts them; real-time SIEM forwarding with checkpoint records ([details](#audit-trail-against-insiders)) |
@@ -95,7 +97,7 @@ topology or add integrations.
 | Slow or failing scan engines | Timeouts per engine, `icap_fail_mode` / `av_fail_mode` per policy, health status in heartbeats |
 | SIEM outage blocks the control-plane | Durable spool per export destination, bounded queues, drops counted in metrics |
 | Forged or altered records injected into the export spool | Spool records carry an HMAC-SHA256 keyed from the audit chain key and bound to the destination; records without or with a wrong MAC are dead-lettered with an alert, not sent |
-| Export to the SIEM silently stops | Delivery state per destination; a destination that cannot start drops records with a critical alert; responses that do not confirm every record (Elasticsearch bulk) are retried; posture check *Audit trail forwarded to a SIEM* requires a delivering destination |
+| Export to the SIEM silently stops | Delivery state per destination; a destination that cannot start drops records with a critical alert; responses that do not confirm every record (Elasticsearch bulk) are retried; posture check *Audit trail forwarded to a SIEM* requires a destination that delivers the audit stream itself (its own last outcome: a mixed destination that accepts the traffic records but rejects the audit records does not count) |
 
 ### Elevation of privilege
 
@@ -162,5 +164,12 @@ comparing it with an archived copy ([operations.md](operations.md#audit-trail)).
 - **Audit trail rollback**: state and audit trail replaced together by an older consistent copy, or rewritten by
   somebody holding the encryption key, verify locally; only the SIEM copy reveals it
   ([above](#audit-trail-against-insiders)).
+- **Reverse proxy configuration**: the control-plane cannot see whether the edge proxy replaces or appends to
+  `X-Forwarded-For`. Its loopback rule covers local users on the proxy host only when they arrive over
+  loopback; trust only the proxy's own addresses, make the edge proxy replace the header, and do not let
+  clients reach it from an address that is itself trusted (a Docker bridge gateway, the host's own address).
+- **Build hosts**: images built from a working copy contain what is in it. The allowlisted build contexts keep
+  out files with new names, but not changes to tracked files; check `git status` before building, or build
+  with `make images` (committed tree only) or in CI.
 - **Monitoring**: mitigations that alert (break-glass logins, emergency publishes, quarantines, security events)
   only help when someone reviews them — forward them to the SIEM and define response procedures.

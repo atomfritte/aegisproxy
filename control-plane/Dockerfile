@@ -5,6 +5,9 @@
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
 
 FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build
+# Only the go.sum-verified modules: a vendor/ directory or a go.work in the context (excluded by .dockerignore
+# anyway) would otherwise replace them without any checksum check.
+ENV GOFLAGS=-mod=readonly GOWORK=off
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

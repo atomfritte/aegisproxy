@@ -2,6 +2,7 @@ package export
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -781,4 +782,61 @@ func TestAuditCheckpointRecordDoesNotMoveCursor(t *testing.T) {
 	if c := cursorID(sinkDir); c != "e1" {
 		t.Fatalf("cursor %q, want the last trail event e1", c)
 	}
+}
+
+// RD4-4: the status reports the delivery outcome per stream. A mixed sink whose destination accepts the
+// traffic documents but rejects every audit document shows a sink-wide success (the traffic's) and a failing,
+// rejected audit stream; once the destination takes the audit documents the audit stream delivers again.
+func TestStreamStatusOfMixedSink(t *testing.T) {
+	var acceptAudit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rd := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			rd = zr
+		}
+		b, _ := io.ReadAll(rd)
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		var items []string
+		for i := 1; i < len(lines); i += 2 {
+			if strings.Contains(lines[i], "aegisproxy.audit") && !acceptAudit.Load() {
+				items = append(items, `{"create":{"status":400,"error":{"type":"mapper_parsing_exception","reason":"audit field mapping"}}}`)
+			} else {
+				items = append(items, `{"create":{"status":201}}`)
+			}
+		}
+		fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
+	}))
+	defer srv.Close()
+	m := New(Options{Node: "n1", Version: "t", SpoolDir: t.TempDir(), ExportDir: t.TempDir()})
+	defer m.Close()
+	sink := models.ExportSink{ID: "exp-es", Name: "siem", Type: "elasticsearch", Enabled: true, Streams: []string{"audit", "traffic"},
+		Endpoint: srv.URL, FlushSeconds: 1}
+	if err := Validate(&sink); err != nil {
+		t.Fatal(err)
+	}
+	m.Configure([]models.ExportSink{sink})
+	for i := range 5 {
+		m.Publish(AuditEvent(models.AuditEvent{ID: fmt.Sprintf("aud-%d", i), Timestamp: time.Now()}))
+		m.Publish(FlowEvent(flow(models.VerdictBlocked)))
+	}
+	waitFor(t, "both outcomes recorded", func() bool { st := statusOf(m, sink.ID); return st.Sent >= 5 && st.Failed >= 5 })
+	st := statusOf(m, sink.ID)
+	audit, traffic := st.Streams[models.StreamAudit], st.Streams[models.StreamTraffic]
+	if st.LastSuccessAt == nil || traffic.LastSuccessAt == nil || traffic.Failing() {
+		t.Fatalf("traffic must be delivered: %+v", st)
+	}
+	if !audit.Failing() || !audit.Rejected || audit.LastSuccessAt != nil || !strings.Contains(audit.LastError, "mapper_parsing_exception") {
+		t.Fatalf("audit stream must be failing with the rejection: %+v", audit)
+	}
+	acceptAudit.Store(true)
+	m.Publish(AuditEvent(models.AuditEvent{ID: "aud-ok", Timestamp: time.Now()}))
+	waitFor(t, "audit stream delivers again", func() bool {
+		a := statusOf(m, sink.ID).Streams[models.StreamAudit]
+		return a.LastSuccessAt != nil && !a.Failing()
+	})
 }

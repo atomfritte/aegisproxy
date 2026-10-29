@@ -180,20 +180,82 @@ func TestProxySecretRequiredFromTrustedPeers(t *testing.T) {
 	}
 }
 
+// DEPLOY4-1: a local user can also go THROUGH the proxy on the same host. A proxy that appends to
+// X-Forwarded-For records that user's loopback address after the user's own entry and sends the secret; a
+// loopback address inside the header is therefore never skipped as a proxy hop, but is the client. Chains
+// through other trusted proxies (a load balancer in front of nginx) keep working.
+func TestForwardedLoopbackIsALocalClient(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	s := &Server{cfg: &config.Config{TrustedProxySecret: secret, TrustedProxies: []netip.Prefix{
+		netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("::1/128"), netip.MustParsePrefix("10.0.0.5/32")}}}
+	s.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	req := func(peer string, xff ...string) *http.Request {
+		r := httptest.NewRequest("POST", "/api/auth/login", nil)
+		r.RemoteAddr = peer
+		for _, v := range xff {
+			r.Header.Add("X-Forwarded-For", v)
+		}
+		r.Header.Set(proxyAuthHeader, secret)
+		return r
+	}
+	for _, c := range []struct {
+		name, peer string
+		xff        []string
+		client     string
+	}{
+		{"local user through nginx (appends 127.0.0.1)", "127.0.0.1:40000", []string{"10.20.30.7, 127.0.0.1"}, "127.0.0.1"},
+		{"local user through nginx on ::1", "127.0.0.1:40000", []string{"10.20.30.7, ::1"}, "::1"},
+		{"IPv4-mapped loopback hop", "127.0.0.1:40000", []string{"10.20.30.7, ::ffff:127.0.0.1"}, "127.0.0.1"},
+		{"any 127/8 hop", "127.0.0.1:40000", []string{"10.20.30.7,127.0.0.2"}, "127.0.0.2"},
+		{"loopback hop in its own header line", "127.0.0.1:40000", []string{"10.20.30.7", "127.0.0.1"}, "127.0.0.1"},
+		{"proxy connects over ::1", "[::1]:40000", []string{"10.20.30.7, ::1"}, "::1"},
+		{"proxy connects over IPv4-mapped loopback", "[::ffff:127.0.0.1]:40000", []string{"10.20.30.7, 127.0.0.1"}, "127.0.0.1"},
+		{"local user through the load balancer and nginx", "127.0.0.1:40000", []string{"10.20.30.7, 10.0.0.5, 127.0.0.1"}, "127.0.0.1"},
+		{"load balancer reached over loopback", "10.0.0.5:40000", []string{"10.20.30.7, 127.0.0.1"}, "127.0.0.1"},
+		{"legit chain: client, load balancer (trusted)", "127.0.0.1:40000", []string{"203.0.113.5, 10.0.0.5"}, "203.0.113.5"},
+		{"proxy replaces the header", "127.0.0.1:40000", []string{"203.0.113.5"}, "203.0.113.5"},
+		{"remote client sends a loopback entry", "127.0.0.1:40000", []string{"127.0.0.1, 203.0.113.5"}, "203.0.113.5"},
+		{"remote client claims loopback through the load balancer", "127.0.0.1:40000", []string{"::1, 203.0.113.5, 10.0.0.5"}, "203.0.113.5"},
+		{"local user without forged entries", "127.0.0.1:40000", []string{"127.0.0.1"}, "127.0.0.1"},
+	} {
+		if got := s.clientIP(req(c.peer, c.xff...)); got != c.client {
+			t.Errorf("%s (peer %s, X-Forwarded-For %q): client %s, want %s", c.name, c.peer, c.xff, got, c.client)
+		}
+	}
+	if src := s.throttleSource(req("127.0.0.1:40000", "198.51.100.9, 127.0.0.1")); src.label != "127.0.0.1" || src.proxy != "" {
+		t.Errorf("local user through nginx is throttled as %+v, want 127.0.0.1", src)
+	}
+	// Loopback trusted by name (AEGIS_TRUSTED_PROXY_HOSTS=localhost) and without a secret: same rule.
+	p := &proxyHostSet{hosts: []string{"localhost"}, refresh: time.Hour, addrs: map[netip.Addr]bool{},
+		lookup: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")}, nil
+		}}
+	p.resolve()
+	byName := &Server{cfg: &config.Config{}, proxyHosts: p}
+	if got := clientIPOf(byName, "127.0.0.1:40000", "10.20.30.7, 127.0.0.1"); got != "127.0.0.1" {
+		t.Errorf("loopback trusted by name: client %s, want 127.0.0.1", got)
+	}
+	if got := clientIPOf(byName, "127.0.0.1:40000", "203.0.113.5"); got != "203.0.113.5" {
+		t.Errorf("loopback trusted by name, replaced header: client %s, want 203.0.113.5", got)
+	}
+}
+
 // DEPLOY-1: the posture report warns when loopback or a broad range is trusted without the proxy secret.
+// DEPLOY4-1: with the secret, trusted loopback passes (loopback hops are local clients), a broad range does not.
 func TestTrustedProxyPosture(t *testing.T) {
-	status := func(secret string, hosts []string, prefixes ...string) string {
+	const secret = "0123456789abcdef0123456789abcdef"
+	status := func(secret string, hosts []string, prefixes ...string) (string, string) {
 		s := &Server{cfg: &config.Config{TrustedProxySecret: secret, TrustedProxyHosts: hosts}}
 		for _, p := range prefixes {
 			s.cfg.TrustedProxies = append(s.cfg.TrustedProxies, netip.MustParsePrefix(p))
 		}
-		var got string
-		s.trustedProxyPostureCheck(func(id, _, _, st, _, _, _ string) {
+		var got, detail string
+		s.trustedProxyPostureCheck(func(id, _, _, st, d, _, _ string) {
 			if id == "trusted-proxies" {
-				got = st
+				got, detail = st, d
 			}
 		})
-		return got
+		return got, detail
 	}
 	for _, c := range []struct {
 		want, secret string
@@ -206,10 +268,21 @@ func TestTrustedProxyPosture(t *testing.T) {
 		{"warn", "", nil, []string{"fd00::/32"}},
 		{"pass", "", nil, []string{"10.96.4.12/32"}},
 		{"pass", "", []string{"ingress.ingress-nginx.svc.cluster.local"}, nil},
-		{"pass", "0123456789abcdef0123456789abcdef", nil, []string{"127.0.0.1/32"}},
+		{"pass", secret, nil, []string{"127.0.0.1/32"}},
+		{"pass", secret, nil, []string{"127.0.0.0/8", "::1/128", "10.96.4.12/32"}},
+		{"pass", secret, []string{"lb.corp.example"}, []string{"127.0.0.1/32"}},
+		{"warn", secret, nil, []string{"127.0.0.1/32", "10.0.0.0/8"}},
+		{"warn", secret, nil, []string{"fd00::/32"}},
 	} {
-		if got := status(c.secret, c.hosts, c.prefixes...); got != c.want {
-			t.Errorf("%v %v secret=%t: %s, want %s", c.prefixes, c.hosts, c.secret != "", got, c.want)
+		got, detail := status(c.secret, c.hosts, c.prefixes...)
+		if got != c.want {
+			t.Errorf("%v %v secret=%t: %s (%s), want %s", c.prefixes, c.hosts, c.secret != "", got, detail, c.want)
+		}
+		if c.secret != "" && got == "pass" && !strings.Contains(detail, "loopback address in X-Forwarded-For counts as a local client") {
+			t.Errorf("%v: detail %q does not say how loopback hops are treated", c.prefixes, detail)
+		}
+		if c.secret != "" && got == "warn" && (strings.Contains(detail, "127.0.0.") || !strings.Contains(detail, "10.0.0.0/8") && !strings.Contains(detail, "fd00::/32")) {
+			t.Errorf("%v: detail %q must name the broad range only", c.prefixes, detail)
 		}
 	}
 }

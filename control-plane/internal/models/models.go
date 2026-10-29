@@ -1100,6 +1100,26 @@ type ExportSinkStatus struct {
 	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
 	LastError     string     `json:"last_error,omitempty"`
 	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
+	// Streams is the delivery state per stream (audit, traffic, ...) of the records this node tried to send:
+	// one destination may accept the records of one stream and reject every record of another, which the
+	// sink-wide LastSuccessAt does not show.
+	Streams map[string]ExportStreamStatus `json:"streams,omitempty"`
+}
+
+// ExportStreamStatus is the delivery state of the records of one stream of a sink.
+type ExportStreamStatus struct {
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	// Rejected: the last failure was a rejection (records dead-lettered or lost), not an unavailable
+	// destination whose records are retried.
+	Rejected bool `json:"rejected,omitempty"`
+}
+
+// Failing reports whether the last delivery attempt of the stream failed (a rejection at the same time as a
+// delivery, i.e. in the same batch, counts as failing).
+func (s ExportStreamStatus) Failing() bool {
+	return s.LastErrorAt != nil && (s.LastSuccessAt == nil || !s.LastSuccessAt.After(*s.LastErrorAt))
 }
 
 // PolicySetDocument is the portable representation of a policy set (policy as code).

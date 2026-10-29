@@ -200,6 +200,21 @@ env_set() {
     cat "$tmp" > "$file"; rm -f "$tmp"
 }
 
+# nginx_appending_xff - nginx configuration files that send the proxy secret (include nginx-proxy-auth.conf) but
+# append to the client's X-Forwarded-For ($proxy_add_x_forwarded_for, the aegis-console.conf of earlier
+# releases) instead of replacing it with $remote_addr: a local user who goes through that nginx chooses the
+# entries in front of the one nginx adds.
+nginx_appending_xff() {
+    local f
+    for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+        [ -f "$f" ] || continue
+        if grep -q '^[^#]*nginx-proxy-auth\.conf' "$f" \
+            && grep -Eq '^[^#]*X-Forwarded-For[[:space:]]+\$proxy_add_x_forwarded_for' "$f"; then
+            printf '%s\n' "$f"
+        fi
+    done
+}
+
 # write_nginx_proxy_auth - /etc/aegis/nginx-proxy-auth.conf (root:root 0600): the line with which nginx sends the
 # proxy secret to the control-plane (include it in the server block, see deploy/nginx/aegis-console.conf).
 write_nginx_proxy_auth() {
@@ -393,6 +408,9 @@ if want_cp; then
     fi
     if [ -s "$SECRETS/trusted-proxy-secret" ]; then
         write_nginx_proxy_auth
+        while IFS= read -r f; do
+            warn "$f appends the client's X-Forwarded-For (\$proxy_add_x_forwarded_for): replace it with 'proxy_set_header X-Forwarded-For \$remote_addr;' as in deploy/nginx/aegis-console.conf and reload nginx (the control-plane already treats a loopback entry as the local client)."
+        done < <(nginx_appending_xff)
     else
         case ",$(env_get "$CP_ENV" AEGIS_TRUSTED_PROXIES)," in
             *,127.*|*,::1*) warn "AEGIS_TRUSTED_PROXIES trusts loopback without a proxy secret: every local account can choose its client address. Re-run with --proxy-secret, then add 'include $ETC/nginx-proxy-auth.conf;' to nginx and reload it." ;;
@@ -548,8 +566,12 @@ PY
 
     rm -rf "$DP_DIR/aegis_dp.new"
     mkdir -p "$DP_DIR/aegis_dp.new"
-    cp -R "$DP_SRC/aegis_dp/." "$DP_DIR/aegis_dp.new/"
-    find "$DP_DIR/aegis_dp.new" -depth \( -name __pycache__ -o -name tests \) -type d -exec rm -rf {} +
+    # Only the package's own modules (*.py, the package has no sub-packages): a directory or an extension module
+    # (.so) next to them would be imported instead of the reviewed module of the same name (aegis_dp/policy/ or
+    # policy.cpython-*.so before policy.py), and bytecode is compiled below from these sources only.
+    find "$DP_SRC/aegis_dp" -mindepth 1 -maxdepth 1 -type f -name '*.py' -exec cp -- {} "$DP_DIR/aegis_dp.new/" \;
+    SKIPPED=$(find "$DP_SRC/aegis_dp" -mindepth 1 -maxdepth 1 ! -name '*.py' ! -name __pycache__ -printf '%f ')
+    [ -z "$SKIPPED" ] || warn "Not installed from $DP_SRC/aegis_dp (only its *.py modules are): $SKIPPED- remove what you did not put there yourself"
     install -m 0644 -o root -g root "$DP_SRC/aegis_addon.py" "$DP_DIR/aegis_addon.py"
     rm -rf "$DP_DIR/aegis_dp"; mv "$DP_DIR/aegis_dp.new" "$DP_DIR/aegis_dp"
     chown -R root:root "$DP_DIR/aegis_dp"; chmod -R u=rwX,go=rX "$DP_DIR/aegis_dp"
@@ -655,7 +677,8 @@ if want_cp; then
     echo "Control-plane      : $(env_get "$CP_ENV" AEGIS_PUBLIC_URL)  [health: $CP_OK]  config: $CP_ENV"
     if [ -s "$SECRETS/bootstrap-admin-password" ]; then echo "Admin login        : admin / (password from $SECRETS/bootstrap-admin-password)"
     else echo "Admin login        : admin / password in $STATE/data/secrets/initial-admin-password (created on first start)"; fi
-    echo "TLS reverse proxy  : deploy/nginx/aegis-console.conf (https AEGIS_PUBLIC_URL; nginx must include $ETC/nginx-proxy-auth.conf, otherwise every request counts as coming from 127.0.0.1)"
+    echo "TLS reverse proxy  : deploy/nginx/aegis-console.conf (https AEGIS_PUBLIC_URL; nginx must include $ETC/nginx-proxy-auth.conf, otherwise every request counts as coming from 127.0.0.1,"
+    echo "                     and replace X-Forwarded-For: proxy_set_header X-Forwarded-For \$remote_addr; - see the file for a load balancer in front of nginx)"
 fi
 if want_dp; then
     echo "Data-plane         : proxy :$(env_get "$DP_ENV" AEGIS_LISTEN_PORT)  [ready: $DP_OK]  config: $DP_ENV"
