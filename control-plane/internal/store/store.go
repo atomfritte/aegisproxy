@@ -344,6 +344,7 @@ func (s *Store) seedClusterLocked() error {
 func (s *Store) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.stopAuditVerification()
 		s.persistWG.Wait()
 	})
 }

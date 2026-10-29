@@ -490,10 +490,15 @@ func (s *Store) consoleUsernameLocked(userName, selfID string) string {
 		return slices.ContainsFunc(s.state.Users, func(u models.User) bool { return u.ID != selfID && strings.EqualFold(u.Username, n) })
 	}
 	if taken(name) {
-		// Never take over another account (local, break-glass or another IdP user) by name.
+		// Never take over another account (local, break-glass, another IdP user, or the record a deleted
+		// user left for the audit trail) by name: audit events, change requests and approvals name their
+		// actor by username.
 		name = clip(name, 56) + "-" + tag[:6]
-		if taken(name) {
+		for n := 1; taken(name); n++ {
 			name = "scim-" + tag[:16]
+			if n > 1 {
+				name += fmt.Sprintf("-%d", n)
+			}
 		}
 	}
 	return name
@@ -527,8 +532,18 @@ func primaryEmail(emails []models.SCIMEmail) string {
 
 // applySCIMProfileLocked copies the SCIM attributes onto the console account (copy-on-write: the
 // SCIM struct is replaced, never modified in place, because readers hold copies of the pointer).
-func (s *Store) applySCIMProfileLocked(u *models.User, in models.SCIMUser, now time.Time) {
+// The single sign-on link belongs to the immutable user ID the SCIM client reports: when the
+// externalId changes, or a deleted record is provisioned again, the link is removed (and the sessions
+// revoked), so that only a subject equal to the new externalId links at the next sign-in.
+func (s *Store) applySCIMProfileLocked(u *models.User, in models.SCIMUser, actor string, now time.Time) {
 	prev := u.SCIM
+	switch {
+	case prev == nil:
+	case prev.Deleted:
+		s.unlinkSSOLocked(u, actor, "the account was provisioned again after the SCIM client deleted it", now)
+	case prev.ExternalID != in.ExternalID:
+		s.unlinkSSOLocked(u, actor, fmt.Sprintf("its SCIM externalId changed from %q to %q", prev.ExternalID, in.ExternalID), now)
+	}
 	sc := in
 	sc.Emails = append([]models.SCIMEmail(nil), in.Emails...)
 	sc.Deleted, sc.LastModified = false, now
@@ -551,6 +566,25 @@ func (s *Store) applySCIMProfileLocked(u *models.User, in models.SCIMUser, now t
 	u.Department = clip(sc.Department, 120)
 }
 
+// unlinkSSOLocked removes the single sign-on link (User.ExternalID, the issuer|subject digest) of a
+// SCIM-managed account and revokes its sessions: the person who signed in through it may not be the
+// one the SCIM client now reports. Audited as USER_UNLINKED_SSO; nothing happens without a link.
+func (s *Store) unlinkSSOLocked(u *models.User, actor, reason string, now time.Time) {
+	if u.ExternalID == "" {
+		return
+	}
+	prev := u.ExternalID
+	u.ExternalID, u.SessionsNotBefore = "", &now
+	s.appendAuditLocked(models.AuditEvent{
+		Actor: actor, ActorRole: scimActorRole, Action: "USER_UNLINKED_SSO", Category: "IDENTITY",
+		EntityType: "user", EntityID: u.ID, EntityName: u.Username,
+		Summary: fmt.Sprintf("Removed the single sign-on link of %s and revoked its sessions: %s; only a sign-in whose subject equals the SCIM externalId links it again",
+			u.Username, reason),
+		BeforeState: "sso_link=" + prev,
+		AfterState:  "sso_link=",
+	})
+}
+
 func scimUserUnchanged(a, b *models.SCIMUser) bool {
 	if a == nil || b == nil {
 		return false
@@ -571,8 +605,9 @@ func (s *Store) scimUserNameTakenLocked(userName, selfID string) bool {
 }
 
 // SCIMCreateUser provisions an account. A single-sign-on account that signed in before SCIM was set
-// up (same subject or username) is claimed instead of duplicated, and a user the SCIM client deleted
-// earlier is revived, so that the person keeps one account and one audit trail.
+// up (same subject) is claimed instead of duplicated, and a user the SCIM client deleted earlier is
+// revived, so that the person keeps one account and one audit trail. Both match the immutable user ID
+// (externalId) only, exactly: a userName can be given to a different person later.
 func (s *Store) SCIMCreateUser(in models.SCIMUser, actor string) (SCIMUserView, error) {
 	if err := normalizeSCIMUser(&in); err != nil {
 		return SCIMUserView{}, err
@@ -585,10 +620,8 @@ func (s *Store) SCIMCreateUser(in models.SCIMUser, actor string) (SCIMUserView, 
 		now := time.Now().UTC()
 		issuer := normalizeSSO(s.state.EntraConfig, "").IssuerURL
 		action, how := "USER_PROVISIONED_SCIM", "Provisioned"
-		// 1. revive a tombstone of the same person
-		i := slices.IndexFunc(s.state.Users, func(u models.User) bool {
-			return u.SCIM != nil && u.SCIM.Deleted && (strings.EqualFold(u.SCIM.UserName, in.UserName) || (in.ExternalID != "" && u.SCIM.ExternalID == in.ExternalID))
-		})
+		// 1. revive the record the same person left when the SCIM client deleted it
+		i := s.scimTombstoneLocked(in.ExternalID)
 		if i >= 0 {
 			how = "Re-provisioned (previously deleted)"
 		} else {
@@ -609,10 +642,17 @@ func (s *Store) SCIMCreateUser(in models.SCIMUser, actor string) (SCIMUserView, 
 			if n := s.countSCIMUsersLocked(); n >= maxSCIMUsers {
 				return scimErr(SCIMTooMany, "at most %d SCIM-provisioned users", maxSCIMUsers)
 			}
+			if slices.ContainsFunc(s.state.Users, func(u models.User) bool {
+				return u.SCIM != nil && u.SCIM.Deleted && strings.EqualFold(u.SCIM.UserName, in.UserName)
+			}) {
+				// A new account with its own ID, console name and audit trail: the deleted record keeps the
+				// history of the person it belonged to.
+				how = "Provisioned (a deleted account with this userName but another externalId was not revived)"
+			}
 			s.state.Users = append(s.state.Users, models.User{ID: newRandomID("usr"), AuthProvider: "oidc", AllowedGroups: []string{}, CreatedAt: now})
 			i = len(s.state.Users) - 1
 		}
-		s.applySCIMProfileLocked(&s.state.Users[i], in, now)
+		s.applySCIMProfileLocked(&s.state.Users[i], in, actor, now)
 		s.syncSCIMUserLocked(i, s.scimMembershipsLocked(), actor, now, true)
 		u := &s.state.Users[i]
 		state := "enabled"
@@ -632,6 +672,27 @@ func (s *Store) SCIMCreateUser(in models.SCIMUser, actor string) (SCIMUserView, 
 		return nil
 	})
 	return out, err
+}
+
+// scimTombstoneLocked finds the record the SCIM client deleted for the user with this externalId (the
+// IdP's immutable user ID, compared exactly), or -1. A userName never matches: the IdP can give it to
+// a different person, who would inherit the account's audit trail and its single sign-on link. Without
+// an externalId, or when several deleted records carry it, nothing is revived and a new account is
+// created.
+func (s *Store) scimTombstoneLocked(externalID string) int {
+	if externalID == "" {
+		return -1
+	}
+	found := -1
+	for i, u := range s.state.Users {
+		if u.SCIM != nil && u.SCIM.Deleted && u.SCIM.ExternalID == externalID {
+			if found >= 0 {
+				return -1
+			}
+			found = i
+		}
+	}
+	return found
 }
 
 func (s *Store) countSCIMUsersLocked() int {
@@ -676,7 +737,7 @@ func (s *Store) SCIMUpdateUser(id string, ifMatch int64, update func(cur SCIMUse
 			return nil
 		}
 		now := time.Now().UTC()
-		s.applySCIMProfileLocked(u, in, now)
+		s.applySCIMProfileLocked(u, in, actor, now)
 		s.appendAuditLocked(models.AuditEvent{
 			Actor: actor, ActorRole: scimActorRole, Action: "USER_UPDATED_SCIM", Category: "IDENTITY",
 			EntityType: "user", EntityID: u.ID, EntityName: u.Username,
@@ -692,8 +753,9 @@ func (s *Store) SCIMUpdateUser(id string, ifMatch int64, update func(cur SCIMUse
 	return out, err
 }
 
-// SCIMDeleteUser deprovisions an account: it is disabled, its sessions are revoked, it leaves every
-// SCIM group and is no longer a SCIM resource. The record stays for the audit trail.
+// SCIMDeleteUser deprovisions an account: it is disabled, its sessions are revoked, its single sign-on
+// link is removed, it leaves every SCIM group and is no longer a SCIM resource. The record stays for
+// the audit trail; only the same externalId revives it.
 func (s *Store) SCIMDeleteUser(id string, actor string) error {
 	return s.withWrite(func() error {
 		i := s.scimUserIndexLocked(id)
@@ -723,6 +785,9 @@ func (s *Store) SCIMDeleteUser(id string, actor string) error {
 			EntityType: "user", EntityID: u.ID, EntityName: u.Username,
 			Summary: fmt.Sprintf("Deleted by the SCIM client: %s disabled, all sessions revoked, removed from %d SCIM groups", u.Username, left),
 		})
+		// The record no longer belongs to anybody: the subject it was linked to is refused as deprovisioned
+		// (SCIM externalId = subject), and whoever the IdP gives the userName next gets a new account.
+		s.unlinkSSOLocked(u, actor, "the SCIM client deleted the account", now)
 		s.noteSCIMChangeLocked(now)
 		return nil
 	})
