@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, KeyRound, Monitor, ShieldCheck, Terminal, 
 import { api } from '../../api';
 import { useAction, useFlows } from '../../data/AppData';
 import { formatDateTime, toTime } from '../../lib/format';
+import { commentText, shellQuote } from '../../lib/shell';
 import type { RotateTokenResponse, Server } from '../../types';
 import { Button, Callout, CodeBlock, CopyButton, Drawer, RelativeTime, Spinner, TabPanel, Tabs } from '../../ui';
 import { VerdictBadge } from '../traffic/VerdictBadge';
@@ -51,12 +52,12 @@ export const OnboardingDrawer: React.FC<{ open: boolean; onClose: () => void; se
 
   const env = res
     ? [
-        `# Proxy for ${server.hostname} (user ${res.proxy_auth_user})`,
-        `export HTTPS_PROXY='${res.onboarding.proxy_url}'`,
-        `export HTTP_PROXY='${res.onboarding.proxy_url}'`,
-        `export NO_PROXY='${res.onboarding.no_proxy}'`,
+        `# Proxy for ${commentText(server.hostname)} (user ${commentText(res.proxy_auth_user)})`,
+        `export HTTPS_PROXY=${shellQuote(res.onboarding.proxy_url)}`,
+        `export HTTP_PROXY=${shellQuote(res.onboarding.proxy_url)}`,
+        `export NO_PROXY=${shellQuote(res.onboarding.no_proxy)}`,
         '',
-        `# Proxy address without credentials: ${res.onboarding.proxy_address}`,
+        `# Proxy address without credentials: ${commentText(res.onboarding.proxy_address)}`,
       ].join('\n')
     : '';
 

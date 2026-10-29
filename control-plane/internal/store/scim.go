@@ -592,15 +592,14 @@ func (s *Store) SCIMCreateUser(in models.SCIMUser, actor string) (SCIMUserView, 
 		if i >= 0 {
 			how = "Re-provisioned (previously deleted)"
 		} else {
-			// 2. claim a just-in-time single-sign-on account (never a local one)
+			// 2. claim a just-in-time single-sign-on account (never a local one) of the same person, only by the
+			// immutable user ID (externalId = token subject). A JIT account's name comes from the username claim,
+			// which users can choose in some IdPs: claiming by name would hand a provisioned role to whoever
+			// signed in first with that name.
 			claimable := func(u models.User) bool { return u.AuthProvider == "oidc" && u.SCIM == nil }
 			if in.ExternalID != "" && issuer != "" {
 				ext := externalID(issuer, in.ExternalID)
 				i = slices.IndexFunc(s.state.Users, func(u models.User) bool { return claimable(u) && u.ExternalID == ext })
-			}
-			if i < 0 {
-				plain := s.plainUsernameLocked(in.UserName)
-				i = slices.IndexFunc(s.state.Users, func(u models.User) bool { return claimable(u) && u.Username == plain })
 			}
 			if i >= 0 {
 				action, how = "USER_LINKED_SCIM", "Took over the single sign-on account"

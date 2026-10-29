@@ -601,7 +601,8 @@ class Policy:
                         res.matched_rule_id, res.matched_rule_name = sess.get("id", ""), f"Learning Session: {sess.get('name', '')}"
                         return res
             # 6. Redirect-object grant of this server
-            grant = None if strict else grants.check(srv_id, host, clean_path, method)
+            scheme, eff_port = request_origin(full_url, port)
+            grant = None if strict else grants.check(srv_id, host, clean_path, method, scheme, eff_port)
             if grant:
                 res.allowed, res.verdict = True, VERDICT_REDIRECT
                 res.matched_rule_id, res.matched_rule_name = grant[1], f"{grant[2]} (Object Redirect)"
@@ -626,6 +627,21 @@ class Policy:
                              "Security Guard: Internal destinations are not reachable via the egress proxy without an explicit rule")
         res.block_reason = "default_deny"
         return res
+
+
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def request_origin(full_url: str, port: int) -> Tuple[str, int]:
+    """Scheme and effective port of a request (same as engine.RequestOrigin): the URL's scheme, else https unless the
+    port is 80 (CONNECT and tunnel re-checks carry no URL)."""
+    try:
+        scheme = urllib.parse.urlsplit(full_url).scheme.lower() if full_url else ""
+    except ValueError:
+        scheme = ""
+    if scheme not in DEFAULT_PORTS:
+        scheme = "http" if port == 80 else "https"
+    return scheme, int(port or 0) or DEFAULT_PORTS[scheme]
 
 
 class RedirectGrants:
@@ -660,6 +676,13 @@ class RedirectGrants:
         path, ok = canonicalize_path(target.path or "/")
         if not ok:
             return False
+        try:
+            port = target.port
+        except ValueError:
+            return False
+        if port == 0:
+            return False
+        port = port or DEFAULT_PORTS[target.scheme]
         exp = time.time() + self.TTL
         with self._lock:
             if len(self._grants) >= self.MAX:
@@ -668,14 +691,18 @@ class RedirectGrants:
                     del self._grants[k]
                 if len(self._grants) >= self.MAX:
                     self._grants.clear()
-            self._grants[f"{server_id}|{host}|{path}"] = (parent_url, rule_id, rule_name, exp)
-            self._grants[f"{server_id}|{host}|CONNECT"] = (parent_url, rule_id, rule_name, exp)
+            # The grant covers exactly the redirect target's origin (scheme, host, port) and object; the tunnel key
+            # lets the client open a CONNECT tunnel to that host:port for it.
+            self._grants[f"{server_id}|{target.scheme}|{host}|{port}|{path}"] = (parent_url, rule_id, rule_name, exp)
+            self._grants[f"{server_id}|{host}|{port}|CONNECT"] = (parent_url, rule_id, rule_name, exp)
         return True
 
-    def check(self, server_id: str, host: str, path: str, method: str) -> Optional[Tuple[str, str, str, float]]:
-        if method not in ("GET", "HEAD", "CONNECT") or not server_id:
+    def check(self, server_id: str, host: str, path: str, method: str, scheme: str = "https",
+              port: int = 0) -> Optional[Tuple[str, str, str, float]]:
+        if method not in ("GET", "HEAD", "CONNECT") or not server_id or scheme not in DEFAULT_PORTS:
             return None
-        key = f"{server_id}|{host}|CONNECT" if method == "CONNECT" else f"{server_id}|{host}|{path}"
+        port = port or DEFAULT_PORTS[scheme]
+        key = f"{server_id}|{host}|{port}|CONNECT" if method == "CONNECT" else f"{server_id}|{scheme}|{host}|{port}|{path}"
         with self._lock:
             grant = self._grants.get(key)
         if grant and time.time() < grant[3]:

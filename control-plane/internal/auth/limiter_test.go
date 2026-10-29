@@ -93,3 +93,66 @@ func TestLoginLimiterFactorsAndMaxLock(t *testing.T) {
 		t.Fatalf("break-glass lockout %s, want at most 1 minute", wait)
 	}
 }
+
+// R3-3: break-glass sign-ins behind an untrusted proxy depend on its ceiling, so sustained failures from
+// behind that proxy must not grow its lockout beyond the break-glass maximum of one minute.
+func TestLoginLimiterProxyCeilingLockIsCapped(t *testing.T) {
+	l := NewLoginLimiter()
+	proxy := Key{Name: "proxy:10.0.0.9", Factor: FactorProxy, MaxLock: time.Minute}
+	for i := 0; i < 5*FactorProxy+10; i++ { // one failure after every expired lock
+		if e := l.entries[proxy.Name]; e != nil {
+			e.lockedUntil = time.Time{}
+		}
+		a, wait := l.Begin(Key{Name: "ip:10.0.0.9|" + strconv.Itoa(i), Factor: FactorSource, Shed: true}, proxy)
+		if wait > 0 {
+			t.Fatalf("attempt %d refused", i)
+		}
+		a.Fail()
+	}
+	if wait := l.Check(proxy.Name); wait <= 0 || wait > time.Minute {
+		t.Fatalf("per-proxy lockout %s, want at most 1 minute", wait)
+	}
+}
+
+// R3-3: idle entries are swept at most once per minute (no scan of the whole map on every attempt), and
+// a limiter full of lockouts sheds new Shed keys and refuses attempts that need any other new key.
+func TestLoginLimiterMemoryIsBounded(t *testing.T) {
+	l := NewLoginLimiter()
+	now := time.Now()
+	for i := 0; i < 2000; i++ {
+		l.entries["ip:idle"+strconv.Itoa(i)] = &loginAttempt{lastSeen: now.Add(-2 * time.Hour)}
+	}
+	l.lastSweep = now
+	a, _ := l.Begin(Key{Name: "u:alice"})
+	a.Release()
+	if len(l.entries) != 2001 {
+		t.Fatalf("swept within a minute of the last sweep: %d entries", len(l.entries))
+	}
+	l.lastSweep = now.Add(-2 * time.Minute)
+	a, _ = l.Begin(Key{Name: "u:alice"})
+	a.Release()
+	if len(l.entries) != 1 {
+		t.Fatalf("%d entries after the sweep, want only u:alice", len(l.entries))
+	}
+
+	for i := len(l.entries); i < maxLimiterEntries; i++ {
+		l.entries["ip:locked"+strconv.Itoa(i)] = &loginAttempt{failures: 20, lockedUntil: now.Add(time.Hour), lastSeen: now}
+	}
+	proxy := Key{Name: "proxy:10.0.0.9", Factor: FactorProxy}
+	l.entries[proxy.Name] = &loginAttempt{lastSeen: now}
+	l.lastSweep = time.Now() // the next sweep (once per second while full) would drop the idle proxy entry
+	a, wait := l.Begin(Key{Name: "ip:10.0.0.9|198.51.100.1", Factor: FactorSource, Shed: true}, proxy)
+	if wait > 0 {
+		t.Fatalf("a full limiter refused an attempt it can bound with the proxy ceiling: %s", wait)
+	}
+	if _, tracked := l.entries["ip:10.0.0.9|198.51.100.1"]; tracked || len(a.keys) != 1 {
+		t.Fatalf("a full limiter tracked a new claimed client: keys %+v", a.keys)
+	}
+	a.Fail()
+	if _, wait := l.Begin(Key{Name: "u:new-account"}); wait != busyRetry {
+		t.Fatalf("a full limiter forgot a lockout or skipped a new account key: wait %s", wait)
+	}
+	if len(l.entries) > maxLimiterEntries+1 {
+		t.Fatalf("%d entries, want at most %d", len(l.entries), maxLimiterEntries+1)
+	}
+}

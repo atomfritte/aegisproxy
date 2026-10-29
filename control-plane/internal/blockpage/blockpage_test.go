@@ -58,6 +58,47 @@ func TestRenderAndFill(t *testing.T) {
 	}
 }
 
+// R3-5: no admin text field may carry a placeholder into a shell: not with "%%%" runs (a single "%%" → "%"
+// pass leaves "%%"), not in fields that were never neutralized (company, support, links incl. URL queries),
+// and not where the company name meets the surrounding text.
+func TestAdminTextCannotInjectPlaceholders(t *testing.T) {
+	fields := func(v string) models.BlockPageTemplate {
+		bp := tpl()
+		bp.CompanyName, bp.Title, bp.Message, bp.ThreatMessage, bp.FooterText, bp.CLIHeader, bp.CLIFooter = v, v, v+" %{company}%", v, v, v, v
+		bp.Support = models.SupportContact{Label: v, Email: v, Phone: v, URL: "https://help.example/?q=" + v}
+		bp.Links = []models.LinkItem{{Label: v, URL: "https://wiki.example/?q=" + v}}
+		return bp
+	}
+	clean, err := Render(fields("x"), "en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"%%%AEGIS:data_json%%%", "%%%%AEGIS:nonce%%%%", "%AEGIS:data_json%", "%%AEGIS:logo%%"} {
+		got, err := Render(fields(v), "en")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, pair := range map[string][2]string{"request_html": {clean.RequestHTML, got.RequestHTML}, "threat_html": {clean.ThreatHTML, got.ThreatHTML},
+			"request_cli": {clean.RequestCLI, got.RequestCLI}, "threat_cli": {clean.ThreatCLI, got.ThreatCLI}} {
+			if want, n := strings.Count(pair[0], "%%AEGIS:"), strings.Count(pair[1], "%%AEGIS:"); n != want {
+				t.Errorf("%q: %s has %d placeholders, want %d", v, name, n, want)
+			}
+		}
+	}
+}
+
+// R3-5: raw values (unescaped) are inserted only in their own spot of the shell.
+func TestRawValuesOnlyInTheirContext(t *testing.T) {
+	vals := map[string]string{"nonce": "n0", "logo": "data:image/png;base64,AA==", "data_json": `{"a":"b"}`}
+	out := Fill(`<a title="%%AEGIS:data_json%%">%%AEGIS:nonce%%</a><i nonce="%%AEGIS:data_json%%"></i><img src="%%AEGIS:logo%%">`+
+		`<style nonce="%%AEGIS:nonce%%"></style><script type="application/json" id="aegis-data">%%AEGIS:data_json%%</script>`, vals, true)
+	want := `<a title="{&#34;a&#34;:&#34;b&#34;}">n0</a><i nonce="{&#34;a&#34;:&#34;b&#34;}"></i><img src="data:image/png;base64,AA==">` +
+		`<style nonce="n0"></style><script type="application/json" id="aegis-data">{"a":"b"}</script>`
+	if out != want {
+		t.Errorf("Fill:\n got %s\nwant %s", out, want)
+	}
+}
+
 func TestLocales(t *testing.T) {
 	de, _ := Render(tpl(), "de")
 	if !strings.Contains(de.RequestHTML, `lang="de"`) || !strings.Contains(de.RequestHTML, "Antrag absenden") {

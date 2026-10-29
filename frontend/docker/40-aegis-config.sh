@@ -26,7 +26,21 @@ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment
 add_header Cross-Origin-Opener-Policy "same-origin" always;
 HDR
 
+# Optional AEGIS_TRUSTED_PROXY_SECRET(_FILE): sent to the control-plane in X-Aegis-Proxy-Auth, so that only this
+# proxy (not every container that shares its address) can supply X-Forwarded-For. Same characters as the
+# control-plane accepts, so it can be embedded into the nginx configuration verbatim.
+PROXY_AUTH=""
+SECRET="${AEGIS_TRUSTED_PROXY_SECRET:-}"
+if [ -n "${AEGIS_TRUSTED_PROXY_SECRET_FILE:-}" ]; then SECRET=$(tr -d '\r\n' < "$AEGIS_TRUSTED_PROXY_SECRET_FILE"); fi
+if [ -n "$SECRET" ]; then
+    if [ "${#SECRET}" -lt 32 ] || printf '%s' "$SECRET" | grep -q '[^A-Za-z0-9._~+/=-]'; then
+        echo "AEGIS_TRUSTED_PROXY_SECRET must be at least 32 characters of letters, digits and -._~+/=" >&2; exit 1
+    fi
+    PROXY_AUTH="proxy_set_header X-Aegis-Proxy-Auth \"$SECRET\";"
+fi
+
 if [ -n "${AEGIS_API_UPSTREAM:-}" ]; then
+    umask 077
     cat > "$OUT/api-proxy.conf" <<API
 location /api/flows/stream {
     proxy_pass ${AEGIS_API_UPSTREAM};
@@ -35,6 +49,7 @@ location /api/flows/stream {
     proxy_set_header Host \$host;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    $PROXY_AUTH
     proxy_buffering off;
     proxy_cache off;
     proxy_read_timeout 1h;
@@ -45,6 +60,7 @@ location /api/ {
     proxy_set_header Host \$host;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    $PROXY_AUTH
     proxy_read_timeout 60s;
     client_max_body_size 16m;
 }

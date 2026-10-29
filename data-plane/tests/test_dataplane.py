@@ -21,7 +21,7 @@ from aegis_dp import clamav  # noqa: E402
 from aegis_dp.content import detect_file_type, scan_dlp  # noqa: E402
 from aegis_dp.controlplane import sign_block_token  # noqa: E402
 from aegis_dp.policy import (  # noqa: E402
-    Policy, RedirectGrants, canonicalize_path, hash_token, match_path, normalize_host, VERDICT_ALLOWED, VERDICT_BLOCKED,
+    Policy, RedirectGrants, canonicalize_path, hash_token, match_path, normalize_host, request_origin, VERDICT_ALLOWED, VERDICT_BLOCKED,
     VERDICT_POLICY, VERDICT_THREAT, VERDICT_TLS_BYPASS, VERDICT_LEARNING, VERDICT_REDIRECT, VERDICT_QUARANTINED,
 )
 from aegis_dp.threatintel import ThreatSnapshot, normalize_url  # noqa: E402
@@ -121,7 +121,9 @@ class PolicyTests(unittest.TestCase):
             self.assertTrue(grants.register(g["server_id"], g["location"], g["parent_url"], g["rule_id"], g["rule_name"]))
         self.assertTrue(v["cases"])
         for c in v["cases"]:
-            res = p.evaluate(c["ip"], c["auth"], c["method"], c["host"], 443, c["path"], f'https://{c["host"]}{c["path"]}', self.t, grants)
+            scheme, port = c.get("scheme", "https"), c.get("port", 443)
+            origin = c["host"] if port == {"http": 80, "https": 443}[scheme] else f'{c["host"]}:{port}'
+            res = p.evaluate(c["ip"], c["auth"], c["method"], c["host"], port, c["path"], f'{scheme}://{origin}{c["path"]}', self.t, grants)
             self.assertEqual((res.verdict, res.server_id), (c["verdict"], c["server_id"]), c["name"])
             if "block_reason" in c:
                 self.assertEqual(res.block_reason, c["block_reason"], c["name"])
@@ -224,6 +226,27 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(self.g.register("srv-ci-1", "https://eu.cdn.example/x", "https://github.com/", "r", "n", allowed_hosts=hosts))
         self.assertIsNone(self.g.check("srv-ci-1", "evil.example", "/x", "GET"))
         self.assertIsNone(self.g.check("10.1.0.5", "eu.cdn.example", "/x", "GET"))  # keyed by server identity, not address
+        # A grant covers exactly the target's origin (scheme, host, effective port); relative targets resolve
+        # against the redirecting URL.
+        self.assertTrue(self.g.register("srv-ci-1", "https://alt.example:8443/o.bin", "https://github.com/", "r", "n"))
+        self.assertTrue(self.g.register("srv-ci-1", "//plain.example/p.bin", "http://github.com/x", "r", "n"))
+        self.assertFalse(self.g.register("srv-ci-1", "https://alt.example:0/o.bin", "https://github.com/", "r", "n"))
+        self.assertFalse(self.g.register("srv-ci-1", "https://alt.example:99999/o.bin", "https://github.com/", "r", "n"))
+        for args, granted in ((("https", 8443), True), (("http", 80), False), (("https", 443), False), (("http", 8443), False)):
+            self.assertEqual(self.g.check("srv-ci-1", "alt.example", "/o.bin", "GET", *args) is not None, granted, args)
+        self.assertIsNotNone(self.g.check("srv-ci-1", "alt.example", "/", "CONNECT", "https", 8443))
+        self.assertIsNone(self.g.check("srv-ci-1", "alt.example", "/", "CONNECT", "https", 443))
+        for args, granted in ((("http", 80), True), (("http", 0), True), (("https", 443), False), (("ftp", 80), False)):
+            self.assertEqual(self.g.check("srv-ci-1", "plain.example", "/p.bin", "GET", *args) is not None, granted, args)
+        self.assertIsNone(self.g.check("srv-ci-1", "plain.example", "/", "CONNECT", "https", 443))
+        self.assertIsNotNone(self.g.check("srv-ci-1", "plain.example", "/", "CONNECT", "http", 80))
+        evp = lambda port, url: p.evaluate("10.1.0.5", "", "GET", "plain.example", port, "/p.bin", url, self.t, self.g).verdict
+        self.assertEqual(evp(80, "http://plain.example/p.bin"), VERDICT_REDIRECT)
+        self.assertEqual(evp(443, "https://plain.example/p.bin"), VERDICT_BLOCKED)
+        self.assertEqual(request_origin("", 80), ("http", 80))
+        self.assertEqual(request_origin("", 0), ("https", 443))
+        self.assertEqual(request_origin("https://h.example:8443/x", 8443), ("https", 8443))
+        self.assertEqual(request_origin("http://[bad/x", 443), ("https", 443))  # unparseable URL: from the port
         sess = {**BUNDLE, "rules": [], "sessions": [{"id": "s1", "server_id": "srv-ci-1", "mode": "record_and_allow",
                                                     "status": "active", "expires_at": FUTURE, "name": "rec"}]}
         r = Policy(sess).evaluate("10.1.0.5", "", "GET", "pypi.org", 443, "/simple/", "", self.t, self.g)
@@ -350,7 +373,7 @@ class PolicySetSemanticsTest(unittest.TestCase):
 class BrandedBlockPageTest(unittest.TestCase):
     SHELL = ('<html lang="x"><style nonce="%%AEGIS:nonce%%"></style><h1>%%AEGIS:server_hostname%%</h1>'
              '<a href="%%AEGIS:portal_url%%">p</a><img src="%%AEGIS:logo%%"><p>%%AEGIS:url%%</p>'
-             '<script type="application/json">%%AEGIS:data_json%%</script>')
+             '<script type="application/json" id="aegis-data">%%AEGIS:data_json%%</script>')
 
     def bundle(self):
         shells = lambda tag: {"request_html": tag + self.SHELL, "threat_html": tag + "THREAT %%AEGIS:reason%%",
@@ -391,6 +414,19 @@ class BrandedBlockPageTest(unittest.TestCase):
         threat, _ = render_branded(self.bundle(), self.ctx("QUARANTINED"), ["grp-ci"], "en", False)
         self.assertEqual(threat, "ENTHREAT &lt;b&gt;r&lt;/b&gt;")
         self.assertIsNone(render_branded({}, self.ctx(), [], "en", False))
+        self.assertIn('id="aegis-data">{"endpoint": "https://aegis.example/api/public/requests", "block_token": "v1.a.b"}</script>', body)
+
+    def test_raw_values_only_in_their_context(self):
+        # R3-5: a raw placeholder smuggled into another spot of a shell (template text) is escaped like any value:
+        # the JSON's quotes must not break out of an attribute.
+        from aegis_dp.blockpage import fill
+        values = {"nonce": "n0", "logo": "data:image/png;base64,AA==", "data_json": '{"a": "x\\u003c"}'}
+        out = fill('<a title="%%AEGIS:data_json%%" href="%%AEGIS:logo%%">%%AEGIS:nonce%%</a>'
+                   '<i nonce="%%AEGIS:data_json%%"></i><img src="%%AEGIS:logo%%">'
+                   '<script type="application/json" id="aegis-data">%%AEGIS:data_json%%</script>', values, True)
+        self.assertEqual(out, '<a title="{&quot;a&quot;: &quot;x\\u003c&quot;}" href="data:image/png;base64,AA==">n0</a>'
+                              '<i nonce="{&quot;a&quot;: &quot;x\\u003c&quot;}"></i><img src="data:image/png;base64,AA==">'
+                              '<script type="application/json" id="aegis-data">{"a": "x\\u003c"}</script>')
 
 
 class AccessLogTest(unittest.TestCase):
@@ -1466,6 +1502,63 @@ class AddonSecurityTest(unittest.TestCase):
         self.assertEqual(self.records(b)[-1]["block_reason"], "av_oversize")
         self.call(b, "response", f)
         self.assertEqual(b.budget.used, 0)
+
+    def test_oversize_downloads_keep_file_type_control(self):
+        # av_oversize_action=allow relays downloads beyond av_max_scan_bytes (1 MiB here) unscanned, but their file
+        # type is still read from the head of the body: padding an executable past the scan limit does not get it through.
+        from aegis_dp import buffering
+        self.assertTrue(buffering.install())
+        mib = 1 << 20
+        zipped = b"PK\x03\x04" + b"\0" * 26 + b"payload.bin"
+        cases = (([("Content-Length", str(3 * mib))], PE, b""),                 # declared oversize: the head is peeked
+                 ([], PE, b""),                                                 # unknown length: buffered up to the limit
+                 ([("Content-Length", str(3 * mib))], zipped, b""),
+                 ([("Content-Length", str(3 * mib)), ("Content-Encoding", "gzip")], PE, b"gzip"))
+        for headers, magic, coding in cases:
+            a = self.addon(blocked_file_types=["pe", "zip"])
+            f = self.buffered_response(a, headers)
+            self.assertFalse(f.response.stream, headers)
+            body = magic + os.urandom(3 * mib)
+            if coding:
+                body = gzip.compress(body, compresslevel=1)
+            st = self.layer(f)
+            cmds = self.feed(st, [body[i:i + (256 << 10)] for i in range(0, len(body), 256 << 10)])
+            self.assertEqual([e.response.status_code for e in self.sent(cmds, "ResponseHeaders")], [403], headers)
+            self.assertNotIn(magic[:8], b"".join(e.data for e in self.sent(cmds, "ResponseData")))
+            rec = self.records(a)[-1]
+            self.assertEqual((rec["verdict"], rec["block_reason"], rec["file_type"]),
+                             ("FILETYPE_BLOCKED", "file_type", "zip" if magic is zipped else "pe"), headers)
+            self.call(a, "response", f)
+            self.assertEqual(a.budget.used, 0)
+        # a clean oversize download passes (flagged unscanned); the head is held only until its type is known
+        for headers in ([("Content-Length", str(3 * mib))], []):
+            a = self.addon(blocked_file_types=["pe", "zip"])
+            f = self.buffered_response(a, headers)
+            st = self.layer(f)
+            self.assertEqual(self.sent(self.feed(st, [b"a" * (512 << 10)]), "ResponseHeaders"), [])
+            self.assertEqual(a.budget.used, 512 << 10, "the head counts against the buffer budget")
+            cmds = self.feed(st, [b"b" * (600 << 10)])
+            self.assertTrue(f.response.stream)
+            self.assertEqual([e.response.status_code for e in self.sent(cmds, "ResponseHeaders")], [200])
+            self.assertEqual(sum(len(e.data) for e in self.sent(cmds, "ResponseData")), 1112 << 10)
+            self.assertEqual(a.budget.used, 0)
+            self.call(a, "response", f)
+            rec = self.records(a)[-1]
+            self.assertEqual(rec["verdict"], "ALLOWED")
+            self.assertIn("AV_UNSCANNED:oversize", rec["security_flags"])
+        # the head needs room in the budget like any inspected body: without it the download fails closed
+        a = self.addon(blocked_file_types=["pe"])
+        a.budget.total = 300 << 10
+        f = self.buffered_response(a, [("Content-Length", str(3 * mib))])
+        cmds = self.feed(self.layer(f), [b"y" * (400 << 10)])
+        self.assertEqual([e.response.status_code for e in self.sent(cmds, "ResponseHeaders")], [503])
+        self.assertEqual(self.records(a)[-1]["block_reason"], "inspection_busy")
+        # nothing to check on the head: relayed at once, as before
+        n = self.addon(blocked_file_types=[], threat_intel_mode="block")
+        n.cp.threat.hashes = {"0" * 64: 0}
+        f = self.buffered_response(n, [("Content-Length", str(3 * mib))])
+        self.assertTrue(f.response.stream)
+        self.assertIn("AV_UNSCANNED:oversize", f.metadata["aegis"]["res"].security_flags)
 
     def test_worker_budget(self):
         # Concurrent downloads share the budget. Exhausted, an enforcing inspection fails closed (503 with

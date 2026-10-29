@@ -134,9 +134,20 @@ func TestSessionCookieAndCSRF(t *testing.T) {
 	if resp := h.do(t, "POST", "/api/policy-sets", rule, map[string]string{"X-Requested-With": "aegis-ui", "Origin": "https://evil.example"}); resp.StatusCode != 403 {
 		t.Errorf("cross-origin cookie POST must be rejected, got %d", resp.StatusCode)
 	}
+	// R3-4: an opaque ("null") or unparsable origin is cross-site as well.
+	for _, origin := range []string{"null", "", "%zz", "file://", "data:text/html,x", "//" + strings.TrimPrefix(h.srv.URL, "http://")} {
+		if resp := h.do(t, "POST", "/api/policy-sets", rule, map[string]string{"X-Requested-With": "aegis-ui", "Origin": origin}); resp.StatusCode != 403 {
+			t.Errorf("cookie POST with Origin %q must be rejected, got %d", origin, resp.StatusCode)
+		}
+	}
 	if resp := h.do(t, "POST", "/api/policy-sets", rule, map[string]string{"X-Requested-With": "aegis-ui"}); resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
 		t.Errorf("legit cookie POST failed: %d %s", resp.StatusCode, b)
+	}
+	rule["spec"].(map[string]any)["name"] = "y"
+	if resp := h.do(t, "POST", "/api/policy-sets", rule, map[string]string{"X-Requested-With": "aegis-ui", "Origin": h.srv.URL}); resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Errorf("same-origin cookie POST failed: %d %s", resp.StatusCode, b)
 	}
 	// Logout revokes the token server-side.
 	old := h.jar

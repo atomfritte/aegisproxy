@@ -15,6 +15,10 @@ window.__AEGIS_CONFIG__ = { apiBaseUrl: "" };   // "" = same origin
 The console host proxies `/api/` to the control-plane. No CORS, the session cookie stays first-party.
 
 - Container: `ghcr.io/atomfritte/aegisproxy-console` with `AEGIS_API_UPSTREAM=http://control-plane:8081`.
+  The control-plane must trust the console as a proxy, either by a name only the console resolves to
+  (`AEGIS_TRUSTED_PROXY_HOSTS=console`) or, when its address is shared (a Docker bridge gateway, host
+  networking), with the same `AEGIS_TRUSTED_PROXY_SECRET` (`_FILE`) on both sides — see
+  [trusted proxies](../configuration.md#trusted-proxies-and-sign-in-throttling).
 - Kubernetes: `console.enabled=true` (default proxies to the control-plane service).
 - nginx / IIS ARR: see `frontend/docker/nginx.conf` and `deploy/windows/iis/web.config` (disable response
   buffering for `/api/flows/stream`).

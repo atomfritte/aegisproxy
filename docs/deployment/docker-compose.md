@@ -21,7 +21,7 @@ The third-party images (ClamAV, and PostgreSQL/HAProxy in the HA variant) are pi
 
 ```bash
 install -m 600 .env.example .env          # holds every secret: owner read/write only
-./scripts/gen-secrets.sh >> .env          # AEGIS_JWT_SECRET, AEGIS_DATAPLANE_KEY, AEGIS_DB_PASSWORD
+./scripts/gen-secrets.sh >> .env          # JWT, data-plane, encryption, DB and proxy secrets
 $EDITOR .env                              # AEGIS_PUBLIC_URL, bind addresses, optional admin password
 docker compose up -d --build
 docker compose ps                         # control-plane and data-plane become "healthy"
@@ -44,19 +44,35 @@ Sign in at `AEGIS_PUBLIC_URL`, change the password (sidebar → RBAC → *Change
 
 ## TLS for the console
 
-Publish the console only on localhost (`AEGIS_CONSOLE_BIND=127.0.0.1:8081`) and terminate TLS in a reverse
-proxy (see `deploy/nginx/aegis-console.conf`), then set:
+Terminate TLS in a reverse proxy. Whoever connects from a trusted address can set `X-Forwarded-For` and
+choose the client address used for login rate limits, CIDR-bound service accounts and the audit trail, so
+the address must belong to the proxy alone.
+
+**Recommended: a proxy container on the compose network.** Add the TLS proxy (nginx, HAProxy, Traefik) as a
+service of the compose project, trust it by service name and do not publish the console port on the host
+(`docker-compose.override.yml` with `services: { control-plane: { ports: !reset [] } }`, Compose ≥ 2.24):
 
 ```
 AEGIS_PUBLIC_URL=https://aegis.corp.example
-AEGIS_TRUSTED_PROXIES=172.18.0.1/32      # exact address of the reverse proxy as seen by the container
+AEGIS_TRUSTED_PROXY_HOSTS=tls-proxy      # compose service name of the proxy
 ```
 
-A reverse proxy on the Docker host reaches the published port from the gateway of the compose network
-(`docker network inspect aegisproxy_default --format '{{(index .IPAM.Config 0).Gateway}}'`). Trust exactly
-that address, never a whole private range such as `172.16.0.0/12`: every container and host inside a trusted
-range could otherwise set `X-Forwarded-For` and choose the client address used for login rate limits,
-CIDR-bound service accounts and the audit trail. Without a reverse proxy leave it empty.
+The HA variant (`deploy/compose/ha`) works this way (`AEGIS_TRUSTED_PROXY_HOSTS=lb,console`).
+
+**A proxy on the Docker host** reaches the published port from the gateway of the compose network
+(`docker network inspect aegisproxy_default --format '{{(index .IPAM.Config 0).Gateway}}'`). Every local account
+and container that connects to the published port arrives from the same gateway address, so trusting it
+alone equals trusting all of them. Trust it only together with the proxy secret (appended to `.env` by
+`gen-secrets.sh`) and let the proxy send it (`proxy_set_header X-Aegis-Proxy-Auth "<AEGIS_TRUSTED_PROXY_SECRET>";`
+in nginx):
+
+```
+AEGIS_PUBLIC_URL=https://aegis.corp.example
+AEGIS_CONSOLE_BIND=127.0.0.1:8081
+AEGIS_TRUSTED_PROXIES=172.18.0.1/32      # the gateway, only with AEGIS_TRUSTED_PROXY_SECRET
+```
+
+Never trust a whole private range such as `172.16.0.0/12`. Without a reverse proxy leave both empty.
 
 Alternatively mount a certificate and set `AEGIS_TLS_CERT_FILE`/`AEGIS_TLS_KEY_FILE`.
 

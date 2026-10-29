@@ -219,9 +219,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1</pre>
 # Branded templates (rendered by the control-plane into shells, see internal/blockpage)
 # ---------------------------------------------------------------------------
 
-_PH_RE = re.compile(r"%%AEGIS:([a-z_]+)%%")
+# A placeholder with the markup in front of it: raw values are inserted unescaped only in the one context the
+# control-plane shell puts them in (data_json contains quotes, which would break out of an attribute).
+_PH_RE = re.compile(r'(nonce="|src="|id="aegis-data">)?%%AEGIS:([a-z_]+)%%')
 _LOGO_RE = re.compile(r"^data:image/(png|jpeg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/]+={0,2}$")
-_RAW_KEYS = {"nonce", "data_json", "logo"}
+_RAW_CONTEXT = {"nonce": 'nonce="', "data_json": 'id="aegis-data">', "logo": 'src="'}
 
 
 def pick_locale(accept_language: str, available: Iterable[str], default: str) -> str:
@@ -262,12 +264,12 @@ def select_template(block_pages: Dict[str, Any], groups: List[str]) -> Optional[
 def fill(shell: str, values: Dict[str, str], html_mode: bool) -> str:
     """Single-pass placeholder substitution (substituted values are never re-scanned)."""
     def sub(m: "re.Match[str]") -> str:
-        key = m.group(1)
+        before, key = m.group(1) or "", m.group(2)
         val = values.get(key, "")
-        if html_mode and key in _RAW_KEYS:
-            return val
+        if html_mode and before and _RAW_CONTEXT.get(key) == before:
+            return before + val
         val = _clean(val)
-        return html.escape(val, quote=True) if html_mode else val
+        return before + (html.escape(val, quote=True) if html_mode else val)
     return _PH_RE.sub(sub, shell)
 
 

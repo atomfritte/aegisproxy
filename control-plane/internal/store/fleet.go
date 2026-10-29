@@ -279,6 +279,10 @@ func normalizeServerInput(srv *models.Server) error {
 	}
 	srv.Hostname = strings.TrimSpace(srv.Hostname)
 	fail(checkText("hostname", srv.Hostname, 255, true))
+	// The host name ends up in one-line contexts (audit summaries, # comments of console snippets).
+	if strings.ContainsAny(srv.Hostname, "\n\t") {
+		fail(errors.New("hostname must be a single line without tabs"))
+	}
 	if srv.IP = strings.TrimSpace(srv.IP); srv.IP != "" {
 		if a, err := netip.ParseAddr(srv.IP); err != nil {
 			fail(fmt.Errorf("invalid IP address %q", srv.IP))

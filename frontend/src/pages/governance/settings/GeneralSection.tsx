@@ -4,6 +4,7 @@ import { API_BASE } from '../../../api';
 import { useConsole, useConsoleState, usePermissions } from '../../../data/AppData';
 import { ROLE_LABELS } from '../../../data/permissions';
 import { useSession } from '../../../data/session';
+import { shellQuote } from '../../../lib/shell';
 import { useTheme } from '../../../lib/theme';
 import { Badge, ButtonLink, Card, CardHeader, CodeBlock, CopyButton, DescriptionList, SegmentedControl } from '../../../ui';
 import { installCommands } from '../../security/tls/ca';
@@ -34,8 +35,8 @@ export const GeneralSection: React.FC = () => {
 
   const onboarding = [
     '# Route outbound traffic of a server through AegisProxy',
-    `export HTTP_PROXY=http://${proxy || '<proxy-host>:8080'}`,
-    `export HTTPS_PROXY=http://${proxy || '<proxy-host>:8080'}`,
+    `export HTTP_PROXY=${proxy ? shellQuote(`http://${proxy}`) : 'http://<proxy-host>:8080'}`,
+    `export HTTPS_PROXY=${proxy ? shellQuote(`http://${proxy}`) : 'http://<proxy-host>:8080'}`,
     'export NO_PROXY=localhost,127.0.0.1,.corp.example',
     '',
     '# Trust the enterprise root CA (fingerprint-pinned installer; the verified one-liner is on TLS & CA)',

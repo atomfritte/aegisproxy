@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -85,6 +86,7 @@ func (s *Server) postureChecks() []PostureCheck {
 	}
 	add("metrics", "platform", "Metrics endpoint protected", pass(s.cfg.MetricsToken != "", "info"), "AEGIS_METRICS_TOKEN",
 		"Set a bearer token for /metrics or restrict it at the network level.", "docs/configuration.md")
+	s.trustedProxyPostureCheck(add)
 	if s.caMgr != nil {
 		left := time.Until(s.caMgr.NotAfter)
 		st := "pass"
@@ -240,6 +242,46 @@ func (s *Server) postureChecks() []PostureCheck {
 }
 
 type postureAdd func(id, cat, title, status, detail, fix, doc string)
+
+// trustedProxyPostureCheck: only the reverse proxy can assert client addresses. Loopback is shared by every
+// local account and a broad range by every host in it; without the proxy secret each of them can choose the
+// address used for CIDR-bound API keys, sign-in throttling and the audit trail.
+func (s *Server) trustedProxyPostureCheck(add postureAdd) {
+	const title = "Client addresses asserted only by the reverse proxy"
+	doc := "docs/configuration.md#trusted-proxies-and-sign-in-throttling"
+	if len(s.cfg.TrustedProxies) == 0 && len(s.cfg.TrustedProxyHosts) == 0 {
+		add("trusted-proxies", "platform", title, "pass", "no trusted proxies: the TCP peer is the client", "", doc)
+		return
+	}
+	if s.cfg.TrustedProxySecret != "" {
+		add("trusted-proxies", "platform", title, "pass", "trusted proxies authenticate with AEGIS_TRUSTED_PROXY_SECRET", "", doc)
+		return
+	}
+	var shared []string
+	for _, p := range s.cfg.TrustedProxies {
+		if broadProxyRange(p) {
+			shared = append(shared, p.String())
+		}
+	}
+	if len(shared) == 0 {
+		add("trusted-proxies", "platform", title, "pass", "trusted proxies listed by address or name", "", doc)
+		return
+	}
+	add("trusted-proxies", "platform", title, "warn", "AEGIS_TRUSTED_PROXIES trusts "+strings.Join(shared, ", ")+" without a proxy secret",
+		"Loopback is shared by every local account and a broad range by every host in it: set AEGIS_TRUSTED_PROXY_SECRET and let the proxy send it in "+
+			proxyAuthHeader+", or trust only the proxy's own address or name (AEGIS_TRUSTED_PROXY_HOSTS).", doc)
+}
+
+// broadProxyRange: a trusted prefix of loopback addresses, or one at least as large as a /16 (IPv4) or /48 (IPv6).
+func broadProxyRange(p netip.Prefix) bool {
+	if p.Addr().IsLoopback() {
+		return true
+	}
+	if p.Addr().Is4() {
+		return p.Bits() <= 16
+	}
+	return p.Bits() <= 48
+}
 
 // encryptionPostureCheck: secrets at rest are encrypted, with a key kept outside the data directory.
 func (s *Server) encryptionPostureCheck(add postureAdd) {

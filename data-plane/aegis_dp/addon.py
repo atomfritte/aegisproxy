@@ -48,7 +48,7 @@ from .blockpage import is_cli_client, render_branded, render_cli, render_html, r
 from .buffering import BLOCK, STREAM, BodyGuard, BufferBudget
 from .clamav import ClamdClient
 from .config import Config
-from .content import detect_file_type, scan_dlp
+from .content import FILE_TYPE_SAMPLE, detect_file_type, scan_dlp
 from .decoding import UndecodableContent, decodable, decode_body, filter_accept_encoding, parse_codings, transfer_codings
 from .destination import DnsCache, check_binding
 from .ops import Metrics, start_ops_server
@@ -1280,10 +1280,17 @@ class AegisAddon:
         clen_raw = resp.headers.get("Content-Length", "")
         clen = int(clen_raw) if clen_raw.isdigit() else None
         if clen is not None and clen > max_scan and inspect_on:
+            peek = self._type_peek(policy, res.group_ids, max_scan) if self._has_body(flow) else 0
             if policy.policy_value("av_oversize_action", "allow") == "block":
                 self._block_streamed(flow, meta, "av_oversize", f"Antivirus: download of {clen} bytes exceeds the {max_scan}-byte scan limit",
                                      f"AegisProxy blocked this download: {clen} bytes exceed the antivirus scan limit ({max_scan} bytes).\n"
                                      "Contact InfoSec if this file is required.\n")
+            elif peek:
+                # Relayed unscanned, but only after the file type was read from the head of the body (buffered within
+                # the worker budget and the client's share like any inspected body).
+                buffering.attach(flow, "response", BodyGuard(self.budget, peek,
+                                                             lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason),
+                                                             self._buffer_client(meta), peek=peek))
             else:
                 resp.stream = True
                 meta["unscanned"] = "oversize"
@@ -1306,7 +1313,7 @@ class AegisAddon:
             # by chunk as the body arrives (with or without Content-Length).
             guard = buffering.attach(flow, "response", BodyGuard(self.budget, max_scan,
                                                                  lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason),
-                                                                 self._buffer_client(meta)))
+                                                                 self._buffer_client(meta), peek=self._type_peek(policy, res.group_ids, max_scan)))
             if clen is not None:
                 reason = guard.declared(clen)
                 if reason:
@@ -1317,9 +1324,14 @@ class AegisAddon:
         meta["unscanned"] = "not_required"
         return STREAM
 
+    def _type_peek(self, policy: Policy, groups: List[str], max_scan: int) -> int:
+        """Bytes of an oversize download's head that are buffered for its file type (0: no file type is blocked)."""
+        return min(FILE_TYPE_SAMPLE, max_scan) if self._blocked_types(policy, groups) else 0
+
     def _download_exceeded(self, flow: http.HTTPFlow, policy: Policy, meta: Dict[str, Any], cap: int, reason: str) -> str:
         """A download outgrew the scan limit ("oversize": av_oversize_action decides) or the worker budget or the
-        client's share of it ("busy": a transient capacity shortage never skips an enforcing inspection)."""
+        client's share of it ("busy": a transient capacity shortage never skips an enforcing inspection). An oversize
+        download that is relayed unscanned still gets its file type checked on the head of its body."""
         self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", reason)))
         if reason == "busy" and self._download_enforcing(policy, meta["res"].group_ids):
             self._block_streamed(flow, meta, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted",
@@ -1330,10 +1342,36 @@ class AegisAddon:
                                  f"AegisProxy blocked this download: it exceeds the antivirus scan limit ({cap} bytes).\n"
                                  "Contact InfoSec if this file is required.\n")
             return BLOCK
+        if reason == "oversize" and self._head_type_blocked(flow, policy, meta, buffering.head(flow, "response")):
+            return BLOCK
         meta["res"].security_flags.append(f"AV_UNSCANNED:{reason}")
         meta["unscanned"] = reason
         flow.response.stream = True
         return STREAM
+
+    def _head_type_blocked(self, flow: http.HTTPFlow, policy: Policy, meta: Dict[str, Any], head: bytes) -> bool:
+        """File type control for a download that is relayed unscanned (av_oversize_action=allow): the type is read from
+        the head of the body, decoded through its content codings like a full body. Hash IOCs and the scan engines need
+        the whole entity and do not run. True when the download was blocked."""
+        types = self._blocked_types(policy, meta["res"].group_ids)
+        if not types or not head:
+            return False
+        try:
+            body, _ = decode_body(head, self._response_codings(flow.response), len(head))
+        except UndecodableContent as exc:  # cut off mid-stream is fine (the decoded prefix), corrupt data is not
+            self._block_streamed(flow, meta, "undecodable_content", printable(f"Content inspection: undecodable download ({exc})", 300),
+                                 "AegisProxy blocked this download: its content coding cannot be inspected.\n")
+            return True
+        ftype = detect_file_type(body, flow.request.pretty_url, flow.response.headers.get("Content-Type", ""))
+        if not ftype:
+            return False
+        meta["file_type"] = ftype
+        if ftype not in types:
+            return False
+        self._block_streamed(flow, meta, "file_type", f"Download control: file type '{ftype}' is not permitted for this server group",
+                             f"AegisProxy blocked this download: file type '{ftype}' is not permitted for this server.\n",
+                             verdict=VERDICT_FILETYPE, file_type=ftype)
+        return True
 
     def _replace_streamed(self, flow: http.HTTPFlow, status: int, msg: bytes, verdict: str) -> None:
         """Turns a response whose headers already arrived into a block: the upstream body is discarded and
@@ -1362,12 +1400,13 @@ class AegisAddon:
         flow.metadata["aegis_pending"] = (sent, msg)  # bodyless upstream responses: sent by the response hook
         flow.metadata["aegis_local"] = True
 
-    def _block_streamed(self, flow: http.HTTPFlow, meta: Dict[str, Any], reason: str, name: str, msg: str, status: int = 403) -> None:
+    def _block_streamed(self, flow: http.HTTPFlow, meta: Dict[str, Any], reason: str, name: str, msg: str, status: int = 403,
+                        verdict: str = VERDICT_POLICY, **extra: Any) -> None:
         res: EvalResult = meta["res"]
-        res.block(VERDICT_POLICY, reason, name)
-        self._replace_streamed(flow, status, msg.encode(), VERDICT_POLICY)
+        res.block(verdict, reason, name)
+        self._replace_streamed(flow, status, msg.encode(), verdict)
         flow.metadata["aegis_recorded"] = True
-        self.cp.record_flow(self._flow_record(flow, res, meta["peer"], meta["auth"], status, VERDICT_POLICY))
+        self.cp.record_flow(self._flow_record(flow, res, meta["peer"], meta["auth"], status, verdict, **extra))
 
     @guarded
     async def response(self, flow: http.HTTPFlow) -> None:
@@ -1407,6 +1446,8 @@ class AegisAddon:
                 return
         else:
             extra["av_result"] = "skipped"
+            if meta.get("file_type"):  # read from the head of an oversize download
+                extra["file_type"] = meta["file_type"]
 
         status = flow.response.status_code
         extra["bytes_sent"] = len(flow.request.raw_content or b"")

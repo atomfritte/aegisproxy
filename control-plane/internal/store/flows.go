@@ -53,6 +53,27 @@ func validFlowID(id string) bool {
 	return true
 }
 
+// flowMethod keeps request methods that look like methods (letters, digits, '-' and '_', starting
+// with a letter: GET, PROPFIND, VERSION-CONTROL, M-SEARCH). The method comes from the workload and
+// HTTP allows ` | $ & and other shell metacharacters in it; the console copies it into curl
+// snippets, so anything else is stored as INVALID.
+func flowMethod(m string) string {
+	m = strings.ToUpper(m)
+	if m == "" {
+		return ""
+	}
+	if len(m) > 16 || m[0] < 'A' || m[0] > 'Z' {
+		return "INVALID"
+	}
+	for i := 0; i < len(m); i++ {
+		c := m[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return "INVALID"
+		}
+	}
+	return m
+}
+
 // sanitizeFlow bounds every attacker-influenced field (URLs, user agents and hostnames come
 // straight from proxied traffic) before it is stored, rendered in the UI or forwarded to webhooks.
 // URLs are redacted per telemetry_query_redaction (again: workers redact before sending).
@@ -72,7 +93,7 @@ func sanitizeFlow(f models.TrafficFlow, now time.Time, i int, redaction string) 
 	if u, _, ok := strings.Cut(f.ProxyAuthUser, ":"); ok {
 		f.ProxyAuthUser = u
 	}
-	f.Method = clip(strings.ToUpper(f.Method), 16)
+	f.Method = flowMethod(f.Method)
 	f.Scheme = clip(strings.ToLower(f.Scheme), 8)
 	f.Host = clip(engine.NormalizeHost(f.Host), 255)
 	f.Path = clip(oneLine(f.Path), 2048)
