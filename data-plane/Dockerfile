@@ -18,8 +18,11 @@ COPY aegis_addon.py healthcheck.py entrypoint.sh /opt/aegis/
 COPY aegis_dp/ /opt/aegis/aegis_dp/
 # /var/lib/aegis/flow-spool: mount point of the optional traffic-record spool (AEGIS_FLOW_SPOOL_DIR). Owned by the
 # runtime user so a new named volume mounted there inherits a writable, private directory.
+# Bytecode comes only from the copied sources: any .pyc that slipped through the build context is deleted first
+# (compileall keeps, and Python then runs, a .pyc whose header matches the source's mtime and size).
 RUN chmod 0755 /opt/aegis/entrypoint.sh /opt/aegis/healthcheck.py \
  && install -d -o 65532 -g 65532 -m 0700 /var/lib/aegis/flow-spool \
+ && find /opt/aegis \( -name '*.pyc' -o -name '*.pyo' \) -delete \
  && python3 -m compileall -q /opt/aegis \
  && chmod -R a+rX /opt/aegis \
  && { pip check | grep -vi -e "^mitmproxy .* has requirement brotli" -e "no broken requirements" | (! grep .); } \

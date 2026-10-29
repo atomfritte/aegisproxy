@@ -1,3 +1,17 @@
-node_modules
+# Only the reviewed sources may reach the image. The patterns apply at every depth: a git-ignored file does not
+# show in `git status`, yet would otherwise be copied; Vite, for one, compiles the variables of a .env file into
+# the bundle.
+**/node_modules
 dist
 e2e
+**/.env*
+**/.vite
+**/.git
+**/secrets
+**/certs
+**/*.pem
+**/*.key
+**/*.crt
+**/*.log
+**/__pycache__
+**/*.pyc

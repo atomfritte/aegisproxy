@@ -1,3 +1,19 @@
+# Only the reviewed sources may reach the image. The patterns apply at every depth: a git-ignored file (a build
+# output, an env file, a key) does not show in `git status`, yet would otherwise be sent to the builder.
 aegis-control-plane
 data
-*_test.go
+**/*_test.go
+**/testdata
+**/.env*
+**/.git
+**/secrets
+**/certs
+**/*.pem
+**/*.key
+**/*.crt
+**/*.log
+**/*.test
+**/*.exe
+**/*.syso
+**/__pycache__
+**/*.pyc

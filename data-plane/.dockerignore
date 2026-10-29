@@ -1,3 +1,22 @@
-__pycache__
-*.pyc
+# Only the reviewed sources may reach the image. The patterns apply at every depth: a git-ignored file (bytecode
+# in aegis_dp/__pycache__, an env file, a key) does not show in `git status`, yet would otherwise be copied, and
+# Python prefers a .pyc whose header matches the source over the source itself.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.env*
+**/.git
+**/node_modules
+**/.venv
+**/venv
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+**/secrets
+**/certs
+**/*.pem
+**/*.key
+**/*.crt
+**/*.log
+data
 tests
