@@ -237,3 +237,36 @@ Defects found this way and fixed (each with a regression test):
   hashes and could not install a baseline-compliant lock at all (pip `ResolutionImpossible`) → `--require-hashes
   --no-deps`, baseline check and `pip check` (verified on Ubuntu 24.04 with a complete, an outdated and an
   incomplete lock file).
+### Adversarial review (2.1)
+
+Three rounds, each with fresh reviewers who attacked the code and a running installation from one attacker
+model: a compromised server behind the proxy (egress bypass), a low-privileged console user, an unauthenticated
+client or a hostile IdP / SIEM endpoint (control plane), an insider with file or database access, a full disk or
+a crash (audit integrity), and a local user, a network attacker during installation or a supply-chain attacker
+(deployment). Every finding was checked against the code, most were reproduced; each fix has a regression test,
+and the next round re-ran the earlier proofs of concept.
+
+| Round | Findings | Most important |
+|---|---|---|
+| 1 | 1 critical, 6 high, 17 medium, several low | Audit verification accepted unkeyed pre-2.1 hashes anywhere in the chain (rewrite without the key); the chain had no fixed start or end; the audit log followed symlinks and opened FIFOs; Team Leads read effective policies (with the proxy-token hash) and simulations of other groups; Windows installers adopted pre-existing `%ProgramData%` directories with planted keys or CA, and ran a user-writable base Python; Helm trusted all private ranges as proxies; secrets in export and notification errors |
+| 2 | 1 critical, 2 high, about 20 medium or low | One client could exhaust the shared inspection budget with announced but empty uploads, so other transfers passed unscanned (now a per-client share); CA installers checked the first certificate of the download but installed the whole file; default image names pointed to an unregistered Docker Hub namespace (now GHCR); Team Leads could change InfoSec BLOCK rules and see other groups' requests; a renamed SCIM group could gain roles; servers behind one NAT address shared redirect grants and learning sessions; long-lived connections outlived a revocation; the unkeyed legacy audit prefix was accepted without confirmation and a truncated tail went unnoticed; a full export queue dropped records |
+| 3 | 0 critical, 4 high, 19 medium or low | Below |
+
+Round 3 in detail (all fixed):
+
+| Area | Finding | Fix |
+|---|---|---|
+| Egress | EGR3-01 (medium): internal, loopback and metadata addresses embedded in IPv6 (NAT64, 6to4, IPv4-compatible) were neither internal nor forbidden. EGR3-02 (low): Go and Python disagreed on "internal" | One explicit prefix table in both engines, classification by the embedded IPv4 address; 67 shared vectors, 0 differences between the engines over 30,320 addresses |
+| Egress | Second reviewer: no exploitable defect (HTTP/1.1 framing and smuggling, revocation of streams, tunnels and keep-alive connections, DLP / file type / buffer budget, block tokens, redirects, telemetry held). Hardened anyway: redirect grants were not bound to scheme and port; blocked file types did not apply to downloads above `av_max_scan_bytes` with `av_oversize_action=allow` | Grants keyed by scheme, host, port and path in both engines (shared vectors); the first bytes of oversize downloads are held and type-checked |
+| Control plane | R3-1 (high): the first SSO sign-in took over an unlinked SCIM-provisioned account (even a Super Admin) through the user-name claim | Accounts are linked only by the immutable IdP subject / SCIM external ID |
+| Control plane | R3-2 (medium): "Copy as curl" put a crafted HTTP method unquoted into the shell command. R3-3 (medium): a direct client spoofing `X-Forwarded-For` got a 40-fold sign-in budget and could extend the break-glass lock. R3-4 / R3-5 (low): `Origin: null` counted as same-origin; markers could be injected into block-page templates | Shell quoting of every part; per-source limits with a per-proxy ceiling and capped locks, IPv6 keyed per /64; `null` origins refused; `%%` refused and raw markers escaped for their context |
+| Audit | F1 (high): events deleted or changed in the middle of the stored trail were only noticed by a manual verification. F2 (high): integrity alerts raised during start-up reached neither the export sinks nor Teams / Slack | Full verification at start-up, periodically (`AEGIS_AUDIT_VERIFY_INTERVAL`) and after every rotation, failures are sticky violations with alerts, metrics and posture; start-up alerts are queued until notifier and exporter run |
+| Audit | F3–F5, N1 (medium / low): unparseable Elasticsearch bulk responses counted as delivered; posture checked only the sink configuration; records for a sink that failed to start were dropped silently; spool files had no integrity protection | Such responses are retried; posture reflects sink health; dropped records are counted and alerted; spool records carry an HMAC |
+| Deployment | WIN-1 (high): the Windows data-plane installer executed the given Python elevated before checking that users cannot write to it. WIN-2 / WIN-3 (medium): the parent of the data root stayed user-writable on worker-only hosts; the default install was not hash-pinned | ACL check before the first execution; the parent is secured; hash-locked install by default |
+| Deployment | DEPLOY-1 (medium/high): the documented same-host nginx setup trusted loopback, which every local user shares, so anyone on the host could forge the client address | `AEGIS_TRUSTED_PROXY_SECRET`: forwarding headers count only together with `X-Aegis-Proxy-Auth`; generated by the Linux installer, supported by the console image; posture warning |
+| Deployment | DEPLOY-2 / DEPLOY-4 (medium / low): any writer could push a `v*` tag and publish signed images, also over an existing release, and the release published a fresh rebuild that CI had not scanned. DEPLOY-3 (medium): the console's verified Windows CA one-liner checked one file and ran another | Release job in the protected `release` environment, existing tags refused, the pushed digest is scanned before it is signed, exact-identity verification documented ([required repository settings](deployment/container-images.md)); the one-liners verify and run the same bytes |
+| Dependencies | DEP-1 (medium): `go.mod` allowed Go 1.26.0 (reachable standard-library CVEs). DEP-2 (medium): stale or planted `.pyc` files from the checkout ran instead of the reviewed source. DEP-3 (low): `pip-audit` covered only the Linux lock | Patched toolchain floor; `.dockerignore` and no bytecode from the build context; `pip-audit` for every lock and the e2e requirements |
+
+Held in round 3 (attacked without success): OIDC signature, algorithm and claim checks, state / PKCE, open
+redirects, SCIM, CSRF, security headers, sessions, HTTP framing, revocation of long-lived connections, content
+inspection limits, block tokens, the audit anchor and checkpoint, and the hash-locked images.
