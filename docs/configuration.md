@@ -238,6 +238,7 @@ many concurrent transfers should be scanned instead of being answered with 503 `
 |---|---|
 | `AEGIS_API_BASE_URL` | Origin of the API when it is not on the console's origin (e.g. `https://aegis-api.corp.example`). Written into `/config.js` at runtime and added to the CSP `connect-src`. |
 | `AEGIS_API_UPSTREAM` | Alternative: nginx proxies `/api/` to this upstream (same origin, no CORS configuration needed), e.g. `http://control-plane:8081`. |
+| `AEGIS_TRUSTED_PROXY_SECRET` (`_FILE`) | With `AEGIS_API_UPSTREAM`: sent to the control-plane as `X-Aegis-Proxy-Auth`, so that only this console (not every container sharing its address) can supply `X-Forwarded-For`. Set the same value on the control-plane. Not needed when the control-plane trusts the console by a name that resolves to it alone (`AEGIS_TRUSTED_PROXY_HOSTS`, as in the HA compose stack and the Helm chart). |
 
 For static hosting without the container (CDN, S3, Azure Static Web Apps, IIS) edit `config.js` in the
 web root:
