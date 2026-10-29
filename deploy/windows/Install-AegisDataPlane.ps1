@@ -718,16 +718,20 @@ function Get-NonAdminWritable {
     # TakeOwnership (generic rights mapped). CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners,
     # which are checked themselves. For -Container (directories that hold the checked tree, i.e. the parent of the
     # data root) only what allows deleting, renaming or replacing their entries counts: owner and
-    # DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership (786496) on the directory itself.
-    param([string[]]$Path = @(), [string[]]$Container = @())
+    # DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership (786496) on the directory itself. For -CreateIn
+    # (the directory above the Python directory, where CPython looks for pyvenv.cfg) the owner and creating files
+    # (WriteData/CreateFiles, 2) in the directory itself count: the volume root's default ACL lets users create
+    # folders there, not files.
+    param([string[]]$Path = @(), [string[]]$Container = @(), [string[]]$CreateIn = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', $SidTrustedInstaller, (Get-ServiceSid $ServiceName))
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
         'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests'; 'S-1-5-32-547' = 'Power Users'; 'S-1-5-32-555' = 'Remote Desktop Users'
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
     $found = @()
-    $checks = @(@($Path | ForEach-Object { @{ Path = $_; Mask = 852038; Self = $false } }) +
-        @($Container | Where-Object { $_ } | ForEach-Object { @{ Path = $_; Mask = 786496; Self = $true } }))
+    $checks = @(@($Path | ForEach-Object { @{ Path = $_; Mask = 852038; Self = $false; What = '' } }) +
+        @($Container | Where-Object { $_ } | ForEach-Object { @{ Path = $_; Mask = 786496; Self = $true; What = '' } }) +
+        @($CreateIn | Where-Object { $_ } | ForEach-Object { @{ Path = $_; Mask = 2; Self = $true; What = ': create files' } }))
     foreach ($check in $checks) {
         $p = $check.Path
         if (-not (Test-Path -LiteralPath $p)) { continue }
@@ -742,7 +746,7 @@ function Get-NonAdminWritable {
             if ("$($rule.AccessControlType)" -ne 'Allow' -or $trusted -contains $sid -or $ownerOnly -contains $sid) { continue }
             if ($check.Self -and "$($rule.PropagationFlags)" -match 'InheritOnly') { continue }
             if (-not ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band $check.Mask)) { continue }
-            $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid })
+            $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid }) + $check.What
         }
         $who = @($who | Sort-Object -Unique)
         if ($who.Count) { $found += '{0} ({1})' -f $p, ($who -join ', ') }
@@ -1097,6 +1101,15 @@ if ($pythonBase -like (Join-Path $env:SystemDrive 'Users\*')) {
 # may rename a directory above it (or delete its entries) can replace the whole installation. Junctions and symbolic
 # links on the way are refused: their targets and the directories above those are not checked.
 $pyHome = Split-Path -Parent $pythonBase
+# CPython also reads pyvenv.cfg next to python.exe and in the directory above it, in isolated mode (-I) as well: its
+# home = line moves the standard library that every start imports. A python.org installation has none, and only
+# administrators may create one there.
+$pyParent = Split-Path -Parent $pyHome
+$pyVenvCfg = @(@($pyHome, $pyParent) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'pyvenv.cfg' } |
+        Where-Object { Test-Path -LiteralPath $_ })
+if ($pyVenvCfg.Count) {
+    throw ("{0} found: CPython would take its standard library from the location it names. Pass the python.exe of a python.org installation (not a virtual environment) and remove a pyvenv.cfg that nobody installed there; check its content first - it may have been planted." -f ($pyVenvCfg -join ', '))
+}
 $pyLib = Join-Path $pyHome 'Lib'
 $pySite = Join-Path $pyLib 'site-packages'
 $pyTree = @($pyHome, $pythonBase, $pyLib, (Join-Path $pyHome 'DLLs'), $pySite) +
@@ -1109,7 +1122,8 @@ $pyWritable = @(@(Get-NonAdminWritable -Path $pyTree) +
     @(foreach ($p in @($pyHome, $pythonBase)) {
             if ((Get-Item -LiteralPath $p -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { "$p (junction/symbolic link, its target is not checked)" }
         }) +
-    @(Get-WritableSource -Location @($pyHome) | ForEach-Object { '{0} ({1})' -f $_.Path, $_.Who }) | Select-Object -Unique)
+    @(Get-WritableSource -Location @($pyHome) | ForEach-Object { '{0} ({1})' -f $_.Path, $_.Who }) +
+    @(Get-NonAdminWritable -CreateIn @($pyParent)) | Select-Object -Unique)
 if ($pyWritable.Count) {
     $pyMessage = ("Python at $pythonBase can be modified by non-administrators: $($pyWritable -join '; '). Install python.org Python for all users into %ProgramFiles% (C:\Program Files\Python312, InstallAllUsers=1), whose ACL only lets administrators write " +
         '(a listed directory above the Python directory: icacls <directory> /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX, then icacls <directory> /setowner *S-1-5-32-544 /L; docs/deployment/windows.md, troubleshooting)')

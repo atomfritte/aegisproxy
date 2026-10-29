@@ -199,7 +199,8 @@ Describe 'Install-AegisDataPlane.ps1' {
             @{ Case = 'the ._pth file is writable'; Relative = 'python313._pth'; Grantee = '*S-1-5-11'; Ace = 'W'; Expect = 'Authenticated Users' },
             @{ Case = 'a user owns Lib\sitecustomize.py'; Relative = 'Lib\sitecustomize.py'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
             @{ Case = 'users may delete entries of the directory above'; Relative = '..'; Grantee = '*S-1-5-32-545'; Ace = '(DC)'; Expect = 'Users' },
-            @{ Case = 'a user owns the directory above'; Relative = '..'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' }
+            @{ Case = 'a user owns the directory above'; Relative = '..'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'users may create files in the directory above (pyvenv.cfg, RV5-W-1)'; Relative = '..'; Grantee = '*S-1-5-32-545'; Ace = '(WD)'; Expect = 'Users: create files' }
         ) {
             $py = New-FakePythonHome (Join-Path $env:SystemDrive 'Tools\Python313')
             $pyHome = Split-Path -Parent $py
@@ -225,6 +226,47 @@ Describe 'Install-AegisDataPlane.ps1' {
                     '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; "*$trustedInstaller" = '(OI)(CI)F'
                     'NT SERVICE\AegisDataPlane' = '(OI)(CI)M'; '*S-1-3-0' = '(OI)(CI)(IO)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
             $FakeWin.Owner[$pyHome] = $trustedInstaller
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'can be modified by non-administrators'
+        }
+
+        # RV5-W-1: CPython reads pyvenv.cfg next to python.exe and in the directory above it, also with -I -S, and takes its
+        # standard library from the home it names.
+        It 'refuses a pyvenv.cfg <Where>, before it runs the interpreter' -TestCases @(
+            @{ Where = 'next to python.exe'; Up = $false }, @{ Where = 'in the directory above the Python directory'; Up = $true }
+        ) {
+            $py = New-FakePythonHome (Join-Path $env:SystemDrive 'Apps\Python313')
+            $dir = if ($Up) { Split-Path -Parent (Split-Path -Parent $py) } else { Split-Path -Parent $py }
+            $cfg = Join-Path $dir 'pyvenv.cfg'
+            Set-Content -LiteralPath $cfg -Value 'home = C:\Users\Public\redir'
+            $err = { & $Installer @Base -PythonExe $py } | Should -Throw '*pyvenv.cfg found*not a virtual environment*' -PassThru
+            "$err" | Should -Match ([regex]::Escape((Get-Item -LiteralPath $cfg -Force).FullName))
+            (Get-FakeCall 'python').Count | Should -Be 0 -Because 'the elevated installer must not start a redirected interpreter'
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'refuses a protected base interpreter in %ProgramData%, where users may create files (pyvenv.cfg above it)' {
+            $pyHome = Join-Path $env:ProgramData 'Anaconda3'
+            $py = Join-Path $pyHome 'python.exe'
+            New-FakeBinary -Path $py
+            Register-FakeExecutable -Path $py -Function FakePython
+            foreach ($dir in @('Lib\site-packages', 'DLLs')) { New-Item -ItemType Directory -Path (Join-Path $pyHome $dir) -Force | Out-Null }
+            $FakeWin.Acl[(Get-FakeFullPath $pyHome)] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
+            $err = { & $Installer @Base -PythonExe $py } | Should -Throw '*can be modified by non-administrators*-AllowWritablePython*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $env:ProgramData) (Users: create files)"))
+            (Get-FakeCall 'python').Count | Should -Be 0
+        }
+
+        It 'accepts a protected base interpreter directly below the volume root, where users may only create folders' {
+            $pyHome = Join-Path $env:SystemDrive 'Python313'
+            $py = Join-Path $pyHome 'python.exe'
+            New-FakeBinary -Path $py
+            Register-FakeExecutable -Path $py -Function FakePython
+            foreach ($dir in @('Lib\site-packages', 'DLLs')) { New-Item -ItemType Directory -Path (Join-Path $pyHome $dir) -Force | Out-Null }
+            $FakeWin.Acl[(Get-FakeFullPath $pyHome)] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py })
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Not -Match 'can be modified by non-administrators'

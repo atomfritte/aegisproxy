@@ -218,7 +218,7 @@ in-memory Windows model (Pester). The CI job `windows` repeats all of it on Wind
 | `aegis-control-plane.exe` as console process | 19/19: bootstrap, policy set publish, data-plane bundle (key accepted/refused), enterprise CA on Windows paths, built-in audit rotation at 1 MB with delayed gzip compression, complete chain verification and export across generations, JSON log file, restart durability |
 | `aegis-control-plane.exe` as service under Wine's SCM | 10/10: `sc create` with the `service` argument, `net start` → `RUNNING`, login, `net stop` with drain and state flush, persistence, restart, exit code 0, invalid setting → `STOPPED` with exit code 1 |
 | Data-plane on python.org Windows CPython 3.12.10 (`win_amd64` wheels of the hash lock: mitmproxy 12.3.0, YARA-X 1.22.0, Brotli 1.2.1, tornado 6.6) | unit tests 94/94 (none skipped); proxy end to end 11/11 with the WinSW arguments: allowed HTTPS with a certificate issued by the enterprise CA, default deny with block page, method restriction, access log on a Windows path, heartbeat with YARA-X, flows at the control-plane |
-| Installers (Pester 5.9.1, PowerShell 7.5, in-memory Windows model) | 436/436; PSScriptAnalyzer 1.25.0: 0 findings |
+| Installers (Pester 5.9.1, PowerShell 7.5, in-memory Windows model) | 441/441; PSScriptAnalyzer 1.25.0: 0 findings |
 
 Defects found this way and fixed (each with a regression test):
 
@@ -240,7 +240,7 @@ Defects found this way and fixed (each with a regression test):
   incomplete lock file).
 ### Adversarial review (2.1)
 
-Four rounds, each with fresh reviewers who attacked the code and a running installation from one attacker
+Four rounds and a re-check, each with fresh reviewers who attacked the code and a running installation from one attacker
 model: a compromised server behind the proxy (egress bypass), a low-privileged console user, an unauthenticated
 client or a hostile IdP / SIEM endpoint (control plane), an insider with file or database access, a full disk or
 a crash (audit integrity), and a local user, a network attacker during installation or a supply-chain attacker
@@ -253,6 +253,7 @@ and the next round re-ran the earlier proofs of concept.
 | 2 | 1 critical, 2 high, about 20 medium or low | One client could exhaust the shared inspection budget with announced but empty uploads, so other transfers passed unscanned (now a per-client share); CA installers checked the first certificate of the download but installed the whole file; default image names pointed to an unregistered Docker Hub namespace (now GHCR); Team Leads could change InfoSec BLOCK rules and see other groups' requests; a renamed SCIM group could gain roles; servers behind one NAT address shared redirect grants and learning sessions; long-lived connections outlived a revocation; the unkeyed legacy audit prefix was accepted without confirmation and a truncated tail went unnoticed; a full export queue dropped records |
 | 3 | 0 critical, 4 high, 19 medium or low | Below (round 3) |
 | 4 | 0 critical, 3 high, 4 medium, 4 low | Below (round 4) |
+| 5 (re-check of round 4) | 0 critical, 1 high, 2 low | The Windows data-plane installer checked the directory above the Python directory for rename rights but not for creating files: a user could plant a `pyvenv.cfg` there, which CPython reads even in isolated mode and which redirects its standard library (code execution in the elevated installer) - now refused, as is any `pyvenv.cfg` next to or above `python.exe`; a planted `.git/info/attributes` (`export-ignore`) could drop a reviewed file from `make images` - the exported tree is now compared with the commit; after a restart a mixed sink that rejected only audit records showed as forwarding until its first audit record - now "not confirmed" |
 
 Round 3 in detail (all fixed):
 
@@ -289,3 +290,5 @@ Held in round 4: the proxy secret (missing, wrong, prefixed or duplicated header
 never logged or forwarded), CSRF origin edge cases, endpoint authorization of the audit API, the earlier fixes
 R3-1 to R3-5 and N1, HTTP framing, revocation, inspection limits, the release workflow (apart from the
 repository settings), the Windows ACL and source checks, and DEP-1 to DEP-3.
+
+Held in the re-check (round 5): the forged `X-Forwarded-For` through nginx, IIS/ARR, HAProxy and the console image (multiple headers, garbage, ports, `::ffff:` forms, duplicate proxy secrets; a remote client cannot obtain a loopback address), the allowlisted build contexts against planted modules, packages, extension modules, `vendor/`, `go.work`, `.npmrc` and `.pth` files with BuildKit and the legacy builder, the per-stream audit posture and its error scrubbing, `PIP_CONFIG_FILE=nul` (global, user and site configuration all ignored), the secret-file checks (no exploitable time-of-check gap, staged-copy and service-read exemptions not abusable) and the ARR rule.
