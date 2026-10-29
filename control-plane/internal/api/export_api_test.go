@@ -44,6 +44,17 @@ func TestLogExportAPI(t *testing.T) {
 	if created.Secret != "" || !created.HasSecret || created.Headers["X-Api-Key"] != "" {
 		t.Fatalf("secrets leaked or lost: %+v", created)
 	}
+	// The configuration is applied asynchronously; a sink exports the events after it started.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		list := decode[map[string]json.RawMessage](t, h.do(t, "GET", "/api/integrations/exports", nil, nil).Body)
+		if strings.Contains(string(list["status"]), created.ID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink not started: %s", list["status"])
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	// Update without re-sending secrets keeps them.
 	created.Name = "SOAR webhook (renamed)"
 	if r := h.do(t, "PUT", "/api/integrations/exports/"+created.ID, created, ui); r.StatusCode != 200 {
