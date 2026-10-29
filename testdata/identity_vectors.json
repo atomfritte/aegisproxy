@@ -1,5 +1,5 @@
 {
- "_comment": "Shared vectors for server identification and temporary grants: store.Identify/Evaluate (control-plane, Go) and Policy.identify/evaluate (data-plane, Python). Servers a, e, b, f and q sit behind one NAT address (203.0.113.10, registered for a only); tokens are given in plain text and hashed by the tests. Sessions are active, grants are registered (server_id, location, parent_url, rule) before the cases run. Change this file only together with both implementations.",
+ "_comment": "Shared vectors for server identification and temporary grants: store.Identify/Evaluate (control-plane, Go) and Policy.identify/evaluate (data-plane, Python). Servers a, e, b, f and q sit behind one NAT address (203.0.113.10, registered for a only); tokens are given in plain text and hashed by the tests. Sessions are active, grants are registered (server_id, location, parent_url, rule) before the cases run. Cases are requests to https on port 443 unless they give \"scheme\" and \"port\"; the full URL is scheme://host[:port]path. Change this file only together with both implementations.",
  "groups": [
   {"id": "grp-web"},
   {"id": "grp-other"},
@@ -29,7 +29,8 @@
  "grants": [
   {"server_id": "srv-e", "location": "https://objects.example/asset.tgz", "parent_url": "https://github.com/acme/x/releases/download/v1/asset.tgz", "rule_id": "r-gh", "rule_name": "gh"},
   {"server_id": "srv-b", "location": "https://objects-b.example/asset.tgz", "parent_url": "https://github.com/acme/x", "rule_id": "r-gh", "rule_name": "gh"},
-  {"server_id": "srv-f", "location": "https://objects-f.example/asset.tgz", "parent_url": "https://github.com/acme/x", "rule_id": "r-gh", "rule_name": "gh"}
+  {"server_id": "srv-f", "location": "https://objects-f.example/asset.tgz", "parent_url": "https://github.com/acme/x", "rule_id": "r-gh", "rule_name": "gh"},
+  {"server_id": "srv-e", "location": "http://cdn-plain.example/pkg.tgz", "parent_url": "http://github.com/acme/y", "rule_id": "r-gh", "rule_name": "gh"}
  ],
  "cases": [
   {"name": "e uses its own redirect grant", "ip": "203.0.113.10", "auth": "svc-e:token-e", "method": "GET", "host": "objects.example", "path": "/asset.tgz", "verdict": "REDIRECT_OBJECT_ALLOWED", "server_id": "srv-e"},
@@ -56,6 +57,10 @@
   {"name": "require_proxy_token: valid bare token from any address", "ip": "198.51.100.7", "auth": "token-c", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-c"},
   {"name": "require_proxy_token on one group: the address does not identify the server", "ip": "10.80.0.40", "auth": "", "method": "GET", "host": "lab.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-auto-10-80-0-40"},
   {"name": "require_proxy_token on one group: CIDR membership cannot reach that group's rules", "ip": "10.80.0.40", "auth": "", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "BLOCKED", "server_id": "srv-auto-10-80-0-40", "block_reason": "default_deny"},
-  {"name": "require_proxy_token on one group: with its token", "ip": "10.80.0.40", "auth": "svc-l:token-l", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-l"}
+  {"name": "require_proxy_token on one group: with its token", "ip": "10.80.0.40", "auth": "svc-l:token-l", "method": "GET", "host": "pci.example", "path": "/x", "verdict": "ALLOWED", "server_id": "srv-l"},
+  {"name": "an https grant does not cover plain http to the same host and path", "ip": "192.168.10.5", "auth": "token-e", "method": "GET", "scheme": "http", "port": 80, "host": "objects.example", "path": "/asset.tgz", "verdict": "BLOCKED", "server_id": "srv-e", "block_reason": "default_deny"},
+  {"name": "an http grant covers its own origin", "ip": "192.168.10.5", "auth": "token-e", "method": "GET", "scheme": "http", "port": 80, "host": "cdn-plain.example", "path": "/pkg.tgz", "verdict": "REDIRECT_OBJECT_ALLOWED", "server_id": "srv-e"},
+  {"name": "an http grant does not cover https to the same host and path", "ip": "192.168.10.5", "auth": "token-e", "method": "GET", "host": "cdn-plain.example", "path": "/pkg.tgz", "verdict": "BLOCKED", "server_id": "srv-e", "block_reason": "default_deny"},
+  {"name": "an http grant does not open a tunnel to port 443", "ip": "192.168.10.5", "auth": "token-e", "method": "CONNECT", "host": "cdn-plain.example", "path": "/", "verdict": "BLOCKED", "server_id": "srv-e", "block_reason": "default_deny"}
  ]
 }

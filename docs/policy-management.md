@@ -46,7 +46,7 @@ A new set has version 0 until it is published for the first time.
 | Host pattern | `github.com`, `*.ubuntu.com`, an IP address. Catch-all `*` ALLOW rules require a Super Admin; Team Leads cannot use top-level wildcards (`*.com`). |
 | Path pattern | `/microsoft/**` (`/microsoft` and everything below), `/simple/*` (exactly one segment below `/simple`), `/repos/*/releases/**`, exact paths — see [Path patterns](#path-patterns). |
 | Methods | Default `GET, HEAD` (least privilege). |
-| Follow redirects | Authorizes the exact object a matching response redirects to (e.g. GitHub release assets on a CDN) for two minutes — for the server that made the request only (the grant belongs to its server identity, not to its source address), and never for members of strict-isolation groups. |
+| Follow redirects | Authorizes the exact object a matching response redirects to (e.g. GitHub release assets on a CDN; same scheme, host, port and path — an `https://` target is not granted over plain `http`) for two minutes — for the server that made the request only (the grant belongs to its server identity, not to its source address), and never for members of strict-isolation groups. |
 | Redirect targets | Optional with *Follow redirects* (`redirect_hosts`): host patterns (`objects.githubusercontent.com`, `*.cdn.example`) the redirect may lead to. Empty = any public host; internal destinations never receive a grant. Set it for rules on sites whose redirects the destination operator (or its users) can steer. |
 | Companion rules | Additional `host/path` patterns that belong to the same purpose (`codeload.github.com/acme/**`). |
 | Expiry | Optional; expired rules are ignored by the engine. |

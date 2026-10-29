@@ -9,6 +9,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -416,16 +417,55 @@ func CanonicalizePath(rawPath string) (string, bool) {
 	return cleaned, true
 }
 
+var defaultPorts = map[string]int{"http": 80, "https": 443}
+
+// RequestOrigin returns the scheme and effective port of a request (same as the data-plane's request_origin): the
+// URL's scheme, else the request's scheme, else https unless the port is 80 (CONNECT and tunnel re-checks carry no
+// URL).
+func RequestOrigin(fullURL, scheme string, port int) (string, int) {
+	s := ""
+	if fullURL != "" {
+		if u, err := url.Parse(fullURL); err == nil {
+			s = strings.ToLower(u.Scheme)
+		}
+	}
+	if _, ok := defaultPorts[s]; !ok {
+		s = strings.ToLower(scheme)
+	}
+	if _, ok := defaultPorts[s]; !ok {
+		s = "https"
+		if port == 80 {
+			s = "http"
+		}
+	}
+	if port <= 0 {
+		port = defaultPorts[s]
+	}
+	return s, port
+}
+
 // RegisterRedirectGrant records a temporary object access grant for the server serverID when an allowed URL
 // redirects (301/302/307/308) to a CDN/Object host. A non-empty allowedHosts (the rule's redirect_hosts patterns)
-// limits the hosts that can receive a grant.
+// limits the hosts that can receive a grant. The grant covers exactly the target's origin (scheme, host, port) and
+// object, plus a CONNECT tunnel to that host:port.
 func (e *PolicyEngine) RegisterRedirectGrant(serverID, locationURL, parentURL, ruleID, ruleName string, allowedHosts []string) {
 	parsed, err := url.Parse(locationURL)
-	if err != nil || parsed.Host == "" || serverID == "" {
+	if err != nil || serverID == "" {
 		return
 	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+	if base, err := url.Parse(parentURL); err == nil && parentURL != "" {
+		parsed = base.ResolveReference(parsed)
+	}
+	if parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
 		return
+	}
+	port := defaultPorts[parsed.Scheme]
+	if p := parsed.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return
+		}
+		port = n
 	}
 	host := NormalizeHost(parsed.Host)
 	if IsDisallowedRedirectTarget(host) {
@@ -448,7 +488,7 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverID, locationURL, parentURL, r
 		RuleName:   ruleName,
 		ExpiresAt:  exp,
 	}
-	key := fmt.Sprintf("%s|%s|%s", serverID, host, cleanPath)
+	key := fmt.Sprintf("%s|%s|%s|%d|%s", serverID, parsed.Scheme, host, port, cleanPath)
 	sh := &e.shards[fnv32(key)%redirectShardCount]
 	sh.mu.Lock()
 	if len(sh.grants) < 1024 {
@@ -456,8 +496,8 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverID, locationURL, parentURL, r
 	}
 	sh.mu.Unlock()
 
-	// Also register a host-level CONNECT pre-flight key so HTTPS tunnel setup to the redirect target succeeds
-	connKey := fmt.Sprintf("%s|%s|CONNECT", serverID, host)
+	// Also register a CONNECT pre-flight key so tunnel setup to the redirect target's host:port succeeds
+	connKey := fmt.Sprintf("%s|%s|%d|CONNECT", serverID, host, port)
 	shConn := &e.shards[fnv32(connKey)%redirectShardCount]
 	shConn.mu.Lock()
 	if len(shConn.grants) < 1024 {
@@ -466,32 +506,35 @@ func (e *PolicyEngine) RegisterRedirectGrant(serverID, locationURL, parentURL, r
 	shConn.mu.Unlock()
 }
 
-// CheckRedirectGrant looks up a grant of the server serverID (the requester's resolved identity).
-func (e *PolicyEngine) CheckRedirectGrant(serverID, host, rawPath, method string) (RedirectGrant, bool) {
+// CheckRedirectGrant looks up a grant of the server serverID (the requester's resolved identity) for the request's
+// origin (scheme and port as returned by RequestOrigin; port 0 means the scheme's default port).
+func (e *PolicyEngine) CheckRedirectGrant(serverID, scheme, host string, port int, rawPath, method string) (RedirectGrant, bool) {
 	upperMethod := strings.ToUpper(strings.TrimSpace(method))
 	// Redirect object grants only permit read-only retrieval (GET/HEAD) and CONNECT tunnel pre-flight, never POST/PUT exfiltration.
 	if upperMethod != "GET" && upperMethod != "HEAD" && upperMethod != "CONNECT" {
 		return RedirectGrant{}, false
 	}
+	defPort, known := defaultPorts[scheme]
+	if !known || serverID == "" {
+		return RedirectGrant{}, false
+	}
+	if port <= 0 {
+		port = defPort
+	}
 	host = NormalizeHost(host)
 	if IsDisallowedRedirectTarget(host) {
 		return RedirectGrant{}, false
 	}
+	var key string
 	if upperMethod == "CONNECT" {
-		connKey := fmt.Sprintf("%s|%s|CONNECT", serverID, host)
-		shConn := &e.shards[fnv32(connKey)%redirectShardCount]
-		shConn.mu.RLock()
-		grant, ok := shConn.grants[connKey]
-		shConn.mu.RUnlock()
-		if ok && time.Now().Before(grant.ExpiresAt) {
-			return grant, true
+		key = fmt.Sprintf("%s|%s|%d|CONNECT", serverID, host, port)
+	} else {
+		cleanPath, ok := CanonicalizePath(rawPath)
+		if !ok {
+			return RedirectGrant{}, false
 		}
+		key = fmt.Sprintf("%s|%s|%s|%d|%s", serverID, scheme, host, port, cleanPath)
 	}
-	cleanPath, ok := CanonicalizePath(rawPath)
-	if !ok {
-		return RedirectGrant{}, false
-	}
-	key := fmt.Sprintf("%s|%s|%s", serverID, host, cleanPath)
 	sh := &e.shards[fnv32(key)%redirectShardCount]
 	sh.mu.RLock()
 	grant, ok := sh.grants[key]

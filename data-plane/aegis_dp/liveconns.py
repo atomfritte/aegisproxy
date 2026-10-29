@@ -72,8 +72,8 @@ class PinnedGrants:
     def __init__(self, grants: Any, pinned: Optional[Tuple[str, str, str, float]]) -> None:
         self.grants, self.pinned = grants, pinned
 
-    def check(self, server_id: str, host: str, path: str, method: str):
-        found = self.grants.check(server_id, host, path, method) if self.grants is not None else None
+    def check(self, server_id: str, host: str, path: str, method: str, scheme: str = "https", port: int = 0):
+        found = self.grants.check(server_id, host, path, method, scheme, port) if self.grants is not None else None
         if found is None and self.pinned is not None:
             return self.pinned[:3] + (float("inf"),)
         return found

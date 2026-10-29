@@ -93,16 +93,19 @@ class BodyGuard:
     ("oversize") or the budget or the client's share of it ("busy"). It adjusts the flow and returns STREAM
     (``message.stream`` is set: the rest is relayed unbuffered) or BLOCK (requests: ``flow.response`` holds the block
     page, the upload is discarded; responses: the response was replaced by the block message with a discarding
-    stream)."""
+    stream). With ``peek``, the first ``peek`` buffered bytes are available as ``head`` while on_exceed runs (the
+    file type of a body that will be relayed unscanned)."""
 
-    __slots__ = ("budget", "cap", "on_exceed", "client", "limit", "reserved", "exceeded", "__weakref__")
+    __slots__ = ("budget", "cap", "on_exceed", "client", "limit", "reserved", "exceeded", "peek", "head", "__weakref__")
 
-    def __init__(self, budget: BufferBudget, cap: int, on_exceed: Callable[[str, int], str], client: str = "") -> None:
+    def __init__(self, budget: BufferBudget, cap: int, on_exceed: Callable[[str, int], str], client: str = "", peek: int = 0) -> None:
         self.budget, self.cap, self.on_exceed = budget, max(0, int(cap)), on_exceed
         self.client = client
         self.limit = budget.client_limit(self.cap)
         self.reserved = 0
         self.exceeded = ""
+        self.peek = max(0, int(peek))
+        self.head = b""
 
     def declared(self, size: int) -> Optional[str]:
         """Decision for a body whose size is announced (Content-Length) before any of it arrived: "oversize" beyond
@@ -131,10 +134,14 @@ class BodyGuard:
         self.reserved += max(0, n)
         return True
 
-    def exceed(self, reason: str, size: int) -> str:
+    def exceed(self, reason: str, size: int, head: bytes = b"") -> str:
         self.exceeded = reason
         self.release()
-        return self.on_exceed(reason, size)
+        self.head = head
+        try:
+            return self.on_exceed(reason, size)
+        finally:
+            self.head = b""
 
     def release(self) -> None:
         if self.reserved:
@@ -159,6 +166,12 @@ def hold(flow: Any, kind: str, n: int) -> bool:
     """Adds ``n`` bytes to the share of the flow's guard; True without a guard (nothing is accounted)."""
     guard = (flow.metadata.get(GUARDS) or {}).get(kind)
     return guard is None or n <= 0 or guard.hold(n)
+
+
+def head(flow: Any, kind: str) -> bytes:
+    """The head of the body of the flow's guard while its on_exceed runs (see BodyGuard.peek), else b""."""
+    guard = (flow.metadata.get(GUARDS) or {}).get(kind)
+    return guard.head if guard is not None else b""
 
 
 def release(flow: Any) -> None:
@@ -208,7 +221,7 @@ def install() -> bool:
         if reason is None:
             return False
         try:
-            decision = guard.exceed(reason, len(buf))
+            decision = guard.exceed(reason, len(buf), bytes(buf)[:guard.peek] if guard.peek else b"")  # (h11 ReceiveBuffer)
         except Exception:  # noqa: BLE001 - the layer must not crash; fail closed below
             log.exception("buffer limit handling failed; aborting the %s", "request" if request else "response")
             decision = ""
