@@ -1,9 +1,11 @@
 package store
 
 import (
+	"cmp"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -38,6 +40,8 @@ func TestIdentityVectorsSharedWithDataPlane(t *testing.T) {
 			IP          string  `json:"ip"`
 			Auth        string  `json:"auth"`
 			Method      string  `json:"method"`
+			Scheme      string  `json:"scheme"`
+			Port        int     `json:"port"`
 			Host        string  `json:"host"`
 			Path        string  `json:"path"`
 			Verdict     string  `json:"verdict"`
@@ -82,8 +86,12 @@ func TestIdentityVectorsSharedWithDataPlane(t *testing.T) {
 	}
 
 	for _, c := range v.Cases {
-		res := st.Evaluate(engine.EvaluationRequest{ServerIP: c.IP, ProxyAuthUser: c.Auth, Method: c.Method, Scheme: "https", Host: c.Host,
-			Port: 443, Path: c.Path, FullURL: "https://" + c.Host + c.Path})
+		scheme, port, origin := cmp.Or(c.Scheme, "https"), cmp.Or(c.Port, 443), c.Host
+		if port != map[string]int{"http": 80, "https": 443}[scheme] {
+			origin += ":" + strconv.Itoa(port)
+		}
+		res := st.Evaluate(engine.EvaluationRequest{ServerIP: c.IP, ProxyAuthUser: c.Auth, Method: c.Method, Scheme: scheme, Host: c.Host,
+			Port: port, Path: c.Path, FullURL: scheme + "://" + origin + c.Path})
 		if res.Verdict != c.Verdict || res.ServerID != c.ServerID {
 			t.Errorf("%s: verdict %s, server %s; want %s, %s (%s)", c.Name, res.Verdict, res.ServerID, c.Verdict, c.ServerID, res.MatchedRuleName)
 		}
@@ -108,7 +116,7 @@ func TestRecordedRedirectGrantBelongsToServer(t *testing.T) {
 	if r := evalCI(st, "objects.example", "/a"); r.Verdict != models.VerdictRedirectObject {
 		t.Fatalf("owner: %+v", r)
 	}
-	if _, ok := st.engine.CheckRedirectGrant("10.1.0.5", "objects.example", "/a", "GET"); ok {
+	if _, ok := st.engine.CheckRedirectGrant("10.1.0.5", "https", "objects.example", 443, "/a", "GET"); ok {
 		t.Fatal("grant registered for the source address")
 	}
 	// The same address with another server's credentials (here: an unknown token) never inherits it.

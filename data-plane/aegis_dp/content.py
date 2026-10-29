@@ -72,6 +72,7 @@ def scan_dlp(chunks: Iterable[bytes], enabled: Iterable[str]) -> List[str]:
 _SCRIPT_EXT = {".sh", ".bash", ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".py", ".pl"}
 _EXT_TYPES = {".exe": "pe", ".dll": "pe", ".scr": "pe", ".sys": "pe", ".msi": "msi_ole", ".jar": "jar", ".apk": "apk",
               ".iso": "iso", ".docm": "office_macro", ".xlsm": "office_macro", ".pptm": "office_macro"}
+FILE_TYPE_SAMPLE = 2 * 1024 * 1024  # bytes of a body detect_file_type looks at (ZIP members are searched this far)
 
 
 def detect_file_type(body: bytes, url: str = "", content_type: str = "") -> Optional[str]:
@@ -90,7 +91,7 @@ def detect_file_type(body: bytes, url: str = "", content_type: str = "") -> Opti
     if head.startswith(b"#!"):
         return "script"
     if head.startswith(b"PK\x03\x04"):
-        sample = body[: 2 * 1024 * 1024]
+        sample = body[:FILE_TYPE_SAMPLE]
         if b"vbaProject.bin" in sample:
             return "office_macro"
         if b"AndroidManifest.xml" in sample or b"classes.dex" in sample:

@@ -320,7 +320,8 @@ func (s *Store) Evaluate(req engine.EvaluationRequest) engine.EvaluationResult {
 		}
 
 		// 6. Ephemeral 302 redirect object grant of this server (GET/HEAD/CONNECT only, single hop).
-		if grant, ok := s.engine.CheckRedirectGrant(srvID, host, cleanPath, method); ok && !strict {
+		scheme, port := engine.RequestOrigin(req.FullURL, req.Scheme, req.Port)
+		if grant, ok := s.engine.CheckRedirectGrant(srvID, scheme, host, port, cleanPath, method); ok && !strict {
 			res.Allowed = true
 			res.Verdict = models.VerdictRedirectObject
 			res.MatchedRuleID = grant.RuleID

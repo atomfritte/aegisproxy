@@ -120,7 +120,24 @@ blocked at the proxy too. Refresh interval: the sync interval, at least 15 minut
 When at least one inspection is active, the worker buffers the response body (up to `av_max_scan_bytes`, which
 is therefore the size limit for every engine — compressed and decoded; larger downloads are streamed unscanned
 with the flag `AV_UNSCANNED:oversize`, or blocked with `av_oversize_action: block`). A download without
-`Content-Length` is buffered chunk by chunk and handled the same way once it outgrows the limit. Buffering is
+`Content-Length` is buffered chunk by chunk and handled the same way once it outgrows the limit. What still
+applies to an oversize download with `av_oversize_action: allow`:
+
+- **File type** — enforced on the head of the body: while a file type is blocked for the server's groups, the
+  worker decodes the first `min(2 MiB, av_max_scan_bytes)` bytes on the wire through the content codings like a
+  full body and checks magic bytes and URL extension before it relays anything (a download that announces an
+  oversize `Content-Length` is held until that head has arrived; one without is already buffered up to the
+  limit). A blocked type is answered with `FILETYPE_BLOCKED`, a corrupt coding with `undecodable_content`. The
+  head counts against the worker's buffer budget and the client's share like any buffered body (no room:
+  `inspection_busy`). ZIP subtypes (`office_macro`, `apk`, `jar`) are recognized only from member names within
+  the decoded head; otherwise the file counts as `zip`. A body that fits the limit on the wire but decodes to
+  more is checked on its decoded first `av_max_scan_bytes` (file type and YARA, see
+  [content decoding](#content-decoding)).
+- **Not applied** — the SHA-256 IOC check, YARA (on the head of a body that is too large on the wire), ClamAV
+  and ICAP RESPMOD need the whole entity and are skipped. Only `av_oversize_action: block` keeps such files out
+  entirely.
+
+Buffering is
 also bounded per worker and per client ([memory sizing](configuration.md#data-plane-memory-sizing)); a download
 that does not fit is **busy**, not oversize: while an inspection that can block is active (blocked file types,
 threat-intel hashes, ClamAV / YARA / ICAP RESPMOD in `block` mode) it is answered with 503 `inspection_busy`
@@ -238,8 +255,10 @@ The worker streams buffered response bodies to clamd via `INSTREAM`. Configure:
 
 - `av_max_scan_bytes` (default 25 MiB) — keep in line with clamd `StreamMaxLength`.
 - `av_oversize_action` — `allow` (stream unscanned, flagged) or `block`. It applies to downloads larger than
-  `av_max_scan_bytes` only; padding a file beyond the limit is enough to get it past every engine with `allow`,
-  so the security posture (`scan-oversize`) warns while ClamAV or ICAP RESPMOD enforce with `allow`.
+  `av_max_scan_bytes` only; padding a file beyond the limit is enough to get it past the hash IOC check and every
+  scan engine with `allow` (blocked file types are still enforced on the head, see
+  [the pipeline](#download-inspection-pipeline)), so the security posture (`scan-oversize`) warns while ClamAV or
+  ICAP RESPMOD enforce with `allow`.
 - `av_fail_mode` — `open` (allow, `AV_ERROR` event) or `closed` (503) when clamd is unavailable or times out.
 - `av_mode` — `block` or `monitor`.
 

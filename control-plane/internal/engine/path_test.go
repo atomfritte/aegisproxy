@@ -68,18 +68,69 @@ func TestRedirectGrantsKeyedByServerID(t *testing.T) {
 	e := NewPolicyEngine()
 	e.RegisterRedirectGrant("srv-a", "https://objects.example/asset.tgz", "https://github.com/x", "r1", "gh", nil)
 	e.RegisterRedirectGrant("", "https://objects.example/other.tgz", "https://github.com/x", "r1", "gh", nil)
-	if _, ok := e.CheckRedirectGrant("srv-a", "objects.example", "/asset.tgz", "GET"); !ok {
+	if _, ok := e.CheckRedirectGrant("srv-a", "https", "objects.example", 443, "/asset.tgz", "GET"); !ok {
 		t.Fatal("grant of srv-a not found")
 	}
-	if _, ok := e.CheckRedirectGrant("srv-a", "objects.example", "/", "CONNECT"); !ok {
+	if _, ok := e.CheckRedirectGrant("srv-a", "https", "objects.example", 443, "/", "CONNECT"); !ok {
 		t.Fatal("CONNECT pre-flight of srv-a not found")
 	}
 	for _, id := range []string{"srv-b", "203.0.113.10", ""} {
-		if _, ok := e.CheckRedirectGrant(id, "objects.example", "/asset.tgz", "GET"); ok {
+		if _, ok := e.CheckRedirectGrant(id, "https", "objects.example", 443, "/asset.tgz", "GET"); ok {
 			t.Errorf("grant of srv-a usable by %q", id)
 		}
 	}
-	if _, ok := e.CheckRedirectGrant("", "objects.example", "/other.tgz", "GET"); ok {
+	if _, ok := e.CheckRedirectGrant("", "https", "objects.example", 443, "/other.tgz", "GET"); ok {
 		t.Error("grant without server identity registered")
+	}
+}
+
+// A grant covers exactly the redirect target's origin: scheme, host and effective port.
+func TestRedirectGrantsKeyedByOrigin(t *testing.T) {
+	e := NewPolicyEngine()
+	e.RegisterRedirectGrant("srv-a", "https://objects.example:8443/asset.tgz", "https://github.com/x", "r1", "gh", nil)
+	e.RegisterRedirectGrant("srv-a", "//plain.example/pkg.tgz", "http://github.com/x", "r1", "gh", nil)
+	e.RegisterRedirectGrant("srv-a", "https://bad-port.example:99999/x", "https://github.com/x", "r1", "gh", nil)
+	cases := []struct {
+		scheme, host string
+		port         int
+		path, method string
+		want         bool
+	}{
+		{"https", "objects.example", 8443, "/asset.tgz", "GET", true},
+		{"http", "objects.example", 80, "/asset.tgz", "GET", false},
+		{"https", "objects.example", 443, "/asset.tgz", "GET", false},
+		{"http", "objects.example", 8443, "/asset.tgz", "GET", false},
+		{"https", "objects.example", 8443, "/", "CONNECT", true},
+		{"https", "objects.example", 443, "/", "CONNECT", false},
+		{"http", "plain.example", 80, "/pkg.tgz", "GET", true},
+		{"http", "plain.example", 0, "/pkg.tgz", "HEAD", true},
+		{"https", "plain.example", 443, "/pkg.tgz", "GET", false},
+		{"https", "plain.example", 80, "/pkg.tgz", "GET", false},
+		{"https", "plain.example", 443, "/", "CONNECT", false},
+		{"http", "plain.example", 80, "/", "CONNECT", true},
+		{"ftp", "plain.example", 80, "/pkg.tgz", "GET", false},
+		{"https", "bad-port.example", 443, "/x", "GET", false},
+	}
+	for _, c := range cases {
+		if _, ok := e.CheckRedirectGrant("srv-a", c.scheme, c.host, c.port, c.path, c.method); ok != c.want {
+			t.Errorf("%s %s://%s:%d%s: granted=%v, want %v", c.method, c.scheme, c.host, c.port, c.path, ok, c.want)
+		}
+	}
+	for _, c := range []struct {
+		url, scheme string
+		port        int
+		wantScheme  string
+		wantPort    int
+	}{
+		{"https://h.example:8443/x", "", 8443, "https", 8443},
+		{"http://h.example/x", "", 80, "http", 80},
+		{"", "http", 0, "http", 80},
+		{"", "", 80, "http", 80},
+		{"", "", 0, "https", 443},
+		{"", "ftp", 21, "https", 21},
+	} {
+		if s, p := RequestOrigin(c.url, c.scheme, c.port); s != c.wantScheme || p != c.wantPort {
+			t.Errorf("RequestOrigin(%q, %q, %d) = %s, %d", c.url, c.scheme, c.port, s, p)
+		}
 	}
 }
