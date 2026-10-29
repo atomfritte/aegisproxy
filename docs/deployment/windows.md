@@ -93,7 +93,7 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 |---|---|
 | OS | Windows Server 2019, 2022 or 2025 (2016 works), x64, domain-joined recommended |
 | Shell | Windows PowerShell 5.1 or PowerShell 7, elevated ("Run as administrator") |
-| Control-plane binary | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane.exe .` |
+| Control-plane binary | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane.exe .` Go ≥ 1.27.3, the `go` line of `control-plane/go.mod` (the Go of the release images); an older `go` downloads that toolchain (checksum-verified, default `GOTOOLCHAIN=auto`) or refuses to build with `GOTOOLCHAIN=local` |
 | Web console | `npm --prefix frontend ci` and `npm --prefix frontend run build` → `frontend\dist` |
 | Python (workers) | **python.org CPython 3.12+ (64-bit), installed "for all users" into `C:\Program Files\Python312`** (the default of `InstallAllUsers=1`). Silent: `python-3.12.x-amd64.exe /quiet InstallAllUsers=1 Include_launcher=1 InstallLauncherAllUsers=1 PrependPath=0`. Chocolatey: `choco install python312 --params "/InstallDir:'C:\Program Files\Python312'"` (its default `C:\Python312` lets users create files there) |
 | WinSW (workers) | `WinSW-x64.exe` from a 2.x release on <https://github.com/winsw/winsw/releases> (MIT). It is never downloaded by the scripts; the data-plane script verifies it against `-WinSWSha256` (default: WinSW 2.12.0 x64, `05B82D46…3A0DA`) and aborts on a mismatch before changing anything |

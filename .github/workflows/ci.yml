@@ -344,6 +344,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
+      # The go line of control-plane/go.mod (what CI's setup-go installs and the floor for source builds) is the Go
+      # of the image builds: bump the golang image digest and go.mod together.
+      - name: go.mod toolchain floor equals the Go of the image builds
+        run: |
+          set -euo pipefail
+          want="go$(sed -n 's/^go //p' control-plane/go.mod)"
+          for f in Dockerfile control-plane/Dockerfile; do
+            img=$(sed -n 's/^FROM \(golang:[^ ]*\) AS build$/\1/p' "$f")
+            got=$(docker run --rm --network none --entrypoint go "$img" env GOVERSION)
+            echo "$f: $img -> $got; control-plane/go.mod -> $want"
+            if [ "$got" != "$want" ]; then echo "::error::$f builds with $got, control-plane/go.mod requires $want: bump them together"; exit 1; fi
+          done
       - run: make images VERSION=${{ github.sha }} IMAGE_TAG=${{ github.sha }}
       - name: vulnerability scan (fails on fixable critical/high)
         # Trivy CLI image pinned by digest (no third-party action in the pipeline).

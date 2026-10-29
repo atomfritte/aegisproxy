@@ -78,7 +78,7 @@ All configuration variables are documented in [`docs/configuration.md`](../confi
 | Distribution | Debian 12/13, Ubuntu 22.04/24.04, RHEL/Rocky/AlmaLinux 9/10 (x86_64 or arm64) |
 | systemd | **≥ 248** (`LoadCredential=` + `%d`). RHEL 8 (systemd 239) is not supported natively - use the container images there |
 | Python (workers) | **≥ 3.12** with `venv`: Ubuntu 24.04 / Debian 13 (`python3`, `python3-venv`), RHEL/Rocky 9 (`dnf install python3.12`). Debian 12 and Ubuntu 22.04 ship older versions: use a vendor/backport build and `--python`, or the container image |
-| Control-plane binary | `CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane .` (`GOARCH=arm64` for ARM) |
+| Control-plane binary | `CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane .` (`GOARCH=arm64` for ARM). Go ≥ 1.27.3, the `go` line of `control-plane/go.mod` (the Go of the release images); an older `go` downloads that toolchain (checksum-verified, default `GOTOOLCHAIN=auto`) or refuses to build with `GOTOOLCHAIN=local` |
 | Console | `npm --prefix frontend ci && npm --prefix frontend run build` → `frontend/dist` |
 | Network | outbound access to PyPI (or an internal mirror) during installation; the port matrix above |
 | Sizing (starting point) | control-plane 2 vCPU / 4 GB; worker 4 vCPU / 8 GB; measure with `/metrics` |

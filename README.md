@@ -11,7 +11,7 @@ Every outbound HTTP(S) request of your servers passes a default-deny proxy that 
 **which exact path** it wants and **who approved it** — with self-service requests, change management,
 threat protection and a complete audit trail.
 
-![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.26-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
+![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.27-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
 
 [Quick start](#quick-start) · [Screenshots](#a-tour-of-the-console) · [Deployment](#deployment) ·
 [Documentation](#documentation) · [Security](SECURITY.md)
@@ -285,7 +285,7 @@ make test-conformance     # Splunk HEC, Sentinel and public Microsoft endpoints 
 npm --prefix frontend run dev   # console dev server on :5173 (proxies /api to :8081)
 ```
 
-Requirements: Go ≥ 1.26, Python ≥ 3.12 with mitmproxy 12.3, Node.js 24, Docker. Repository layout:
+Requirements: Go ≥ 1.27.3 (`control-plane/go.mod`), Python ≥ 3.12 with mitmproxy 12.3, Node.js 24, Docker. Repository layout:
 
 ```
 control-plane/      Go control-plane: API, policy engine, store, threat intel, identity, export
