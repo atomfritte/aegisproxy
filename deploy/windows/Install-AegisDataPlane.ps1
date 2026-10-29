@@ -13,10 +13,13 @@
     administrators can modify (%ProgramFiles%) and installs mitmproxy==12.3.0 into it.
 
     Steps (idempotent; a re-run upgrades addon/venv/WinSW configuration and keeps the staged secrets):
-      * resolves Python (py -3.12 / -3.13 / -3.14 or -PythonExe), refuses an interpreter that non-administrators
-        can modify, creates <InstallDir>\venv, pip install
-      * takes over existing directories (owner Administrators, foreign ACEs removed); files that existed before
-        are only kept on an upgrade of an intact installation or with -AdoptExistingSecrets
+      * resolves Python (-PythonExe or the all-users installation of 3.12 / 3.13 / 3.14 registered in HKLM) and
+        refuses an interpreter that non-administrators can modify before it runs it for the first time
+      * takes over existing directories (owner Administrators, foreign ACEs removed), including
+        %ProgramData%\AegisProxy above the default data root; files that existed before are only kept on an
+        upgrade of an intact installation or with -AdoptExistingSecrets
+      * creates <InstallDir>\venv and installs the hash-locked data-plane\requirements-lock.txt (mitmproxy 12.3.0,
+        YARA-X and every dependency, binary wheels only) with pip --require-hashes
       * copies data-plane\aegis_addon.py + aegis_dp\ to <InstallDir>\app (byte-compiled)
       * stages the data-plane key and the CA (mitmproxy-ca.pem = key + cert) into <DataRoot> with ACLs that
         only SYSTEM, Administrators and the service account can read (verified after the installation)
@@ -37,13 +40,24 @@
                                          (AEGIS_FLOW_SPOOL_DIR)                       - service: modify
 
 .PARAMETER PythonExe
-    Explicit python.exe (python.org CPython >= 3.12, installed for all users). Default: detected with the
-    Python launcher (py -3.12, then -3.13, -3.14).
+    Explicit python.exe (python.org CPython >= 3.12, installed for all users). Default: the all-users installation
+    of Python 3.12, then 3.13, 3.14 as registered in HKLM\SOFTWARE\Python\PythonCore\<version>\InstallPath (PEP 514,
+    what "py -3.12" finds); found without running the launcher or the interpreter. The interpreter is first run
+    after its directory, DLLs, Lib and site-packages passed the check of -AllowWritablePython, and always in
+    isolated mode (-I; the version probe also without the site module, -S).
 
 .PARAMETER AllowWritablePython
     Accept a base interpreter whose directory, Lib, DLLs or site-packages non-administrators (Users,
     Authenticated Users, Everyone, INTERACTIVE, ...) can modify or create files in, e.g. C:\Python312 below a
-    volume root that lets users create files. Code planted there runs in the service. Not recommended.
+    volume root that lets users create files. Code planted there runs in the service, and in this script (as
+    Administrator) as soon as it runs the interpreter. Not recommended.
+
+.PARAMETER DataRoot
+    Data directory (default %ProgramData%\AegisProxy\data-plane). Its parent %ProgramData%\AegisProxy is taken over
+    as well (owner Administrators, SYSTEM/Administrators only; a control-plane on this host keeps the ACLs of its own
+    subdirectories): whoever owns the parent could rename the data directory and put a junction in its place. Any
+    other parent must already be controlled by administrators - the installation stops if a non-administrator owns
+    it or may delete entries in it, change its permissions or take ownership of it.
 
 .PARAMETER SourceDir
     The repository's data-plane folder (contains aegis_addon.py and aegis_dp\). Default: ..\..\data-plane.
@@ -98,12 +112,18 @@
     prohibited by policy.
 
 .PARAMETER RequirementsFile
-    Complete, hash-pinned lock file (uv pip compile --generate-hashes; its --override is needed), installed with
-    --require-hashes --no-deps instead of mitmproxy==12.3.0 and yara-x==1.22.0 (include yara-x to keep YARA
-    scanning). It must pin every dependency and at least the versions of data-plane\requirements-security.txt,
-    e.g. uv pip compile --generate-hashes --override requirements-security.txt requirements.in. The overrides are
-    not installed on top of it (that would bypass hash checking); the script verifies the baseline versions and
-    runs pip check, which may only report the conflicts caused by those overrides.
+    Your own complete, hash-pinned lock file instead of the shipped data-plane\requirements-lock.txt (default),
+    installed with --require-hashes --no-deps (include yara-x to keep YARA scanning; -NoYara does not edit it). It
+    must pin every dependency and at least the versions of data-plane\requirements-security.txt, e.g.
+    uv pip compile --generate-hashes --override requirements-security.txt requirements.in. The overrides are not
+    installed on top of it (that would bypass hash checking); the script verifies the baseline versions and runs
+    pip check, which may only report the conflicts caused by those overrides. The shipped lock is checked the same
+    way and installed from binary wheels only (--only-binary=:all:, no source builds as Administrator).
+
+.PARAMETER AllowUnpinnedPackages
+    Install mitmproxy==12.3.0, yara-x==1.22.0 and data-plane\requirements-security.txt from the package index
+    without hash pinning (pip resolves the dependencies) instead of the shipped lock file. A compromised index,
+    mirror or proxy then decides which code runs in the service. Not recommended.
 
 .PARAMETER Uninstall
     Removes the service, firewall rules, program files and the staged CA/key copies; keeps the logs.
@@ -115,7 +135,7 @@
         -WinSWExe C:\Install\WinSW-x64.exe -AllowedRemoteAddress 10.20.0.0/16,10.30.0.0/16
 
 .EXAMPLE
-    # Offline / hash-pinned installation from an internal wheel share
+    # Own hash-pinned lock file, installed offline from an internal wheel share
     .\Install-AegisDataPlane.ps1 ... -RequirementsFile \\fs\aegis\requirements-win.txt `
         -PipArgs '--no-index','--find-links','\\fs\aegis\wheels'
 
@@ -224,12 +244,17 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [string[]]$PipArgs,
 
-    # Complete hash-pinned lock file (installed with --require-hashes --no-deps instead of mitmproxy==12.3.0
-    # and yara-x==1.22.0); include yara-x in it to keep YARA scanning.
+    # Complete hash-pinned lock file instead of the shipped data-plane\requirements-lock.txt (installed with
+    # --require-hashes --no-deps); include yara-x in it to keep YARA scanning.
     [Parameter(ParameterSetName = 'Install')]
     [string]$RequirementsFile,
 
-    # Do not install the YARA-X engine (YARA rule sets then report "unavailable" on this worker).
+    # Install from the package index without hash pinning instead of the shipped lock file (not recommended).
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowUnpinnedPackages,
+
+    # Do not install the YARA-X engine (YARA rule sets then report "unavailable" on this worker). The shipped lock
+    # file is installed without its yara-x entry.
     [Parameter(ParameterSetName = 'Install')]
     [switch]$NoYara,
 
@@ -269,6 +294,9 @@ $SidTrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271
 
 $InstallDir  = [System.IO.Path]::GetFullPath($InstallDir)
 $DataRoot    = [System.IO.Path]::GetFullPath($DataRoot)
+$DataParent  = Split-Path -Parent $DataRoot
+# %ProgramData%\AegisProxy (parent of the default data root, data root of a control-plane on this host) is taken over.
+$OwnDataParent = $DataParent.TrimEnd('\', '/') -eq ([System.IO.Path]::GetFullPath((Join-Path $env:ProgramData 'AegisProxy'))).TrimEnd('\', '/')
 $VenvDir     = Join-Path $InstallDir 'venv'
 $VenvPython  = Join-Path $VenvDir 'Scripts\python.exe'
 $Mitmdump    = Join-Path $VenvDir 'Scripts\mitmdump.exe'
@@ -785,23 +813,29 @@ foreach ($m in [regex]::Matches($PolicyMaxAge.ToLowerInvariant(), '(\d+)([smhd]?
 if ($policyMaxAgeSeconds -gt 0 -and $policyMaxAgeSeconds -lt 30) { throw "-PolicyMaxAge '$PolicyMaxAge' is too short (at least 30 seconds, or 0 for no limit)." }
 if (-not $policyMaxAgeSeconds) { Write-Note 'No -PolicyMaxAge: a worker cut off from the control-plane keeps enforcing its last policy indefinitely (no later quarantines or revocations).' }
 
-# Python (python.org CPython >= 3.12, all-users installation)
+# Python (python.org CPython >= 3.12, all-users installation). Nothing runs the interpreter before its files passed
+# the check below: on startup it loads the DLLs next to python.exe, imports sitecustomize/usercustomize and executes
+# the import lines of every site-packages\*.pth, so code planted there would run here as Administrator. The path comes
+# from -PythonExe or from the registration of the all-users installation (PEP 514, HKLM: only administrators can
+# change it; py -3.12 reads the same keys), not from running the launcher.
 $pythonBase = $null
 if ($PythonExe) {
     if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "-PythonExe '$PythonExe' not found." }
     $pythonBase = (Resolve-Path -LiteralPath $PythonExe).ProviderPath
 }
 else {
-    $launcher = Get-Command -Name 'py.exe' -ErrorAction SilentlyContinue
-    if (-not $launcher) { throw 'Python launcher (py.exe) not found. Install python.org Python 3.12+ for all users or pass -PythonExe.' }
-    foreach ($selector in @('-3.12', '-3.13', '-3.14')) {
-        $probe = Invoke-Native -FilePath $launcher.Source -ArgumentList @($selector, '-c', 'import sys; print(sys.executable)') -NoThrow
-        if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) { $pythonBase = ($probe.Output[-1]).Trim(); break }
+    foreach ($tag in @('3.12', '3.13', '3.14')) {
+        $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Python\PythonCore\$tag\InstallPath" -ErrorAction SilentlyContinue
+        if (-not $reg) { continue }
+        $exe = if ($reg.PSObject.Properties['ExecutablePath']) { "$($reg.ExecutablePath)" }
+        elseif ($reg.PSObject.Properties['(default)']) { Join-Path "$($reg.'(default)')" 'python.exe' }
+        else { '' }
+        if ($exe -and (Test-Path -LiteralPath $exe -PathType Leaf)) { $pythonBase = (Resolve-Path -LiteralPath $exe).ProviderPath; break }
     }
-    if (-not $pythonBase) { throw 'No Python 3.12+ found via "py -3.12/-3.13/-3.14". Install python.org Python 3.12 (for all users).' }
+    if (-not $pythonBase) {
+        throw 'No all-users Python 3.12+ registered (HKLM\SOFTWARE\Python\PythonCore\3.12, 3.13 or 3.14). Install python.org Python 3.12 for all users (InstallAllUsers=1) or pass -PythonExe.'
+    }
 }
-$pyVersion = ((Invoke-Native -FilePath $pythonBase -ArgumentList @('-c', 'import sys; print(sys.version_info[0], sys.version_info[1], sys.version_info[2], sep=chr(46))')).Output -join '').Trim()
-if ([version]$pyVersion -lt [version]'3.12.0') { throw "Python $pyVersion at $pythonBase is too old; mitmproxy $MitmproxyVersion requires Python >= 3.12." }
 if ($pythonBase -like '*\WindowsApps\*') { throw 'The Microsoft Store Python cannot be used by services. Install python.org Python for all users.' }
 if ($pythonBase -like (Join-Path $env:SystemDrive 'Users\*')) {
     throw "Python at $pythonBase is a per-user installation; the service account cannot read it. Reinstall python.org Python with 'Install for all users' (InstallAllUsers=1)."
@@ -824,7 +858,34 @@ if ($pyWritable.Count) {
     if (-not $AllowWritablePython) { throw "$pyMessage, or pass -AllowWritablePython to accept the risk." }
     Write-Note "$pyMessage. Continuing because of -AllowWritablePython."
 }
+# Every run of Python here uses isolated mode (-I: no PYTHON* variables, no user site-packages, neither the current
+# directory nor the script directory on sys.path). The version probe also skips the site module (-S, no .pth files).
+$pyVersion = ((Invoke-Native -FilePath $pythonBase -ArgumentList @('-I', '-S', '-c', 'import sys; print(sys.version_info[0], sys.version_info[1], sys.version_info[2], sep=chr(46))')).Output -join '').Trim()
+if ([version]$pyVersion -lt [version]'3.12.0') { throw "Python $pyVersion at $pythonBase is too old; mitmproxy $MitmproxyVersion requires Python >= 3.12." }
 Write-Step "Python $pyVersion at $pythonBase"
+
+# Packages: by default the shipped lock file pins mitmproxy, YARA-X and every dependency by hash, binary wheels only (no
+# source builds as Administrator). -RequirementsFile replaces it with your own lock; -AllowUnpinnedPackages resolves
+# them from the package index without hashes.
+$lockFile = $null
+$lockArgs = @()
+if ($RequirementsFile -and $AllowUnpinnedPackages) { throw '-RequirementsFile and -AllowUnpinnedPackages exclude each other.' }
+if ($RequirementsFile) {
+    if (-not (Test-Path -LiteralPath $RequirementsFile -PathType Leaf)) { throw "-RequirementsFile '$RequirementsFile' not found." }
+    $lockFile = (Resolve-Path -LiteralPath $RequirementsFile).ProviderPath
+}
+elseif (-not $AllowUnpinnedPackages) {
+    $lockFile = Join-Path $SourceDir 'requirements-lock.txt'
+    if (-not (Test-Path -LiteralPath $lockFile -PathType Leaf)) {
+        throw "$lockFile is missing: the data-plane packages are installed hash-pinned from it. Pass your own lock with -RequirementsFile, or -AllowUnpinnedPackages to install them without hash pinning."
+    }
+    $lockArgs = @('--only-binary=:all:')
+}
+else {
+    Write-Note 'Supply chain: -AllowUnpinnedPackages installs mitmproxy and its dependencies from the package index without hash pinning;'
+    Write-Note 'a compromised index, mirror or proxy decides which code runs in the service. Prefer the shipped data-plane\requirements-lock.txt'
+    Write-Note '(default) or -RequirementsFile <uv pip compile --generate-hashes --override requirements-security.txt output>.'
+}
 
 # Pre-existing directories: ProgramData (and the volume root for a custom path) lets every user create
 # directories, so they may exist before the first installation, with a staged CA or control-plane CA bundle, a
@@ -832,16 +893,27 @@ Write-Step "Python $pyVersion at $pythonBase"
 # upgrade of an intact installation (service registered, directories owned by Administrators with the ACLs set
 # below) or with -AdoptExistingSecrets. Links are refused: ACL changes and deletions would act on their targets
 # (hard-linked files: on the file elsewhere). Protect-Directory checks again while it takes the directories over.
+# The same holds for %ProgramData%\AegisProxy above the data root: whoever owns it (or may delete its entries) can
+# rename the data root and put a junction in its place, so it is taken over too; any other parent of -DataRoot must
+# already be controlled by administrators.
 try {
     $links = @(Find-ReparsePoint @($InstallDir, $DataRoot))
+    if ($OwnDataParent -and (Test-Path -LiteralPath $DataParent) -and ((Get-Item -LiteralPath $DataParent -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        $links += $DataParent
+    }
+    $parentIssues = @(Get-NonAdminWritable -Container @($DataParent))
     $trustIssues = @()
     if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { $trustIssues += "service $ServiceName is not installed (first installation)" }
     else { $trustIssues += @(Get-InstallationAclProblem -Principal @((Get-ServiceSid $ServiceName), $SidLocalService.TrimStart('*'))) }
+    if ($parentIssues.Count) { $trustIssues += "parent directory not controlled by administrators: $($parentIssues -join '; ')" }
     $preExisting = @()
     if ($trustIssues.Count -and -not $links.Count) { $preExisting = @(Get-ExistingFile @($InstallDir, $ConfDir, $SecretsDir, $RuntimeDir, $SpoolDir)) }
 }
 catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
 if ($links.Count) { throw "Junctions/symbolic links and hard-linked files are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
+if ($parentIssues.Count -and -not $OwnDataParent) {
+    throw "The parent directory of -DataRoot can be modified by non-administrators: $($parentIssues -join '; '). They could replace $DataRoot (rename it and put a junction in its place). Choose a -DataRoot whose parent only administrators control."
+}
 if ($preExisting.Count -and -not $AdoptExistingSecrets) {
     throw ("Refusing to adopt {0} file(s) that existed before this installation ({1}):`n  {2}`nA local user may have planted them. Delete them, or - if they are yours (interrupted first run, files you verified) - re-run with -AdoptExistingSecrets; the script then takes ownership and resets their ACLs." -f
         $preExisting.Count, ($trustIssues -join '; '), (($preExisting | Select-Object -First 10) -join "`n  "))
@@ -854,6 +926,12 @@ if ($preExisting.Count) { Write-Note "-AdoptExistingSecrets: keeping $($preExist
 if ($PSCmdlet.ShouldProcess($ServiceName, 'Stop service for upgrade')) { Stop-DataPlaneService }
 
 if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and restrict ACL to SYSTEM/Administrators')) {
+    # %ProgramData%\AegisProxy first, so that nobody can rename the data root while it is taken over. Only the
+    # directory itself: a control-plane on this host keeps the ACLs of its subdirectories (it sets the same ACL here).
+    if ($OwnDataParent) {
+        if (-not (Test-Path -LiteralPath $DataParent)) { New-Item -ItemType Directory -Path $DataParent -Force | Out-Null }
+        Protect-Directory -Root $DataParent -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F") -Allowed $AclAdmins
+    }
     foreach ($dir in @($InstallDir, $AppDir, $DataRoot, $ConfDir, $SecretsDir, $LogsDir, $RuntimeDir, $SpoolDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
@@ -888,15 +966,24 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
     if ($recreate) { Remove-DirectoryTree $VenvDir }
     if (-not (Test-Path -LiteralPath $VenvPython)) {
         Write-Step "Creating virtual environment $VenvDir"
-        Invoke-NativeLive -FilePath $pythonBase -ArgumentList @('-m', 'venv', $VenvDir)
+        Invoke-NativeLive -FilePath $pythonBase -ArgumentList @('-I', '-m', 'venv', $VenvDir)
     }
-    Write-Note 'Supply chain: for production prefer an offline, hash-pinned installation from a vetted wheel mirror'
-    Write-Note '(-RequirementsFile <uv pip compile --generate-hashes --override requirements-security.txt output> -PipArgs --no-index,--find-links,<share>).'
-    $pipArgList = @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--require-virtualenv')
-    if ($RequirementsFile) {
+    $pipArgList = @('install', '--disable-pip-version-check', '--no-input', '--require-virtualenv')
+    $pipReq = $lockFile
+    if ($lockFile -and $NoYara -and -not $RequirementsFile) {
+        # The shipped lock without the yara-x requirement and its hash lines, written to the admin-only program directory.
+        $pipReq = Join-Path $InstallDir 'requirements-lock-noyara.txt'
+        $skip = $false
+        $kept = foreach ($line in [System.IO.File]::ReadAllLines($lockFile)) {
+            if ($line -notmatch '^\s') { $skip = $line -match '^yara[-_]x\b' }
+            if (-not $skip) { $line }
+        }
+        Write-TextNoBom -Path $pipReq -Value ((@($kept) -join "`n") + "`n")
+    }
+    if ($lockFile) {
         # A complete lock file pins every dependency; --no-deps lets it raise packages above mitmproxy's upper
         # bounds (security baseline). Completeness is checked with "pip check" below.
-        $pipArgList += @('--require-hashes', '--no-deps', '-r', (Resolve-Path -LiteralPath $RequirementsFile).ProviderPath)
+        $pipArgList += @('--require-hashes', '--no-deps') + $lockArgs + @('-r', $pipReq)
     }
     else {
         $pipArgList += "mitmproxy==$MitmproxyVersion"
@@ -904,44 +991,45 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
         if (-not $NoYara) { $pipArgList += @("yara-x==$YaraXVersion", '--only-binary', 'yara-x') }
     }
     if ($PipArgs) { $pipArgList += $PipArgs }
-    Write-Step "pip $($pipArgList[2..($pipArgList.Count - 1)] -join ' ')"
-    Invoke-NativeLive -FilePath $VenvPython -ArgumentList $pipArgList
+    Write-Step "pip $($pipArgList -join ' ')"
+    try { Invoke-NativeLive -FilePath $VenvPython -ArgumentList (@('-I', '-m', 'pip') + $pipArgList) }
+    finally { if ($pipReq -ne $lockFile) { Remove-Item -LiteralPath $pipReq -Force -ErrorAction SilentlyContinue } }
     # Security overrides for mitmproxy dependencies (mitmproxy's upper bound excludes the fixed release).
     $securityReq = Join-Path $SourceDir 'requirements-security.txt'
-    if ((Test-Path -LiteralPath $securityReq) -and -not $RequirementsFile) {
-        $secArgs = @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--require-virtualenv', '--no-deps', '--only-binary=:all:', '-r', $securityReq)
+    if ((Test-Path -LiteralPath $securityReq) -and -not $lockFile) {
+        $secArgs = @('-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--require-virtualenv', '--no-deps', '--only-binary=:all:', '-r', $securityReq)
         if ($PipArgs) { $secArgs += $PipArgs }
         Invoke-NativeLive -FilePath $VenvPython -ArgumentList $secArgs
     }
     elseif (Test-Path -LiteralPath $securityReq) {
         # Hash-pinned mode: an unhashed install on top would bypass --require-hashes, so only verify the pins. The
         # venv's Python compares the versions (PEP 440: pre-releases sort before the release, invalid versions fail).
-        $baseline = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', $BaselineCheck, $securityReq) -SuccessCodes @(0, 1)
+        $baseline = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-c', $BaselineCheck, $securityReq) -SuccessCodes @(0, 1)
         if ($baseline.ExitCode -ne 0) {
             throw ("{0} does not meet the security baseline of data-plane\requirements-security.txt: {1}. Pin the fixed versions with their hashes in the requirements file." -f
-                $RequirementsFile, (@($baseline.Output | Where-Object { "$_".Trim() }) -join ' '))
+                $lockFile, (@($baseline.Output | Where-Object { "$_".Trim() }) -join ' '))
         }
         # Every dependency must be in the lock file; the only tolerated conflicts are the baseline overrides
         # (names compared PEP 503-normalized).
         $overrides = @(foreach ($line in (Get-Content -LiteralPath $securityReq)) {
                 if ($line -match '^\s*(?<name>[A-Za-z0-9._-]+)==') { ($Matches['name'] -replace '[-_.]+', '-').ToLowerInvariant() }
             })
-        $pipCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'check') -SuccessCodes @(0, 1)
+        $pipCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-m', 'pip', 'check') -SuccessCodes @(0, 1)
         $broken = @($pipCheck.Output | Where-Object {
                 $_.Trim() -and $_ -notmatch '^No broken' -and
                 -not ($_ -match 'but you have (?<pkg>\S+) ' -and $overrides -contains ($Matches['pkg'] -replace '[-_.]+', '-').ToLowerInvariant())
             })
         if ($broken.Count) {
-            throw ("The hash-pinned requirements file is incomplete or inconsistent ({0}), pip check reports:`n  {1}" -f $RequirementsFile, ($broken -join "`n  "))
+            throw ("The hash-pinned requirements file is incomplete or inconsistent ({0}), pip check reports:`n  {1}" -f $lockFile, ($broken -join "`n  "))
         }
     }
     if (-not (Test-Path -LiteralPath $Mitmdump)) { throw "mitmdump.exe not found in the venv ($Mitmdump)." }
     # The addon needs these standard-library modules - fail now instead of at service start.
-    $check = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', 'import http.server, hmac, gzip, ssl, asyncio, mitmproxy.version as v; print(v.VERSION)')
+    $check = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-c', 'import http.server, hmac, gzip, ssl, asyncio, mitmproxy.version as v; print(v.VERSION)')
     $installed = ($check.Output -join '').Trim()
     if ($installed -ne $MitmproxyVersion) { Write-Note "Installed mitmproxy $installed (expected $MitmproxyVersion)." }
     Write-Ok "mitmproxy $installed installed in $VenvDir"
-    $yaraCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', 'import yara_x') -SuccessCodes @(0, 1)
+    $yaraCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-c', 'import yara_x') -SuccessCodes @(0, 1)
     if ($yaraCheck.ExitCode -eq 0) { Write-Ok 'YARA-X available for YARA rule sets' }
     else { Write-Note 'YARA-X is not installed: YARA rule sets report "unavailable" on this worker.' }
 }
@@ -951,9 +1039,9 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'Install AegisProxy addon')) {
     $null = Invoke-Native -FilePath 'robocopy.exe' -ArgumentList @((Join-Path $SourceDir 'aegis_dp'), (Join-Path $AppDir 'aegis_dp'),
         '/MIR', '/XJ', '/XD', '__pycache__', 'tests', '/XF', '*.pyc', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -SuccessCodes @(0, 1, 2, 3, 4, 5, 6, 7)
     Copy-Item -LiteralPath (Join-Path $SourceDir 'aegis_addon.py') -Destination (Join-Path $AppDir 'aegis_addon.py') -Force
-    $null = Invoke-Native -FilePath $VenvPython -ArgumentList @('-m', 'compileall', '-q', $AppDir)
+    $null = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-m', 'compileall', '-q', $AppDir)
     # Import test (does not instantiate the addon, so no configuration is needed).
-    $null = Invoke-Native -FilePath $VenvPython -ArgumentList @('-c', 'import sys; sys.path.insert(0, sys.argv[1]); import aegis_dp.addon', $AppDir)
+    $null = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import aegis_dp.addon', $AppDir)
     Write-Ok "Addon installed in $AppDir (import check passed)"
 }
 
@@ -1045,6 +1133,7 @@ if ($PSCmdlet.ShouldProcess($DataRoot, "Grant $LogonAccount access")) {
     $null = Invoke-Native -FilePath 'icacls.exe' -ArgumentList @($SpoolDir, '/grant:r', "${AclPrincipal}:(OI)(CI)M", '/L', '/Q')
     # Read the result back: only SYSTEM, Administrators, the service (and users: read program files) may have access.
     $aclProblems = @(Get-InstallationAclProblem -Principal @($AclSid) -IncludeLogs)
+    if ($OwnDataParent) { $aclProblems += @(Get-AclProblem -Path $DataParent -Allowed $AclAdmins) }
     if ($aclProblems.Count) {
         throw ("ACL verification failed - the service was not started:`n  {0}" -f ($aclProblems -join "`n  "))
     }

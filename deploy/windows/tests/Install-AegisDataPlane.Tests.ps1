@@ -5,6 +5,7 @@ BeforeAll {
     . (Join-Path $PSScriptRoot 'FakeWindows.ps1')
     $script:Installer = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\Install-AegisDataPlane.ps1')).ProviderPath
     $script:SecurityRequirements = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\data-plane\requirements-security.txt'))
+    $script:LockFile = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\data-plane\requirements-lock.txt'))
 
     function Get-RenderedService {
         # The WinSW configuration as written next to the wrapper: [xml] plus an env name -> value map.
@@ -266,24 +267,51 @@ Describe 'Install-AegisDataPlane.ps1' {
             { & $Installer @Base } | Should -Throw '*Python 3.11.9*too old*'
         }
 
-        It 'finds Python with the launcher (first working of py -3.12/-3.13/-3.14)' {
-            $bin = Join-Path $FakeWin.Root 'bin'
-            New-FakeBinary -Path (Join-Path $bin 'py.exe')
-            if (-not $IsWindows) { [System.IO.File]::SetUnixFileMode((Join-Path $bin 'py.exe'), [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute') }
-            $env:PATH = $bin
-            Register-FakeExecutable -Path (Join-Path $bin 'py.exe') -Function FakePython
-            $FakeWin.Python.Launcher['-3.13'] = $PythonExe
+        It 'finds the all-users Python in the registry (first installed of 3.12/3.13/3.14) without running a launcher' {
+            # 3.12 is registered, but its files are gone; 3.13 has only the install directory (default value).
+            $FakeWin.Registry['HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath'] = @{ '(default)' = (Join-Path $env:ProgramFiles 'Python312-removed\'); ExecutablePath = (Join-Path $env:ProgramFiles 'Python312-removed\python.exe') }
+            $FakeWin.Registry['HKLM:\SOFTWARE\Python\PythonCore\3.13\InstallPath'] = @{ '(default)' = (Split-Path -Parent $PythonExe) + [System.IO.Path]::DirectorySeparatorChar }
+            $FakeWin.Registry['HKLM:\SOFTWARE\Python\PythonCore\3.14\InstallPath'] = @{ ExecutablePath = (Join-Path $env:ProgramFiles 'Python314\python.exe') }
+            $env:PATH = Join-Path $FakeWin.Root 'empty'
             $p = $Base.Clone(); $p.Remove('PythonExe')
             $run = Invoke-Installer -Path $Installer -Parameters $p
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Match ([regex]::Escape("Python 3.12.10 at $PythonExe"))
-            @(Get-FakeCall 'python' | Where-Object { $_.Args[0] -match '^-3\.' } | ForEach-Object { $_.Args[0] }) | Should -Be @('-3.12', '-3.13')
+            @(Get-FakeCall 'python' | Where-Object { $_.Exe -ne $PythonExe -and $_.Exe -ne $VenvPython }).Count | Should -Be 0
         }
 
-        It 'fails without the launcher and without -PythonExe' {
-            $env:PATH = Join-Path $FakeWin.Root 'empty'
+        It 'fails without -PythonExe when no all-users Python 3.12+ is registered' {
+            $FakeWin.Registry['HKLM:\SOFTWARE\Python\PythonCore\3.11\InstallPath'] = @{ ExecutablePath = $PythonExe }
             $p = $Base.Clone(); $p.Remove('PythonExe')
-            { & $Installer @p } | Should -Throw '*Python launcher (py.exe) not found*'
+            { & $Installer @p } | Should -Throw '*No all-users Python 3.12+ registered*-PythonExe*'
+            (Get-FakeCall 'python').Count | Should -Be 0
+        }
+
+        It 'does not run an interpreter that non-administrators can modify before refusing it (<Source>)' -TestCases @(
+            @{ Source = '-PythonExe' }, @{ Source = 'registry' }
+        ) {
+            # C:\Python312 below the volume root: users may modify site-packages, where a sitecustomize.py or .pth
+            # file runs on every interpreter start.
+            $pyHome = Join-Path $env:SystemDrive 'Python312'
+            $py = Join-Path $pyHome 'python.exe'
+            New-FakeBinary -Path $py
+            Register-FakeExecutable -Path $py -Function FakePython
+            New-Item -ItemType Directory -Path (Join-Path $pyHome 'Lib\site-packages') -Force | Out-Null
+            $p = $Base.Clone(); $p.Remove('PythonExe')
+            if ($Source -eq '-PythonExe') { $p.PythonExe = $py }
+            else { $FakeWin.Registry['HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath'] = @{ '(default)' = "$pyHome\"; ExecutablePath = $py } }
+            { & $Installer @p } | Should -Throw '*can be modified by non-administrators*'
+            (Get-FakeCall 'python').Count | Should -Be 0 -Because 'the elevated installer must not start an untrusted interpreter'
+        }
+
+        It 'runs Python only in isolated mode, the base interpreter probe also without the site module' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $calls = @(Get-FakeCall 'python')
+            $calls.Count | Should -BeGreaterThan 5
+            foreach ($call in $calls) { $call.Options | Should -Contain '-I' -Because ($call.Args -join ' ') }
+            $base = @($calls | Where-Object { $_.Exe -eq $PythonExe })
+            ($base | ForEach-Object { $_.Args[0..1] -join ' ' }) | Should -Be @('-c import sys; print(sys.version_info[0], sys.version_info[1], sys.version_info[2], sep=chr(46))', "-m venv")
+            $base[0].Options | Should -Contain '-S'
         }
     }
 
@@ -380,6 +408,7 @@ Describe 'Install-AegisDataPlane.ps1' {
             (Get-FakeAccess $SpoolDir)['NT SERVICE\AegisDataPlane'] | Should -Be 'M'
             Test-FakeWritable $SpoolDir | Should -BeFalse -Because 'users must not inject traffic records'
             Get-PrincipalList $DataRoot | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544')
+            Get-PrincipalList (Split-Path -Parent $DataRoot) | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544') -Because 'whoever controls %ProgramData%\AegisProxy can replace the data root'
         }
 
         It 'gives the service read/execute access to venv, addon and wrapper' {
@@ -389,18 +418,18 @@ Describe 'Install-AegisDataPlane.ps1' {
             }
         }
 
-        It 'installs pinned mitmproxy and YARA-X (binary wheel) and the security overrides into the venv' {
+        It 'installs the shipped hash-locked requirements from binary wheels only, then checks the baseline and runs pip check' {
             $pip = Get-PipCall
-            $pip.Count | Should -Be 2
+            $pip.Count | Should -Be 1 -Because 'unhashed installs on top (security overrides) would bypass --require-hashes'
             $pip[0].Exe | Should -Be $VenvPython
-            foreach ($arg in @('--require-virtualenv', '--no-input', 'mitmproxy==12.3.0', 'yara-x==1.22.0')) { $pip[0].Args | Should -Contain $arg }
-            $pip[0].Args | Should -Not -Contain '--no-deps' -Because 'without a lock file pip resolves the dependencies'
-            (Get-PipCall 'check').Count | Should -Be 0
-            ($pip[0].Args -join ' ') | Should -Match '--only-binary yara-x'
-            ($pip[1].Args -join ' ') | Should -Match '--no-deps --only-binary=:all: -r '
-            $pip[1].Args[-1] | Should -Be $SecurityRequirements
+            ($pip[0].Args -join ' ') | Should -BeLike "* --require-virtualenv --require-hashes --no-deps --only-binary=:all: -r $LockFile"
+            $pip[0].Args | Should -Not -Contain 'mitmproxy==12.3.0'
+            (Get-PipCall 'check').Count | Should -Be 1
+            @(Get-FakeCall 'python' | Where-Object { $_.Args[0] -eq '-c' -and $_.Args[1] -like 'import re, sys, importlib.metadata*' }).Count | Should -Be 1
+            $FakeWin.Python.Packages['mitmproxy'] | Should -Be '12.3.0'
             $FakeWin.Python.Packages['brotli'] | Should -Be '1.2.1'
             $Run.Output | Should -Match 'YARA-X available'
+            $Run.Output | Should -Not -Match 'without hash pinning'
         }
 
         It 'copies the addon without tests and caches, then byte-compiles and import-checks it' {
@@ -424,11 +453,67 @@ Describe 'Install-AegisDataPlane.ps1' {
     }
 
     Context 'variants' {
-        It 'skips YARA-X with -NoYara' {
+        It 'skips YARA-X with -NoYara: the shipped lock without its yara-x entry, from the admin-only program directory' {
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ NoYara = $true })
             $run.ExitCode | Should -Be 0
-            (Get-PipCall)[0].Args | Should -Not -Contain 'yara-x==1.22.0'
+            $pip = Get-PipCall
+            $pip.Count | Should -Be 1
+            ($pip[0].Args -join ' ') | Should -Match '--require-hashes --no-deps --only-binary=:all: -r '
+            $req = $FakeWin.Python.Requirements[0]
+            $req.Path | Should -Be (Join-Path $InstallDir 'requirements-lock-noyara.txt')
+            Test-Path -LiteralPath $req.Path | Should -BeFalse -Because 'the generated copy is removed after pip ran'
+            $shipped = @(Get-Content -LiteralPath $LockFile)
+            @($req.Lines | Where-Object { $_ -match '^yara' }).Count | Should -Be 0
+            @($shipped | Where-Object { $_ -match '^yara-x==' }).Count | Should -Be 1
+            # Everything else is kept verbatim: the requirement lines of the other packages with all their hash lines.
+            $yaraBlock = @($shipped | Select-String -Pattern '^yara-x==' | ForEach-Object LineNumber)[0]
+            $hashes = 0
+            for ($i = $yaraBlock; $i -lt $shipped.Count -and $shipped[$i] -match '^\s'; $i++) { $hashes++ }
+            $req.Lines.Count | Should -Be ($shipped.Count - 1 - $hashes)
+            $FakeWin.Python.Packages.ContainsKey('yara-x') | Should -BeFalse
+            $FakeWin.Python.Packages['mitmproxy'] | Should -Be '12.3.0'
             $run.Output | Should -Match 'YARA-X is not installed'
+        }
+
+        It 'installs from the package index without hashes only with -AllowUnpinnedPackages, with a supply-chain warning' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ AllowUnpinnedPackages = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Supply chain: -AllowUnpinnedPackages installs mitmproxy and its dependencies from the package index without hash pinning'
+            $pip = Get-PipCall
+            $pip.Count | Should -Be 2
+            foreach ($arg in @('--require-virtualenv', '--no-input', 'mitmproxy==12.3.0', 'yara-x==1.22.0')) { $pip[0].Args | Should -Contain $arg }
+            $pip[0].Args | Should -Not -Contain '--require-hashes'
+            $pip[0].Args | Should -Not -Contain '--no-deps' -Because 'without a lock file pip resolves the dependencies'
+            ($pip[0].Args -join ' ') | Should -Match '--only-binary yara-x'
+            ($pip[1].Args -join ' ') | Should -Match '--no-deps --only-binary=:all: -r '
+            $pip[1].Args[-1] | Should -Be $SecurityRequirements
+            (Get-PipCall 'check').Count | Should -Be 0
+            $FakeWin.Python.Packages['brotli'] | Should -Be '1.2.1'
+            $FakeWin.Python.Requirements.Path | Should -Not -Contain $LockFile
+        }
+
+        It 'skips YARA-X with -NoYara -AllowUnpinnedPackages' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ NoYara = $true; AllowUnpinnedPackages = $true })).ExitCode | Should -Be 0
+            (Get-PipCall)[0].Args | Should -Not -Contain 'yara-x==1.22.0'
+        }
+
+        It 'refuses to install without a lock file unless -AllowUnpinnedPackages, before changing anything' {
+            $source = Join-Path $FakeWin.Root 'source'
+            foreach ($file in @('aegis_addon.py', 'aegis_dp\__init__.py', 'aegis_dp\addon.py')) {
+                New-Item -ItemType File -Path (Join-Path $source $file) -Force | Out-Null
+            }
+            { & $Installer @Base -SourceDir $source } | Should -Throw '*requirements-lock.txt is missing*-RequirementsFile*-AllowUnpinnedPackages*'
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SourceDir = $source; AllowUnpinnedPackages = $true })).ExitCode | Should -Be 0
+        }
+
+        It 'refuses <Case> before changing anything' -TestCases @(
+            @{ Case = 'a missing -RequirementsFile'; Extra = @{ RequirementsFile = 'missing-lock.txt' }; Message = "*-RequirementsFile 'missing-lock.txt' not found*" },
+            @{ Case = '-RequirementsFile with -AllowUnpinnedPackages'; Extra = @{ RequirementsFile = 'lock.txt'; AllowUnpinnedPackages = $true }; Message = '*exclude each other*' }
+        ) {
+            $p = Join-Parameters $Base $Extra
+            { & $Installer @p } | Should -Throw $Message
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
         }
 
         It 'installs only the complete hash-pinned lock (--no-deps) with -RequirementsFile, then runs pip check' {
@@ -499,8 +584,14 @@ Describe 'Install-AegisDataPlane.ps1' {
             (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ RequirementsFile = $req; SourceDir = $source })).ExitCode | Should -Be 0
         }
 
-        It 'appends -PipArgs to both pip runs' {
-            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PipArgs = @('--index-url', 'https://nexus.corp.example/simple') })).ExitCode | Should -Be 0
+        It 'appends -PipArgs to the pip run of the lock file and to both unpinned pip runs' {
+            $pipArgs = @('--index-url', 'https://nexus.corp.example/simple')
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PipArgs = $pipArgs })).ExitCode | Should -Be 0
+            $calls = Get-PipCall
+            $calls.Count | Should -Be 1
+            ($calls[0].Args -join ' ') | Should -Match '--only-binary=:all: -r .+ --index-url https://nexus.corp.example/simple$'
+            $FakeWin.Calls.Clear()
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PipArgs = $pipArgs; AllowUnpinnedPackages = $true })).ExitCode | Should -Be 0
             $calls = Get-PipCall
             $calls.Count | Should -Be 2
             foreach ($call in $calls) { ($call.Args -join ' ') | Should -Match '--index-url https://nexus.corp.example/simple$' }
@@ -583,7 +674,7 @@ Describe 'Install-AegisDataPlane.ps1' {
             # Stands in for any change of the (user-writable) source between the early check and the copy.
             $global:SwapWinSW = $WinSW
             Set-Item -LiteralPath 'Function:\global:FakePythonSwap' -Value {
-                if ($args[0] -eq '-m' -and $args[1] -eq 'pip' -and $args[2] -eq 'install') { [System.IO.File]::WriteAllBytes($global:SwapWinSW, [byte[]](0x4D, 0x5A, 0x21)) }
+                if ($args -contains 'pip' -and $args -contains 'install') { [System.IO.File]::WriteAllBytes($global:SwapWinSW, [byte[]](0x4D, 0x5A, 0x21)) }
                 FakePython @args
             }
             Register-FakeExecutable -Path $VenvPython -Function FakePythonSwap
@@ -750,11 +841,88 @@ Describe 'Install-AegisDataPlane.ps1' {
             @{ Name = 'control-plane CA bundle'; PlantIn = 'SecretsDir'; PlantFile = 'control-plane-ca.pem' },
             @{ Name = 'traffic record spool segment'; PlantIn = 'SpoolDir'; PlantFile = 'seg-000000000001-1.jsonl' }
         ) {
-            # The planter writes the file right after the inspection, before the first icacls call locks the directories.
+            # The planter writes the file right after the inspection, before icacls locks the directories (as soon as the
+            # installer has created the directory; %ProgramData%\AegisProxy is taken over before that).
             $planted = Join-Path (Get-Variable -Name $PlantIn -ValueOnly) $PlantFile
-            $FakeWin.IcaclsHook = { param($a) if (-not [System.IO.File]::Exists($planted)) { [System.IO.File]::WriteAllText($planted, 'planted') } }.GetNewClosure()
+            $FakeWin.IcaclsHook = {
+                param($a)
+                if (-not [System.IO.File]::Exists($planted) -and [System.IO.Directory]::Exists((Split-Path -Parent $planted))) { [System.IO.File]::WriteAllText($planted, 'planted') }
+            }.GetNewClosure()
             { & $Installer @Base } | Should -Throw "*1 file(s) appeared in the installation directories while this script ran*$PlantFile*"
             $FakeWin.Services.Count | Should -Be 0
+        }
+    }
+
+    Context 'parent of the data root' {
+        BeforeEach {
+            $script:DataParent = Split-Path -Parent $DataRoot
+            $script:LocalUser = 'S-1-5-21-111-222-333-1007'
+        }
+
+        It 'takes over a %ProgramData%\AegisProxy that a non-administrator created in advance, before the data root' {
+            New-Item -ItemType Directory -Path $DataParent -Force | Out-Null
+            Set-FakeOwner -Path $DataParent -Sid $LocalUser
+            $FakeWin.Acl[(Get-FakeFullPath $DataParent)] = @{ Protected = $false; Grants = [ordered]@{ "*$LocalUser" = '(OI)(CI)F' } }
+            $run = Invoke-Installer -Path $Installer -Parameters $Base
+            $run.ExitCode | Should -Be 0
+            (Get-Acl -LiteralPath $DataParent).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+            Get-PrincipalList $DataParent | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544')
+            $calls = @(Get-FakeCall 'icacls.exe')
+            $order = @($calls | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $order.IndexOf((Get-FakeFullPath $DataParent)) | Should -Not -Be -1
+            $order.IndexOf((Get-FakeFullPath $DataParent)) | Should -BeLessThan $order.IndexOf((Get-FakeFullPath $DataRoot))
+            @($calls | Where-Object { $_.Args -notcontains '/L' -or $_.Args -contains '/T' }).Count | Should -Be 0
+        }
+
+        It 'treats an installation below a parent that a non-administrator controls as not intact' {
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            $FakeWin.Owner[(Get-FakeFullPath $DataParent)] = $LocalUser
+            { & $Installer @Base } | Should -Throw "*Refusing to adopt*parent directory not controlled by administrators: $DataParent (owner $LocalUser)*"
+            $run =Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ AdoptExistingSecrets = $true })
+            $run.ExitCode | Should -Be 0
+            (Get-Acl -LiteralPath $DataParent).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+        }
+
+        It 'leaves the subdirectories of a control-plane on this host alone' {
+            $certs = Join-Path $DataParent 'certs'
+            New-Item -ItemType Directory -Path $certs -Force | Out-Null
+            $FakeWin.Acl[(Get-FakeFullPath $DataParent)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F' } }
+            $FakeWin.Acl[(Get-FakeFullPath $certs)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-80-1-2-3-4-5' = '(OI)(CI)RX' } }
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            Get-PrincipalList $certs | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-80-1-2-3-4-5')
+            @(Get-FakeCall 'icacls.exe' | Where-Object { (Get-FakeFullPath $_.Args[0]).StartsWith((Get-FakeFullPath $certs)) }).Count | Should -Be 0
+        }
+
+        It 'refuses a junction in place of %ProgramData%\AegisProxy and leaves its target alone' {
+            $target = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $target | Out-Null
+            New-Item -ItemType SymbolicLink -Path $DataParent -Target $target | Out-Null
+            { & $Installer @Base } | Should -Throw "*Junctions/symbolic links*not allowed*$DataParent*"
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $target -Force).Count | Should -Be 0
+        }
+
+        It 'refuses a custom -DataRoot whose parent <Case>, before changing anything' -TestCases @(
+            @{ Case = 'a non-administrator owns'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'lets users delete entries of'; Ace = '(DC)'; Expect = 'Users' }
+        ) {
+            $parent = Join-Path $env:SystemDrive 'AegisData'
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            if ($Owner) { $FakeWin.Owner[(Get-FakeFullPath $parent)] = $Owner }
+            else { $FakeWin.Acl[(Get-FakeFullPath $parent)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-32-545' = $Ace } } }
+            $p = Join-Parameters $Base @{ DataRoot = (Join-Path $parent 'data-plane') }
+            { & $Installer @p } | Should -Throw "*parent directory of -DataRoot can be modified by non-administrators*$parent ($Expect)*"
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $parent 'data-plane') | Should -BeFalse
+        }
+
+        It 'accepts a custom -DataRoot below a parent that administrators control and leaves that parent as it is' {
+            $parent = Join-Path $env:SystemDrive 'AegisData'
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            $p = Join-Parameters $Base @{ DataRoot = (Join-Path $parent 'data-plane') }
+            (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
+            @(Get-FakeCall 'icacls.exe' | Where-Object { (Get-FakeFullPath $_.Args[0]) -eq (Get-FakeFullPath $parent) }).Count | Should -Be 0
+            Test-Path -LiteralPath (Split-Path -Parent $DataRoot) | Should -BeFalse -Because '%ProgramData%\AegisProxy is not used'
         }
     }
 

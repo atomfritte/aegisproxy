@@ -197,7 +197,8 @@ set, 2 MiB in total, 100 sets; `include` statements are not supported (paste the
 
 Engine: **YARA-X** (VirusTotal's Rust re-implementation and the official successor of YARA), falling back to
 `yara-python`. The data-plane image contains YARA-X, and the Linux and Windows installers install it
-(`yara-x==1.22.0` binary wheel) unless `--no-yara` / `-NoYara` is given; with a hash-pinned requirements file
+(`yara-x==1.22.0` binary wheel from the hash-locked `data-plane/requirements-lock.txt`) unless `--no-yara` /
+`-NoYara` is given (the lock is then installed without its `yara-x` entry); with your own requirements file
 (`--requirements` / `-RequirementsFile`) add `yara-x` to it. Without an engine the status is `unavailable`.
 
 Every rule set is compiled on its own: the console rejects structural errors (missing name or condition,

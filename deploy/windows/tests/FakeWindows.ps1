@@ -50,7 +50,7 @@ function Initialize-FakeWindows {
         BinaryVersion = '2.1.0-test'
         VersionHangs  = $false
         VersionKilled = $false
-        Python        = @{ Version = '3.12.10'; Packages = @{}; Launcher = @{}; VenvsCreated = 0; PipCheck = @() }
+        Python        = @{ Version = '3.12.10'; Packages = @{}; VenvsCreated = 0; PipCheck = @(); Requirements = @() }
         Iis           = @{ AppPools = @{}; Sites = @{}; Features = @(); Config = @{} }
         RewriteDll    = $true
         RewriteReg    = $null
@@ -400,16 +400,15 @@ function Initialize-FakeWindows {
     }
 
     function global:FakePython {
-        # python.exe / py.exe double: version probes, venv creation, pip, compileall and the import checks.
+        # python.exe double: version probe, venv creation, pip, compileall and the import checks. Leading interpreter
+        # options (-I, -S, -E, ...) are recorded as Options; Args holds the rest of the command line.
         $a = @($args)
+        $options = @()
+        while ($a.Count -and $a[0] -cmatch '^-[BEIOPSsuv]$') { $options += $a[0]; $a = @($a | Select-Object -Skip 1) }
         $self = $global:FakeWin.InvokedExe
-        $global:FakeWin.Calls.Add([pscustomobject]@{ Command = 'python'; Exe = $self; Args = $a })
+        $global:FakeWin.Calls.Add([pscustomobject]@{ Command = 'python'; Exe = $self; Options = $options; Args = $a })
         $py = $global:FakeWin.Python
         $global:LASTEXITCODE = 0
-        if ($a[0] -match '^-3\.\d+$') {
-            if ($py.Launcher.ContainsKey($a[0])) { $py.Launcher[$a[0]] } else { "No suitable Python runtime found"; $global:LASTEXITCODE = 103 }
-            return
-        }
         if ($a[0] -eq '-m' -and $a[1] -eq 'venv') {
             $scripts = Join-Path $a[2] 'Scripts'
             New-Item -ItemType Directory -Path $scripts -Force | Out-Null
@@ -426,6 +425,8 @@ function Initialize-FakeWindows {
             $scripts = Split-Path -Parent $self
             for ($i = 2; $i -lt $a.Count; $i++) {
                 if ($a[$i] -eq '-r') {
+                    # Kept for the tests: the installer may delete a requirements file it generated.
+                    $py.Requirements += [pscustomobject]@{ Path = $a[$i + 1]; Lines = @(Get-Content -LiteralPath $a[$i + 1]) }
                     foreach ($line in Get-Content -LiteralPath $a[$i + 1]) {
                         if ($line -match '^\s*(?<n>[A-Za-z0-9._-]+)==(?<v>[0-9][^\s;]*)') { $py.Packages[$Matches['n'].ToLowerInvariant()] = $Matches['v'] }
                     }

@@ -104,7 +104,7 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 > **Do not use mitmproxy's Windows installer / PyInstaller binaries.** The bundled executables do not
 > necessarily contain every standard-library module the addon imports (`http.server`, `hmac`, `gzip`, ...).
 > The data-plane script creates a virtual environment from the python.org interpreter and installs
-> `mitmproxy==12.3.0` with pip. The Microsoft Store Python and per-user installations (`C:\Users\...`) are
+> mitmproxy 12.3.0 with pip from the hash-locked `data-plane\requirements-lock.txt`. The Microsoft Store Python and per-user installations (`C:\Users\...`) are
 > rejected because the service account cannot read them. The interpreter must also be writable by nobody but
 > SYSTEM, Administrators, TrustedInstaller and the data-plane service (an allowlist: any other user or group,
 > e.g. Users, Power Users, Remote Desktop Users, a domain group or a single account, counts). Checked are the
@@ -112,8 +112,14 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 > `DLLs`, `Lib\site-packages`, the `*.dll` and `*._pth` files next to `python.exe`, and `*.pth`,
 > `sitecustomize.py` and `usercustomize.py` in `Lib` and `site-packages`; for the directory above the Python
 > directory, its owner and whether others may delete or rename its entries or change its ACL. Code planted there
-> (`python3XX.dll`, `Lib\sitecustomize.py`, a `.pth` file, a replaced Python directory) would run in the service.
-> `-AllowWritablePython` overrides this check (not recommended).
+> (`python3XX.dll`, `Lib\sitecustomize.py`, a `.pth` file, a replaced Python directory) would run in the service -
+> and in the elevated installer the moment it starts the interpreter. The script therefore checks these ACLs before
+> it runs Python for the first time: the interpreter comes from `-PythonExe` or from the registration of the
+> all-users installation (`HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath`, then 3.13 and 3.14 - PEP 514, the keys
+> `py -3.12` reads; neither the launcher nor the interpreter is run to find it). Every run of Python by the script
+> uses isolated mode (`-I`: no `PYTHON*` variables, no user site-packages, neither the current directory nor the
+> script directory on `sys.path`); the version probe of the base interpreter also skips the `site` module (`-S`).
+> `-AllowWritablePython` overrides the ACL check (not recommended).
 
 Copy a deployment package to the target host, for example:
 
@@ -319,17 +325,28 @@ and `C:\ProgramData\AegisProxy\certs\mitmproxy-ca.pem` is restricted to SYSTEM/A
 
 The script:
 
-1. Verifies WinSW against `-WinSWSha256`, resolves Python (`py -3.12`, then 3.13/3.14, or `-PythonExe`) and refuses
-   an interpreter that non-administrators can modify (section 2), creates
-   `C:\Program Files\AegisProxy\data-plane\venv` (the program directory gets its own ACL: SYSTEM/Administrators
-   full control, Users and the service read/execute) and installs `mitmproxy==12.3.0`, `yara-x==1.22.0` and the
-   security overrides of `data-plane\requirements-security.txt`, then verifies that `http.server`, `hmac`,
-   `gzip`, `ssl` and the addon import correctly. Existing program and data directories are taken over like on the
-   control-plane (top-down, owner Administrators, foreign ACEs removed, links and hard-linked files refused, files
-   planted during the run refused, ACLs verified after the installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
+1. Verifies WinSW against `-WinSWSha256`, resolves Python (`-PythonExe`, or the all-users installation of 3.12,
+   then 3.13/3.14 registered in HKLM) and refuses an interpreter that non-administrators can modify before running
+   it (section 2), creates `C:\Program Files\AegisProxy\data-plane\venv` (the program directory gets its own ACL:
+   SYSTEM/Administrators full control, Users and the service read/execute) and installs the hash-locked
+   `data-plane\requirements-lock.txt` (mitmproxy 12.3.0, YARA-X 1.22.0 and every dependency, see *Packages* below),
+   then verifies that `http.server`, `hmac`, `gzip`, `ssl` and the addon import correctly. Existing program and
+   data directories are taken over like on the control-plane (top-down, owner Administrators, foreign ACEs removed,
+   links and hard-linked files refused, files planted during the run refused, ACLs verified after the
+   installation); on a first installation, pre-existing files there - a staged CA, a control-plane CA bundle, a
    `confdir\config.yaml` (mitmdump options and scripts), a prepared venv or .NET extraction cache, spooled
    traffic records (they would be uploaded as this worker's records) - are refused unless `-AdoptExistingSecrets`
    is given. Logs are kept either way.
+
+   **Parent of the data root.** Every user may create `C:\ProgramData\AegisProxy` on a worker host without a
+   control-plane, and its owner could later rename `data-plane` below it and put a junction in its place. The
+   script therefore takes `C:\ProgramData\AegisProxy` over first (owner Administrators, protected ACL with
+   SYSTEM/Administrators full control - the same ACL the control-plane installer sets there; only the directory
+   itself, so a control-plane on the same host keeps the ACLs of `data`, `certs`, `secrets` and `logs`), refuses it
+   if it is a junction or symbolic link, and verifies its ACL after the installation. If a non-administrator owns
+   it or may delete its entries, change its ACL or take ownership of it, an existing installation counts as not
+   intact (pre-existing files need `-AdoptExistingSecrets`). For a custom `-DataRoot`, the parent directory is
+   not changed: the installation stops before any change if a non-administrator owns it or has one of these rights.
 2. Copies `aegis_addon.py` and `aegis_dp\` to `...\data-plane\app` (byte-compiled; the program directory is
    read-only for the service).
 3. Stages the key (`C:\ProgramData\AegisProxy\data-plane\secrets\dataplane.key`, read-only for the service) and
@@ -357,9 +374,9 @@ services). The worker never needs LocalSystem.
 Further parameters: `-ListenPort` (8080), `-ListenHost` (0.0.0.0), `-OpsAddr` (127.0.0.1:9091),
 `-FailMode` (closed), `-PolicyMaxAge` (`10m`: `AEGIS_POLICY_MAX_AGE`, the worker fails closed once its last policy
 sync is older; at least 30 s, `''` or `0` = no limit), `-WorkerId`, `-PublicUrl`/`-DashboardUrl` (block-page fallbacks), `-ExtraEnvironment`,
-`-PipArgs`/`-RequirementsFile` (offline, hash-pinned installation from an internal wheel share - recommended
-for production; see below), `-WinSWSha256` (hash of a different WinSW build), `-NoYara` (do not install
-the YARA-X engine, which is otherwise installed as `yara-x==1.22.0` binary wheel), `-RecreateVenv`,
+`-PipArgs` (e.g. an internal index or an offline wheel share), `-RequirementsFile` / `-AllowUnpinnedPackages`
+(see below), `-WinSWSha256` (hash of a different WinSW build), `-NoYara` (do not install the YARA-X engine: the
+shipped lock is installed without its `yara-x` entry), `-RecreateVenv`,
 `-AllowWritablePython`, `-AllowUnencryptedImport`, `-AdoptExistingSecrets` (see above), `-Uninstall` (removes
 service, rules, program files, the staged key/CA copies and records still in the spool - links inside are removed
 as links, their targets are never touched; keeps logs). `-ExtraEnvironment` refuses the variables the template or a
@@ -367,9 +384,22 @@ dedicated parameter sets (`CONTROL_PLANE_URL`, `AEGIS_DATAPLANE_KEY[_FILE]`, `AE
 `AEGIS_POLICY_MAX_AGE`, `AEGIS_FLOW_SPOOL_DIR`, ...); the spool size limit is `AEGIS_FLOW_SPOOL_MAX` (default `256m`)
 through `-ExtraEnvironment`.
 
-**Hash-pinned installation.** `-RequirementsFile` takes a complete lock file with hashes for every package,
-including `yara-x` and the security baseline. Generate it on a build host with uv, whose `--override` raises
-Brotli above mitmproxy's declared upper bound:
+**Packages (hash-pinned by default).** Like `install-linux.sh`, the script installs the shipped
+`data-plane\requirements-lock.txt` - a universal lock with Windows markers that pins mitmproxy, YARA-X and every
+transitive dependency by SHA-256 - with `pip install --require-hashes --no-deps --only-binary=:all:` (binary
+wheels only, no source build runs as Administrator). Nothing is installed on top of it without hashes: the script
+aborts if a package is below the baseline of `requirements-security.txt` (compared by the venv's Python with
+`packaging`, PEP 440: `1.2.1rc1` is below `1.2.1`, an unparseable version fails the check), and aborts if
+`pip check` reports anything other than these deliberate overrides (an incomplete lock file). If the lock file is
+missing next to the sources, the installation stops before any change. A package index or mirror can still make the
+installation fail, but no longer choose the code: a wheel whose hash is not in the lock is rejected. For an
+offline installation pass `-PipArgs '--no-index','--find-links','\\fs\aegis\wheels'` with a wheel share that holds
+the locked versions.
+
+`-RequirementsFile` replaces the shipped lock with your own complete lock file with hashes for every package,
+including `yara-x` and the security baseline (checked the same way, installed with `--require-hashes --no-deps`;
+`-NoYara` does not edit it). Generate it on a build host with uv, whose `--override` raises Brotli above
+mitmproxy's declared upper bound:
 
 ```powershell
 'mitmproxy==12.3.0', 'yara-x==1.22.0' | Set-Content requirements.in
@@ -377,10 +407,10 @@ uv pip compile --python-version 3.12 --python-platform x86_64-pc-windows-msvc --
     --override data-plane\requirements-security.txt requirements.in -o requirements-win.txt
 ```
 
-The script installs it with `--require-hashes --no-deps`, aborts if a package is below the baseline of
-`requirements-security.txt` (compared by the venv's Python with `packaging`, PEP 440: `1.2.1rc1` is below
-`1.2.1`, an unparseable version fails the check), and aborts if `pip check` reports anything other than these
-deliberate overrides (an incomplete lock file).
+`-AllowUnpinnedPackages` restores the unpinned installation of earlier releases (`mitmproxy==12.3.0`,
+`yara-x==1.22.0` and `requirements-security.txt`, dependencies resolved by pip from the index, no hashes) and prints
+a supply-chain warning: whoever controls the index, a mirror or the path to it then decides which code runs in the
+service. Not recommended; it cannot be combined with `-RequirementsFile`.
 
 Manage the worker with `Get-Service AegisDataPlane | Restart-Service` or
 `& 'C:\Program Files\AegisProxy\data-plane\aegis-dataplane.exe' status`. Logs (rolled by size, 20 MB × 10):
@@ -580,7 +610,7 @@ systemd drop-ins). Details: [`linux.md`](linux.md#10-rolling-out-the-ca-and-prox
 | Control-plane | Build the new `aegis-control-plane.exe`, re-run `Install-AegisControlPlane.ps1 -BinaryPath <new> -PublicUrl <same>`. The service stops, the binary is replaced, secrets/state/config are kept. Workers keep enforcing during the restart |
 | Console | Rebuild `frontend\dist`; re-run with `-UiDir` (control-plane) or re-run `Install-AegisConsole-IIS.ps1` |
 | Data-plane addon | Re-run `Install-AegisDataPlane.ps1` with the new `data-plane` folder |
-| mitmproxy / Python | Update the pinned version (or `-RequirementsFile`), re-run with `-RecreateVenv`; a new Python minor version recreates the venv automatically |
+| mitmproxy / Python | Deploy a release with the updated `data-plane\requirements-lock.txt` (or pass your own `-RequirementsFile`), re-run with `-RecreateVenv`; a new Python minor version recreates the venv automatically |
 | Cluster | One node at a time; wait for `/readyz` on the upgraded node before the next one. Upgrade the control-plane before the workers |
 
 Check `aegis-control-plane.exe version`, `GET /api/public/meta` (field `version`) and `aegis_build_info` on `/metrics`.
@@ -674,6 +704,9 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share (any spelling: `//host/share`, `\\?\UNC\...`, mapped drive) | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
 | Installer: `... is a device path` | a source path like `\\?\GLOBALROOT\...` or `\\?\Volume{...}\...` | Pass a drive-letter or UNC path |
 | Installer: `Junctions/symbolic links and hard-linked files are not allowed`, `Junction/symbolic link in the installation directories`, `... has further hard links` | a link or a hard-linked file in a directory that existed before (ACL changes and deletions would reach the file elsewhere) | Remove the listed entries (`Remove-Item` on the link itself; `fsutil hardlink list <file>` shows the other names of a hard-linked file) and re-run |
+| Installer: `No all-users Python 3.12+ registered` | Python installed per user, by a tool that does not write the PEP 514 keys, or 32-bit only | Install python.org Python 3.12 (64-bit) with `InstallAllUsers=1`, or pass `-PythonExe 'C:\Program Files\Python312\python.exe'` |
+| Installer: `...\requirements-lock.txt is missing` | the deployment package lacks `data-plane\requirements-lock.txt` (or `-SourceDir` points elsewhere) | Copy the complete `data-plane` folder of the release, or pass your own `-RequirementsFile` |
+| Installer: `The parent directory of -DataRoot can be modified by non-administrators` | the directory above a custom `-DataRoot` is owned by another account, or others may delete its entries / change its ACL | Choose a `-DataRoot` below a directory that only administrators control, or fix the listed owner/ACEs (`icacls <path> /setowner *S-1-5-32-544 /L`, `icacls <path> /remove <account>`) |
 | Installer: `N file(s) appeared in the installation directories while this script ran` | someone who could still write to a pre-existing directory added files between the inspection and the lock-down | Find out where they come from, delete them and re-run; the directories are locked now, so a re-run is not raced |
 
 Run the control-plane in the foreground with its service environment (stop the service first):
@@ -704,7 +737,8 @@ Remove-Item Env:AEGIS_LOG_FILE
       balancers; ops/metrics ports only from monitoring; Public profile closed.
 - [ ] `AEGIS_TRUSTED_PROXIES` lists exactly the reverse proxies/load balancers.
 - [ ] `/metrics` protected by `AEGIS_METRICS_TOKEN` or network ACLs.
-- [ ] Data-plane installed from a hash-pinned, internally mirrored package set; WinSW binary verified.
+- [ ] Data-plane installed from the hash-pinned lock (default; no `-AllowUnpinnedPackages`), ideally from an internal
+      wheel mirror; WinSW binary verified.
 - [ ] `AEGIS_FAIL_MODE=closed`; Protection Policy reviewed (threat intel `block`, AV `block`,
       `block_private_destinations`, `block_raw_tcp`, `allowed_ports`).
 - [ ] ClamAV signatures update automatically; `StreamMaxLength` aligned with `av_max_scan_bytes`.
