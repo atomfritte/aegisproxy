@@ -1,12 +1,34 @@
+# Build context of the all-in-one image (Dockerfile at the repository root): it uses frontend/ and control-plane/
+# only, so everything else (.claude/, deploy/, docs/, data-plane/, local runtime state) stays out. The patterns
+# below apply at every depth: a git-ignored file (bytecode, an env file, a key, a build output) does not show in
+# `git status`, yet would otherwise be sent to the builder and could end up in the image.
+*
+!frontend
+!control-plane
+**/.git
 **/node_modules
 **/dist
-**/.git
+**/.vite
 **/__pycache__
 **/*.pyc
+**/*.pyo
+**/.env*
+**/secrets
+**/certs
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.log
+**/*_test.go
+**/testdata
+**/*.test
+**/*.exe
+**/*.syso
+**/.idea
+**/.vscode
+**/*.swp
 control-plane/aegis-control-plane
 control-plane/data
-certs
-.env
-*.log
-deploy
-docs
+frontend/e2e

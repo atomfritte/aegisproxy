@@ -93,7 +93,7 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 |---|---|
 | OS | Windows Server 2019, 2022 or 2025 (2016 works), x64, domain-joined recommended |
 | Shell | Windows PowerShell 5.1 or PowerShell 7, elevated ("Run as administrator") |
-| Control-plane binary | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane.exe .` |
+| Control-plane binary | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane.exe .` Go ≥ 1.27.3, the `go` line of `control-plane/go.mod` (the Go of the release images); an older `go` downloads that toolchain (checksum-verified, default `GOTOOLCHAIN=auto`) or refuses to build with `GOTOOLCHAIN=local` |
 | Web console | `npm --prefix frontend ci` and `npm --prefix frontend run build` → `frontend\dist` |
 | Python (workers) | **python.org CPython 3.12+ (64-bit), installed "for all users" into `C:\Program Files\Python312`** (the default of `InstallAllUsers=1`). Silent: `python-3.12.x-amd64.exe /quiet InstallAllUsers=1 Include_launcher=1 InstallLauncherAllUsers=1 PrependPath=0`. Chocolatey: `choco install python312 --params "/InstallDir:'C:\Program Files\Python312'"` (its default `C:\Python312` lets users create files there) |
 | WinSW (workers) | `WinSW-x64.exe` from a 2.x release on <https://github.com/winsw/winsw/releases> (MIT). It is never downloaded by the scripts; the data-plane script verifies it against `-WinSWSha256` (default: WinSW 2.12.0 x64, `05B82D46…3A0DA`) and aborts on a mismatch before changing anything |
@@ -530,21 +530,34 @@ file is trusted machine-wide via `NODE_EXTRA_CA_CERTS`), configures Node.js/Git 
 the WinHTTP and machine-wide proxy:
 
 Never pipe the installer into `iex`: download it, compare its SHA-256 with the value the console shows under
-**TLS & CA** (also `windows_script_sha256` of `GET /api/public/ca/info`), then run it (elevated):
+**TLS & CA** (also `windows_script_sha256` of `GET /api/public/ca/info`), then run exactly the checked bytes
+(elevated). The console's one-liner (`windows_command`) does the same; never download the script under a fixed
+name into a shared directory such as `C:\Windows\Temp`, where another local user could swap it in between:
 
 ```powershell
 $env:AEGIS_PROXY = 'aegis-proxy.corp.example:8080'
-$f = Join-Path $env:TEMP 'aegis-ca-install.ps1'
-iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 -OutFile $f
-if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch' }
-powershell -NoProfile -ExecutionPolicy Bypass -File $f
+& {   # in memory, then into a new random-named directory: the bytes that are checked are the bytes that run
+  $ErrorActionPreference = 'Stop'
+  $b = (Invoke-WebRequest -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1).RawContentStream.ToArray()
+  $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-', '')
+  if ($h -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch, not running it' }
+  $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid()))
+  try {
+    $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+    $s = [IO.File]::Open($f, 'CreateNew', 'Write', 'None'); try { $s.Write($b, 0, $b.Length) } finally { $s.Close() }
+    powershell -NoProfile -ExecutionPolicy Bypass -File $f
+  } finally { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
+}
 ```
 
 ### Linux servers
 
 ```bash
-curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh     # CA trust (pinned)
-echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
+# CA trust (pinned): linux_command from the console, or
+d=$(mktemp -d)   # private directory: the file that is checked is the file that runs
+curl -fsSLo "$d/aegis-ca-install.sh" https://aegis.corp.example/api/public/ca/install-linux.sh
+echo "<linux_script_sha256 from the console>  $d/aegis-ca-install.sh" | sha256sum -c - && sudo bash "$d/aegis-ca-install.sh"
+rm -rf "$d"
 sudo tee -a /etc/environment <<'EOF'
 http_proxy=http://aegis-proxy.corp.example:8080
 https_proxy=http://aegis-proxy.corp.example:8080
@@ -712,8 +725,9 @@ The CI job `windows` (`.github/workflows/ci.yml`) runs on every push on Windows 
 3. installs Python for all users into `C:\Program Files\Python312` and WinSW 2.12.0 (pinned SHA-256), then both
    services, checks the event log source and the `service` ImagePath, and runs the log rotation task once as
    `NT SERVICE\AegisControlPlane` (result 0, archive created);
-4. rolls out the enterprise CA the documented way (downloads `install-windows.ps1`, compares its SHA-256 with
-   `windows_script_sha256` of `/api/public/ca/info`, runs it with `-File`), registers the runner as a server, publishes a policy
+4. rolls out the enterprise CA with the console's `windows_command` in Windows PowerShell 5.1 (download into
+   memory, SHA-256 against `windows_script_sha256`, written with `CreateNew` into a new random-named directory,
+   run with `-File`; the same command with a wrong hash must be refused), registers the runner as a server, publishes a policy
    set and checks an allowed HTTPS request (200), a denied one (403), the worker heartbeat and the recorded flow;
 5. grows the audit trail past the (CI) rotation size of 1 MB, checks the rotated and compressed generations and
    verifies the complete hash chain across them;

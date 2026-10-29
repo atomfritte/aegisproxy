@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"aegisproxy/control-plane/internal/auth"
+	"aegisproxy/control-plane/internal/blockpage"
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
 	"aegisproxy/control-plane/internal/store"
@@ -567,11 +568,9 @@ func renderCLIBlock(publicURL, dashboardURL string, res engine.EvaluationResult,
 %s
  🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER (compare the installer's SHA-256 with
     the AegisProxy console, TLS & CA, before running it):
-    curl -fsSLo aegis-ca-install.sh %s/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
-    sudo bash aegis-ca-install.sh
-================================================================================`,
+%s================================================================================`,
 		status, res.ServerHostname, serverIP, strings.Join(res.GroupIDs, ", "), method, fullURL, traceID,
-		res.Verdict, reason, selfService, publicURL)
+		res.Verdict, reason, selfService, blockpage.CLICAInstallSteps(publicURL))
 }
 
 // authFailedHelp is the data-plane's AUTH_FAILED_HELP (data-plane/aegis_dp/blockpage.py).

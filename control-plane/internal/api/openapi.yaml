@@ -6081,10 +6081,10 @@ components:
           description: SHA-256 (hex) of the Windows installer as served by this deployment.
         linux_command:
           type: string
-          description: Copy-paste command that downloads the Linux installer, verifies `linux_script_sha256` (`sha256sum -c`) and only then runs it with sudo.
+          description: Copy-paste command that downloads the Linux installer into a fresh private directory (`mktemp -d`), verifies `linux_script_sha256` (`sha256sum -c`) and only then runs exactly that file with sudo.
         windows_command:
           type: string
-          description: Copy-paste command for an elevated PowerShell that downloads the Windows installer to `%TEMP%`, verifies `windows_script_sha256` (`Get-FileHash`) and only then runs it.
+          description: Copy-paste command for an elevated PowerShell that downloads the Windows installer into memory, verifies `windows_script_sha256`, writes exactly those bytes into a new random-named directory under `%TEMP%` (`CreateNew`) and only then runs that file with `-File`.
     PublicAccessRequestInput:
       type: object
       required: [reason]

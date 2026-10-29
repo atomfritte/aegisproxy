@@ -78,7 +78,7 @@ All configuration variables are documented in [`docs/configuration.md`](../confi
 | Distribution | Debian 12/13, Ubuntu 22.04/24.04, RHEL/Rocky/AlmaLinux 9/10 (x86_64 or arm64) |
 | systemd | **≥ 248** (`LoadCredential=` + `%d`). RHEL 8 (systemd 239) is not supported natively - use the container images there |
 | Python (workers) | **≥ 3.12** with `venv`: Ubuntu 24.04 / Debian 13 (`python3`, `python3-venv`), RHEL/Rocky 9 (`dnf install python3.12`). Debian 12 and Ubuntu 22.04 ship older versions: use a vendor/backport build and `--python`, or the container image |
-| Control-plane binary | `CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane .` (`GOARCH=arm64` for ARM) |
+| Control-plane binary | `CGO_ENABLED=0 go -C control-plane build -trimpath -ldflags "-s -w -X main.Version=2.1.0" -o aegis-control-plane .` (`GOARCH=arm64` for ARM). Go ≥ 1.27.3, the `go` line of `control-plane/go.mod` (the Go of the release images); an older `go` downloads that toolchain (checksum-verified, default `GOTOOLCHAIN=auto`) or refuses to build with `GOTOOLCHAIN=local` |
 | Console | `npm --prefix frontend ci && npm --prefix frontend run build` → `frontend/dist` |
 | Network | outbound access to PyPI (or an internal mirror) during installation; the port matrix above |
 | Sizing (starting point) | control-plane 2 vCPU / 4 GB; worker 4 vCPU / 8 GB; measure with `/metrics` |
@@ -373,13 +373,17 @@ networks. Load balancers in front of workers must not SNAT client traffic unless
 
 Verify the CA fingerprint printed by the installer (also `https://aegis.corp.example/api/public/ca/info`)
 through a second channel. Never pipe the installers into a shell: the console (**TLS & CA**) shows
-one-liners that check the downloaded script against its SHA-256 before running it.
+one-liners that check the downloaded script against its SHA-256 before running it. Download into a fresh
+private directory (`mktemp -d`), never under a fixed name into the current or a shared directory, so the file
+that is checked is the file that runs.
 
 **Linux servers**
 
 ```bash
-curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh
-echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
+d=$(mktemp -d)   # private directory: the file that is checked is the file that runs
+curl -fsSLo "$d/aegis-ca-install.sh" https://aegis.corp.example/api/public/ca/install-linux.sh
+echo "<linux_script_sha256 from the console>  $d/aegis-ca-install.sh" | sha256sum -c - && sudo bash "$d/aegis-ca-install.sh"
+rm -rf "$d"
 ```
 
 The script pins the CA fingerprint (it requires `curl` and `openssl`), refuses a download that holds more than

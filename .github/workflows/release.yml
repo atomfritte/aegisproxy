@@ -1,6 +1,8 @@
 # Signed, attested release images (tags v*): GHCR, SBOM attached as attestation, cosign keyless signing.
 # Nothing is published unless the tag matches the product version and every CI gate (ci.yml) passes for the
-# tagged commit.
+# tagged commit. The jobs that push, sign and release run in the "release" environment: its required
+# reviewers, the tag ruleset on refs/tags/v* and branch protection are the actual controls (a writer can edit
+# this file on a branch and push a tag); SECURITY.md, "Repository settings required for release integrity".
 name: release
 on:
   push:
@@ -42,6 +44,7 @@ jobs:
   publish:
     needs: [version, verify]
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: read
       packages: write
@@ -64,6 +67,38 @@ jobs:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      # A published release tag is never moved to another digest (a second run for the same tag, or a re-run after a
+      # partial publish: delete the partial package version first). This catches mistakes only: anyone who can push
+      # a tag can also edit this check away, so the control is the tag ruleset on refs/tags/v* plus the reviewers
+      # of the release environment. 401/403 (token or manifest) mean the package does not exist yet (GHCR answers
+      # 403 for a package nobody can read): the same token pushes below, and a token that can push to an existing
+      # package can also read it. Anything else that is not a clear answer fails the job.
+      - name: image tag not yet published
+        env:
+          IMAGE: ${{ github.repository_owner }}/aegisproxy-${{ matrix.name }}
+          TAG: ${{ github.ref_name }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo=$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          status=$(curl -sS -o "$RUNNER_TEMP/token.json" -w '%{http_code}' -u "$REGISTRY_USER:$REGISTRY_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull")
+          case "$status" in
+            200) ;;
+            401|403) echo "ghcr.io/$repo does not exist yet (token HTTP $status)"; exit 0 ;;
+            *) echo "::error::ghcr.io token request failed (HTTP $status)"; exit 1 ;;
+          esac
+          token=$(jq -er .token "$RUNNER_TEMP/token.json")
+          rm -f "$RUNNER_TEMP/token.json"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repo/manifests/$TAG")
+          case "$code" in
+            404|401|403) echo "ghcr.io/$repo:$TAG is not published yet (HTTP $code)" ;;
+            200) echo "::error::ghcr.io/$repo:$TAG already exists; a release tag is never overwritten"; exit 1 ;;
+            *) echo "::error::cannot tell whether ghcr.io/$repo:$TAG exists (HTTP $code)"; exit 1 ;;
+          esac
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -74,6 +109,17 @@ jobs:
           sbom: true
           build-args: VERSION=${{ github.ref_name }}
           tags: ghcr.io/${{ github.repository_owner }}/aegisproxy-${{ matrix.name }}:${{ github.ref_name }}
+      # The pushed digest itself (not a rebuild) is scanned before it is signed: an image that fails stays unsigned,
+      # and deployments that verify the signature (SECURITY.md) refuse it. Same pinned scanner as ci.yml.
+      - name: vulnerability scan of the pushed digest (fails on fixable critical/high)
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          REF: ghcr.io/${{ github.repository_owner }}/aegisproxy-${{ matrix.name }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD "$TRIVY_IMAGE" \
+            image --image-src remote --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "$REF"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: sign
         run: cosign sign --yes ghcr.io/${{ github.repository_owner }}/aegisproxy-${{ matrix.name }}@${{ steps.build.outputs.digest }}
@@ -82,3 +128,87 @@ jobs:
           subject-name: ghcr.io/${{ github.repository_owner }}/aegisproxy-${{ matrix.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+  # Release assets: the digest of every published image, each verified with exactly the commands SECURITY.md
+  # documents (signer = this workflow at this tag), and the Helm chart packaged with those digests pinned. Both
+  # files are attested by this workflow and attached to the GitHub release.
+  assets:
+    needs: publish
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write      # create the GitHub release
+      packages: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - name: image digests (each verified against this workflow's signature and provenance)
+        id: digests
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="aegisproxy-$TAG-image-digests.txt"
+          : > "$out"
+          for name in control-plane control-plane-api data-plane console; do
+            img="ghcr.io/$OWNER/aegisproxy-$name"
+            digest=$(docker buildx imagetools inspect "$img:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then echo "::error::no digest for $img:$TAG"; exit 1; fi
+            cosign verify "$img@$digest" \
+              --certificate-identity "https://github.com/$REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            gh attestation verify "oci://$img@$digest" --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/release.yml" --source-ref "refs/tags/$TAG" > /dev/null
+            echo "$img@$digest" >> "$out"
+            echo "${name//-/_}=$digest" >> "$GITHUB_OUTPUT"
+          done
+          cat "$out"
+      - name: Helm chart with the image digests pinned
+        env:
+          TAG: ${{ github.ref_name }}
+          CONTROL_PLANE: ${{ steps.digests.outputs.control_plane }}
+          CONSOLE: ${{ steps.digests.outputs.console }}
+          DATA_PLANE: ${{ steps.digests.outputs.data_plane }}
+        run: |
+          set -euo pipefail
+          chart="$RUNNER_TEMP/chart/aegisproxy"
+          mkdir -p "$RUNNER_TEMP/chart" && cp -r deploy/helm/aegisproxy "$chart"
+          # The first 'digest: ""' of each image block (controlPlane.image, console.image, dataPlane.image).
+          awk -v cp="$CONTROL_PLANE" -v console="$CONSOLE" -v dp="$DATA_PLANE" '
+            /^[A-Za-z]/ { section = $1 }
+            /^    digest: ""/ && !(section in done) {
+              d = section == "controlPlane:" ? cp : section == "console:" ? console : section == "dataPlane:" ? dp : ""
+              if (d != "") { sub(/digest: ""/, "digest: \"" d "\""); done[section] = 1 }
+            }
+            { print }' deploy/helm/aegisproxy/values.yaml > "$chart/values.yaml"
+          helm package "$chart" --version "${TAG#v}" --app-version "${TAG#v}" --destination .
+          helm template t "aegisproxy-${TAG#v}.tgz" --set storage.postgres.url=postgres://u:p@db/aegis --set console.enabled=true \
+            --set 'networkPolicy.proxyClientCIDRs={10.0.0.0/8}' > rendered.yaml
+          for d in "$CONTROL_PLANE" "$CONSOLE" "$DATA_PLANE"; do
+            grep -q "aegisproxy-[a-z-]*:$TAG@$d" rendered.yaml || { echo "::error::$d is not pinned in the packaged chart"; exit 1; }
+          done
+          if grep -E 'image: .*aegisproxy-' rendered.yaml | grep -v '@sha256:'; then echo "::error::unpinned AegisProxy image in the packaged chart"; exit 1; fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            aegisproxy-${{ github.ref_name }}-image-digests.txt
+            aegisproxy-*.tgz
+      - name: GitHub release with the image digests and the pinned chart
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --verify-tag --title "AegisProxy $TAG" \
+            --notes "Image digests and the Helm chart with the digests pinned, both attested by the release workflow. Verify them and the images as described in SECURITY.md (Release integrity)." \
+            "aegisproxy-$TAG-image-digests.txt" "aegisproxy-${TAG#v}.tgz"

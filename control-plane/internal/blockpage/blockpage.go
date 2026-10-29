@@ -266,12 +266,14 @@ const pageTmpl = `<!DOCTYPE html>
 {{if .Links}}<nav class="links">{{range .Links}}<a href="{{.URL}}" rel="noopener noreferrer">{{.Label}}</a>{{end}}</nav>{{end}}
 </main>
 {{if .ShowCA}}<section class="card ca"><h2>{{.T.ca_heading}}</h2><p class="muted">{{.T.ca_intro}}</p>
-<pre>curl -fsSLo aegis-ca-install.sh %%AEGIS:public_url%%/api/public/ca/install-linux.sh
-sha256sum aegis-ca-install.sh
-sudo bash aegis-ca-install.sh</pre>
-<pre>iwr -UseBasicParsing %%AEGIS:public_url%%/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
-Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
-powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1</pre>
+<pre>d=$(mktemp -d)
+curl -fsSLo "$d/aegis-ca-install.sh" %%AEGIS:public_url%%/api/public/ca/install-linux.sh
+sha256sum "$d/aegis-ca-install.sh"
+sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"</pre>
+<pre>$d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+iwr -UseBasicParsing %%AEGIS:public_url%%/api/public/ca/install-windows.ps1 -OutFile $f
+Get-FileHash $f -Algorithm SHA256
+powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName</pre>
 <p class="small"><a href="%%AEGIS:public_url%%/api/public/ca/aegis-ca.crt">{{.T.ca_pem}}</a> · <a href="%%AEGIS:public_url%%/api/public/ca/aegis-ca.der">{{.T.ca_der}}</a></p></section>{{end}}
 <footer>{{range .Footer}}<p>{{.}}</p>{{end}}<p class="powered">{{.T.powered}}</p></footer>
 </div>
@@ -435,6 +437,19 @@ func firstNonEmpty(v ...string) string {
 const rule = "================================================================================\n"
 const thin = "--------------------------------------------------------------------------------\n"
 
+// CLICAInstallSteps are the CA installer steps of the terminal block messages (also the data-plane's
+// blockpage.py). The installer is downloaded into a fresh private directory, its SHA-256 shown for
+// comparison with the console, and exactly that file is run; never a fixed name in a shared or the
+// current directory, where another local user could swap it between the check and the run.
+func CLICAInstallSteps(publicURL string) string {
+	return fmt.Sprintf(`    Linux:   d=$(mktemp -d); curl -fsSLo "$d/aegis-ca-install.sh" %[1]s/api/public/ca/install-linux.sh && sha256sum "$d/aegis-ca-install.sh"
+             sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"
+    Windows: $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+             iwr -UseBasicParsing %[1]s/api/public/ca/install-windows.ps1 -OutFile $f; Get-FileHash $f -Algorithm SHA256
+             powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName
+`, publicURL)
+}
+
 func renderCLI(t models.BlockPageTemplate, tr strs, threat bool) string {
 	var b strings.Builder
 	b.WriteString(rule)
@@ -471,8 +486,7 @@ func renderCLI(t models.BlockPageTemplate, tr strs, threat bool) string {
 	}
 	if t.ShowCASection {
 		b.WriteString(thin)
-		fmt.Fprintf(&b, " %s\n  %s\n    Linux:   curl -fsSLo aegis-ca-install.sh %s/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh\n             sudo bash aegis-ca-install.sh\n    Windows: iwr -UseBasicParsing %s/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1\n             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n             powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n",
-			tr["cli_ca"], tr["cli_ca_verify"], ph("public_url"), ph("public_url"))
+		fmt.Fprintf(&b, " %s\n  %s\n%s", tr["cli_ca"], tr["cli_ca_verify"], CLICAInstallSteps(ph("public_url")))
 	}
 	if f := strings.TrimSpace(expandText(t.CLIFooter, companyName(t))); f != "" {
 		b.WriteString(thin)

@@ -6,6 +6,8 @@ updates:
   - { package-ecosystem: pip, directory: /data-plane, schedule: { interval: weekly } }
   # Hash-locked pip-audit environment of the CI audit job.
   - { package-ecosystem: pip, directory: /.github, schedule: { interval: weekly } }
+  # Hash-locked console regression suite (Playwright for Python).
+  - { package-ecosystem: pip, directory: /frontend/e2e, schedule: { interval: weekly } }
   - { package-ecosystem: npm, directory: /frontend, schedule: { interval: weekly }, groups: { npm: { patterns: ["*"] } } }
   # Node.js build images stay on an LTS line (even major versions); odd majors are short-lived, so the
   # move to the next LTS is done deliberately instead of by Dependabot.

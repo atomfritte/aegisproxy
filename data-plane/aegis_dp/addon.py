@@ -44,7 +44,7 @@ from mitmproxy.proxy import server_hooks
 
 from . import __version__, buffering, liveconns
 from .accesslog import AccessLog
-from .blockpage import is_cli_client, render_branded, render_cli, render_html, render_stale
+from .blockpage import ca_install_steps, is_cli_client, render_branded, render_cli, render_html, render_stale
 from .buffering import BLOCK, STREAM, BodyGuard, BufferBudget
 from .clamav import ClamdClient
 from .config import Config
@@ -854,11 +854,7 @@ class AegisAddon:
         page = (f"AegisProxy Root CA portal\n\n  CA (PEM):   http://{host}/ca.crt\n  CA (DER):   http://{host}/ca.der\n\n"
                 "Download the installer and compare its SHA-256 with the value shown in the AegisProxy console\n"
                 "(TLS & CA, opened over https) before running it:\n"
-                f"  Linux:      curl -fsSLo aegis-ca-install.sh http://{host}/install-linux.sh && sha256sum aegis-ca-install.sh\n"
-                "              sudo bash aegis-ca-install.sh\n"
-                f"  Windows:    iwr -UseBasicParsing http://{host}/install-windows.ps1 -OutFile aegis-ca-install.ps1\n"
-                "              Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n"
-                "              powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n\n"
+                f"{ca_install_steps(f'http://{host}', '')}\n"
                 f"Control-plane: {public}\n")
         flow.response = http.Response.make(200, page.encode("utf-8", "replace"), {"Content-Type": "text/plain; charset=utf-8"})
 

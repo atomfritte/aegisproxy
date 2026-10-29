@@ -54,6 +54,16 @@ jobs:
           python -m venv /tmp/audit
           /tmp/audit/bin/pip install -q --require-hashes --only-binary=:all: -r .github/requirements-audit.txt
           /tmp/audit/bin/pip-audit --path /tmp/dp/lib/python3*/site-packages
+      # The venv above holds only what Linux CPython 3.14 installs. The lock also pins packages for Windows (pydivert,
+      # mitmproxy-windows), macOS and CPython 3.12/3.13 (backports-zstd), and the console regression suite has its own
+      # lock: every pin of both, with the environment markers removed, is audited as well (still hash-locked).
+      - name: pip-audit (every pin of the data-plane and e2e locks, any platform or Python version)
+        run: |
+          for lock in data-plane/requirements-lock.txt frontend/e2e/requirements.txt; do
+            sed -E '/^[^#]/ s/ *;[^\\]*( \\)$/\1/' "$lock" > "$RUNNER_TEMP/all-pins.txt"
+            if grep -qE '^[A-Za-z0-9][^#]*;' "$RUNNER_TEMP/all-pins.txt"; then echo "::error::$lock: environment marker left"; exit 1; fi
+            /tmp/audit/bin/pip-audit --disable-pip --require-hashes -r "$RUNNER_TEMP/all-pins.txt"
+          done
       - name: cross-language block token
         run: |
           TOK=$(python -I -c "import sys; sys.path.insert(0,'data-plane'); from aegis_dp.controlplane import sign_block_token; print(sign_block_token('k'*40, {'ip':'10.1.0.5','url':'https://x.example/ü','m':'GET','tid':'t'}))")
@@ -225,14 +235,19 @@ jobs:
       - name: end to end through the Windows services
         run: |
           $ErrorActionPreference = 'Stop'
-          # Trust the enterprise CA with the product's own roll-out script, the documented way: download it, compare
-          # its SHA-256 with windows_script_sha256 of /api/public/ca/info, only then run it (never piped into iex).
-          $caScript = Join-Path $env:RUNNER_TEMP 'aegis-ca-install.ps1'
-          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/api/public/ca/install-windows.ps1 -OutFile $caScript
-          $expected = "$((Invoke-RestMethod http://127.0.0.1:8081/api/public/ca/info).windows_script_sha256)"
-          $actual = (Get-FileHash -LiteralPath $caScript -Algorithm SHA256).Hash
-          if ($expected -notmatch '^[0-9A-Fa-f]{64}$' -or $actual -ne $expected) { throw "CA installer SHA-256 $actual does not match windows_script_sha256 '$expected'" }
-          powershell -NoProfile -ExecutionPolicy Bypass -File $caScript
+          # Trust the enterprise CA with the product's own roll-out, exactly the command the console hands out
+          # (windows_command of /api/public/ca/info), in Windows PowerShell 5.1 as an administrator would: it
+          # downloads the installer into memory, compares it with windows_script_sha256, writes those bytes with
+          # CreateNew into a new random-named directory and runs that file. A wrong hash must stop it first.
+          $info = Invoke-RestMethod http://127.0.0.1:8081/api/public/ca/info
+          $sha = "$($info.windows_script_sha256)"
+          if ($sha -notmatch '^[0-9A-Fa-f]{64}$' -or -not "$($info.windows_command)".Contains("-ne '$sha'")) { throw "unexpected CA info: $($info | ConvertTo-Json -Compress)" }
+          function Invoke-WindowsPowerShell([string]$command) {
+            powershell -NoProfile -NonInteractive -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("$command; exit `$LASTEXITCODE")))
+          }
+          $out = Invoke-WindowsPowerShell $info.windows_command.Replace($sha, ('0' * 64)) 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0 -or $out -notmatch 'SHA-256 mismatch, not running it') { throw "CA installer command with a wrong hash was not refused ($LASTEXITCODE): $out" }
+          Invoke-WindowsPowerShell $info.windows_command
           if ($LASTEXITCODE -ne 0) { throw "CA installer failed with exit code $LASTEXITCODE" }
           $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
           $h = @{ 'X-Requested-With' = 'aegis-ui' }
@@ -339,6 +354,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
+      # The go line of control-plane/go.mod (what CI's setup-go installs and the floor for source builds) is the Go
+      # of the image builds: bump the golang image digest and go.mod together.
+      - name: go.mod toolchain floor equals the Go of the image builds
+        run: |
+          set -euo pipefail
+          want="go$(sed -n 's/^go //p' control-plane/go.mod)"
+          for f in Dockerfile control-plane/Dockerfile; do
+            img=$(sed -n 's/^FROM \(golang:[^ ]*\) AS build$/\1/p' "$f")
+            got=$(docker run --rm --network none --entrypoint go "$img" env GOVERSION)
+            echo "$f: $img -> $got; control-plane/go.mod -> $want"
+            if [ "$got" != "$want" ]; then echo "::error::$f builds with $got, control-plane/go.mod requires $want: bump them together"; exit 1; fi
+          done
       - run: make images VERSION=${{ github.sha }} IMAGE_TAG=${{ github.sha }}
       - name: vulnerability scan (fails on fixable critical/high)
         # Trivy CLI image pinned by digest (no third-party action in the pipeline).

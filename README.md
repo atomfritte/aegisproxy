@@ -11,7 +11,7 @@ Every outbound HTTP(S) request of your servers passes a default-deny proxy that 
 **which exact path** it wants and **who approved it** — with self-service requests, change management,
 threat protection and a complete audit trail.
 
-![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.26-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
+![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.27-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
 
 [Quick start](#quick-start) · [Screenshots](#a-tour-of-the-console) · [Deployment](#deployment) ·
 [Documentation](#documentation) · [Security](SECURITY.md)
@@ -121,11 +121,11 @@ $ curl -x http://proxy.corp.example:8080 http://example.com/
 --------------------------------------------------------------------------------
  INSTALL THE ROOT CA
   Compare the installer's SHA-256 with the AegisProxy console (TLS & CA) before running it.
-    Linux:   curl -fsSLo aegis-ca-install.sh http://localhost:8081/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
-             sudo bash aegis-ca-install.sh
-    Windows: iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
-             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
-             powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1
+    Linux:   d=$(mktemp -d); curl -fsSLo "$d/aegis-ca-install.sh" http://localhost:8081/api/public/ca/install-linux.sh && sha256sum "$d/aegis-ca-install.sh"
+             sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"
+    Windows: $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+             iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 -OutFile $f; Get-FileHash $f -Algorithm SHA256
+             powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName
 ================================================================================
 ```
 
@@ -285,7 +285,7 @@ make test-conformance     # Splunk HEC, Sentinel and public Microsoft endpoints 
 npm --prefix frontend run dev   # console dev server on :5173 (proxies /api to :8081)
 ```
 
-Requirements: Go ≥ 1.26, Python ≥ 3.12 with mitmproxy 12.3, Node.js 24, Docker. Repository layout:
+Requirements: Go ≥ 1.27.3 (`control-plane/go.mod`), Python ≥ 3.12 with mitmproxy 12.3, Node.js 24, Docker. Repository layout:
 
 ```
 control-plane/      Go control-plane: API, policy engine, store, threat intel, identity, export
