@@ -70,11 +70,14 @@ function Initialize-FakeWindows {
     # %ProgramFiles% as shipped: read/execute for users.
     $global:FakeWin.Acl[(Get-FakeFullPath $env:ProgramFiles)] = @{ Protected = $true; Grants = [ordered]@{
             $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX' } }
-    # Volume root as on a Windows client SKU: authenticated users may modify everything they create below it.
-    # Paths that the installers do not lock down explicitly therefore show up as user-writable.
+    # System drive as on a Windows client SKU: authenticated users may create folders in the volume root and modify
+    # everything below it. Paths there that the installers do not lock down explicitly show up as user-writable.
+    $global:FakeWin.Acl[(Get-FakeFullPath $drive)] = @{ Protected = $true; Grants = [ordered]@{
+            $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX'
+            $script:SidAuthenticatedUsers = '(OI)(CI)(IO)M'; 'NT AUTHORITY\Authenticated Users' = '(AD)' } }
+    # Everything else below the root (test sources, link targets) only administrators can change.
     $global:FakeWin.Acl[$Root] = @{ Protected = $true; Grants = [ordered]@{
-            $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'
-            $script:SidUsers = '(OI)(CI)RX'; $script:SidAuthenticatedUsers = '(OI)(CI)M' } }
+            $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX' } }
 
     function global:Get-Service {
         [CmdletBinding()]
@@ -544,6 +547,7 @@ function Add-FakeWindowsMock {
         foreach ($k in @($global:FakeWin.Registry.Keys)) { if ($k -eq "$LiteralPath" -or $k -like "$LiteralPath\*") { $global:FakeWin.Registry.Remove($k) } }
     }
     Mock Start-Process -ParameterFilter { @($ArgumentList) -contains 'version' } {
+        Add-FakeCall 'Start-Process' @($FilePath, $ArgumentList)
         if ($RedirectStandardOutput) { [System.IO.File]::WriteAllText($RedirectStandardOutput, $global:FakeWin.BinaryVersion + "`n") }
         $proc = [pscustomobject]@{ ExitCode = 0 }
         Add-Member -InputObject $proc -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) -not $global:FakeWin.VersionHangs }
@@ -602,7 +606,10 @@ function Get-FakeCall([string]$Command) {
 }
 
 function global:Get-FakeFullPath([string]$Path) {
-    [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    # Without a trailing separator, except for a root ('/', 'C:\').
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if ($full.Length -gt [System.IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\', '/') }
+    $full
 }
 
 function global:Test-FakePrincipal([string]$Principal) {
@@ -624,7 +631,8 @@ function global:Get-FakeSid([string]$Principal) {
         $hash = [System.Security.Cryptography.SHA1]::HashData([System.Text.Encoding]::Unicode.GetBytes($virtual[1]))
         return $virtual[0] + '-' + ((0..4 | ForEach-Object { [System.BitConverter]::ToUInt32($hash, 4 * $_) }) -join '-')
     }
-    $wellKnown = @{ 'NT AUTHORITY\LocalService' = 'S-1-5-19'; 'NT AUTHORITY\SYSTEM' = 'S-1-5-18'; 'BUILTIN\Administrators' = 'S-1-5-32-544'; 'BUILTIN\Users' = 'S-1-5-32-545' }
+    $wellKnown = @{ 'NT AUTHORITY\LocalService' = 'S-1-5-19'; 'NT AUTHORITY\SYSTEM' = 'S-1-5-18'; 'BUILTIN\Administrators' = 'S-1-5-32-544'
+        'BUILTIN\Users' = 'S-1-5-32-545'; 'NT AUTHORITY\Authenticated Users' = 'S-1-5-11' }
     if ($wellKnown.ContainsKey($Principal)) { return $wellKnown[$Principal] }
     return $Principal
 }
@@ -672,7 +680,7 @@ function global:Get-FakeAccessRule([string]$Path) {
             if ($entry.Protected) { break }
         }
         if ($current -eq $global:FakeWin.Root) { break }
-        $parent = Split-Path -Parent $current
+        $parent = [System.IO.Path]::GetDirectoryName($current)   # null at a root ('/', 'C:\'), where Split-Path throws
         if (-not $parent -or $parent -eq $current) { break }
         $current = $parent
         $depth++
@@ -709,7 +717,7 @@ function Get-FakeAccess {
             if ($entry.Protected) { break }
         }
         if ($current -eq $global:FakeWin.Root) { break }
-        $parent = Split-Path -Parent $current
+        $parent = [System.IO.Path]::GetDirectoryName($current)
         if (-not $parent -or $parent -eq $current) { break }
         $current = $parent
         $first = $false

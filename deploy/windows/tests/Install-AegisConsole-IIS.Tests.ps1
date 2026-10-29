@@ -113,6 +113,61 @@ Describe 'Install-AegisConsole-IIS.ps1' {
         }
     }
 
+    Context 'installation sources' {
+        BeforeEach {
+            # A release that an administrator copied into C:\Install\AegisProxy on a client edition: C:\Install, created
+            # in the volume root, inherits Modify for authenticated users.
+            $script:InstallFolder = Join-Path $env:SystemDrive 'Install'
+            $script:ReleaseDist = Join-Path $InstallFolder 'AegisProxy\frontend\dist'
+            New-Item -ItemType Directory -Path $ReleaseDist -Force | Out-Null
+            Copy-Item -Path (Join-Path $Dist '*') -Destination $ReleaseDist -Recurse
+            $script:ReleaseWebConfig = Join-Path $InstallFolder 'AegisProxy\deploy\windows\iis\web.config'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $ReleaseWebConfig) -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $Installer) 'iis\web.config') -Destination $ReleaseWebConfig
+            $script:Params = Join-Parameters $Base @{ DistDir = $ReleaseDist; WebConfigTemplate = $ReleaseWebConfig }
+        }
+
+        It 'refuses a release that non-administrators can change before it copies anything' {
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*-AllowWritableSource*' -PassThru
+            foreach ($path in @($InstallFolder, (Join-Path $ReleaseDist 'assets\index-abc123.js'), $ReleaseWebConfig)) {
+                "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $path) (Authenticated Users)"))
+            }
+            "$err" | Should -Not -Match ([regex]::Escape("$(Get-FakeFullPath $env:SystemDrive) (")) -Because 'users may create folders in the volume root, but not change those of others'
+            (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Iis.Sites.Count | Should -Be 0
+            Test-Path -LiteralPath $Site | Should -BeFalse
+        }
+
+        It 'deploys the release once its folder in the volume root has its own ACL (Windows guide, section 2)' {
+            icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters $Params
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'Non-administrators can change'
+            Test-Path -LiteralPath (Join-Path $Site 'assets\index-abc123.js') | Should -BeTrue
+        }
+
+        It 'continues with -AllowWritableSource and repeats the warning' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Params @{ AllowWritableSource = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Continuing because of -AllowWritableSource'
+        }
+
+        It 'refuses a protected release when <Case>' -TestCases @(
+            @{ Case = 'users may change a script of the console'; Relative = 'AegisProxy\frontend\dist\assets\index-abc123.js'; Grantee = '*S-1-5-32-545'; Ace = 'M'; Expect = 'Users' },
+            @{ Case = 'another account owns web.config'; Relative = 'AegisProxy\deploy\windows\iis\web.config'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'everyone may take ownership of a folder above web.config'; Relative = 'AegisProxy\deploy'; Grantee = '*S-1-1-0'; Ace = '(WO)'; Expect = 'Everyone' }
+        ) {
+            icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            $weak = Get-FakeFullPath (Join-Path $InstallFolder $Relative)
+            if ($Owner) { $FakeWin.Owner[$weak] = $Owner }
+            else { $FakeWin.Acl[$weak] = @{ Protected = $false; Grants = [ordered]@{ $Grantee = $Ace } } }
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($Expect)"))
+            (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+        }
+    }
+
     Context 'deployment with a separate API origin' {
         BeforeEach {
             New-Item -ItemType Directory -Path (Join-Path $Site 'assets') -Force | Out-Null

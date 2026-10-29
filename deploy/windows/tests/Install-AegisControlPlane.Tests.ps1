@@ -104,6 +104,79 @@ Describe 'Install-AegisControlPlane.ps1' {
         }
     }
 
+    Context 'installation sources' {
+        BeforeEach {
+            # A release that an administrator copied into C:\Install\AegisProxy on a client edition: C:\Install, created
+            # in the volume root, inherits Modify for authenticated users.
+            $script:InstallFolder = Join-Path $env:SystemDrive 'Install'
+            $script:ReleaseBinary = Join-Path $InstallFolder 'AegisProxy\aegis-control-plane.exe'
+            New-FakeBinary -Path $ReleaseBinary
+            $script:Ui = Join-Path $InstallFolder 'AegisProxy\frontend\dist'
+            New-Item -ItemType Directory -Path (Join-Path $Ui 'assets') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $Ui 'index.html') -Value '<!doctype html>'
+            Set-Content -LiteralPath (Join-Path $Ui 'assets\index-abc123.js') -Value 'console.log(1)'
+            $script:Params = Join-Parameters $Base @{ BinaryPath = $ReleaseBinary; UiDir = $Ui; SkipFirewall = $true }
+        }
+
+        It 'refuses a release that non-administrators can change before it runs the binary' {
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*-AllowWritableSource*' -PassThru
+            foreach ($path in @($InstallFolder, $ReleaseBinary, (Join-Path $Ui 'assets\index-abc123.js'))) {
+                "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $path) (Authenticated Users)"))
+            }
+            "$err" | Should -Not -Match ([regex]::Escape("$(Get-FakeFullPath $env:SystemDrive) (")) -Because 'users may create folders in the volume root, but not change those of others'
+            "$err" | Should -Match ([regex]::Escape("icacls `"$InstallFolder`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`""))
+            (Get-FakeCall 'Start-Process').Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'installs from the release once its folder in the volume root has its own ACL (Windows guide, section 2)' {
+            icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters $Params
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'Non-administrators can change'
+            Get-FakeFullPath ((Get-FakeCall 'Start-Process')[0].Args[0]) | Should -Be (Get-FakeFullPath $ReleaseBinary)
+        }
+
+        It 'continues with -AllowWritableSource and repeats the warning' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Params @{ AllowWritableSource = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Non-administrators can change installation sources'
+            $run.Output | Should -Match 'Continuing because of -AllowWritableSource'
+        }
+
+        It 'refuses a protected release when <Case>' -TestCases @(
+            @{ Case = 'another account owns the binary'; Relative = 'AegisProxy\aegis-control-plane.exe'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'users may change a script of the console'; Relative = 'AegisProxy\frontend\dist\assets\index-abc123.js'; Grantee = '*S-1-5-32-545'; Ace = 'M'; Expect = 'Users' },
+            @{ Case = 'users get write access to new files of the console (inherit-only)'; Relative = 'AegisProxy\frontend\dist'; Grantee = '*S-1-5-32-545'; Ace = '(OI)(IO)W'; Expect = 'Users' },
+            @{ Case = 'everyone may rename the release folder'; Relative = 'AegisProxy'; Grantee = '*S-1-1-0'; Ace = '(D)'; Expect = 'Everyone' },
+            @{ Case = 'users may delete entries of the protected folder'; Relative = ''; Grantee = '*S-1-5-32-545'; Ace = '(DC)'; Expect = 'Users' },
+            @{ Case = 'a group may change the permissions of a folder above the release'; Relative = '..'; Grantee = '*S-1-5-21-111-222-333-1105'; Ace = '(WDAC)'; Expect = 'S-1-5-21-111-222-333-1105' }
+        ) {
+            icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            $weak = Get-FakeFullPath $(if ($Relative -eq '..') { $env:SystemDrive } elseif ($Relative) { Join-Path $InstallFolder $Relative } else { $InstallFolder })
+            if ($Owner) { $FakeWin.Owner[$weak] = $Owner }
+            else {
+                if (-not $FakeWin.Acl.ContainsKey($weak)) { $FakeWin.Acl[$weak] = @{ Protected = $false; Grants = [ordered]@{} } }
+                $FakeWin.Acl[$weak].Grants[$Grantee] = $Ace
+            }
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($Expect)"))
+            (Get-FakeCall 'Start-Process').Count | Should -Be 0
+        }
+
+        It 'refuses a junction on the way to the release (its target is not checked)' {
+            $elsewhere = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $elsewhere | Out-Null
+            Move-Item -LiteralPath (Join-Path $InstallFolder 'AegisProxy') -Destination (Join-Path $elsewhere 'AegisProxy')
+            icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            New-Item -ItemType SymbolicLink -Path (Join-Path $InstallFolder 'AegisProxy') -Target (Join-Path $elsewhere 'AegisProxy') | Out-Null
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath (Join-Path $InstallFolder 'AegisProxy')) (junction/symbolic link, its target is not checked)"))
+        }
+    }
+
     Context 'fresh installation' {
         BeforeEach {
             $script:Password = 'Correct-Horse-Battery-2026'

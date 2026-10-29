@@ -196,6 +196,24 @@ jobs:
           Invoke-WebRequest -UseBasicParsing https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe -OutFile "$env:RUNNER_TEMP\WinSW-x64.exe"
           $h = (Get-FileHash "$env:RUNNER_TEMP\WinSW-x64.exe" -Algorithm SHA256).Hash
           if ($h -ne '05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA') { throw "WinSW hash mismatch: $h" }
+      # The installers refuse sources that non-administrators can change, including every folder above them: lock the
+      # top-level folder that holds the checkout and RUNNER_TEMP (WinSW) down like docs/deployment/windows.md, section 2.
+      - name: release folder only administrators can change
+        run: |
+          $dirs = @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP | ForEach-Object {
+              $root = [System.IO.Path]::GetPathRoot($_)
+              $top = $_.Substring($root.Length).Split('\')[0]
+              if (-not $top) { throw "$_ is a volume root" }
+              Join-Path $root $top
+            } | Sort-Object -Unique)
+          icacls ([System.IO.Path]::GetPathRoot($dirs[0]))
+          foreach ($dir in $dirs) {
+            icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /Q
+            if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r $dir failed with exit code $LASTEXITCODE" }
+            icacls $dir /setowner '*S-1-5-32-544' /T /L /C /Q
+            if ($LASTEXITCODE -ne 0) { Write-Warning "icacls /setowner $dir exited with $LASTEXITCODE (files it could not change are reported by the installers)" }
+            icacls $dir
+          }
       - name: install the control-plane service
         run: |
           $pw = ConvertTo-SecureString 'Ci-Windows-Root-Pass-2026' -AsPlainText -Force
