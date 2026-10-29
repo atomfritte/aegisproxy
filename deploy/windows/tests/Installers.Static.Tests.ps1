@@ -57,6 +57,32 @@ Describe '<Name>' -ForEach $Installers {
     }
 }
 
+Describe 'installation source check' {
+    It 'is the same code in every installer (<Name>)' -TestCases @(
+        @{ Name = 'ConvertTo-FileRight' }, @{ Name = 'Get-WritableSource' }, @{ Name = 'Assert-TrustedSource' }
+    ) {
+        $scripts = @(Get-ChildItem -LiteralPath $Root -Filter 'Install-Aegis*.ps1' -File)
+        $scripts.Count | Should -Be 3
+        $texts = @($scripts | ForEach-Object {
+                (Get-Ast $_.FullName).Ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $false).Extent.Text
+            })
+        $texts.Count | Should -Be 3
+        @($texts | Sort-Object -Unique).Count | Should -Be 1
+    }
+
+    It 'runs before the installers use their sources' {
+        foreach ($case in @(
+                @{ Script = 'Install-AegisControlPlane.ps1'; Before = 'Start-Process -FilePath $newBinary' },
+                @{ Script = 'Install-AegisDataPlane.ps1'; Before = 'Get-FileHash -LiteralPath $WinSWExe' },
+                @{ Script = 'Install-AegisConsole-IIS.ps1'; Before = "robocopy.exe' -ArgumentList @(`$DistDir" })) {
+            $text = [System.IO.File]::ReadAllText((Join-Path $Root $case.Script))
+            $check = $text.IndexOf('Assert-TrustedSource -Path @($PSCommandPath')
+            $check | Should -BeGreaterThan 0 -Because $case.Script
+            $check | Should -BeLessThan $text.IndexOf($case.Before) -Because $case.Script
+        }
+    }
+}
+
 Describe 'WinSW template and data-plane installer' {
     It 'replaces exactly the placeholders the template defines' {
         $template = [System.IO.File]::ReadAllText((Join-Path $Root 'aegis-dataplane.xml'))

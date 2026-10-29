@@ -13,6 +13,8 @@
     administrators can modify (%ProgramFiles%) and installs mitmproxy==12.3.0 into it.
 
     Steps (idempotent; a re-run upgrades addon/venv/WinSW configuration and keeps the staged secrets):
+      * refuses installation sources that non-administrators can change (this script, the WinSW template, WinSW,
+        data-plane\, the lock file, the CA files, and every folder above them), before it runs or copies any of them
       * resolves Python (-PythonExe or the all-users installation of 3.12 / 3.13 / 3.14 registered in HKLM) and
         refuses an interpreter that non-administrators can modify before it runs it for the first time
       * takes over existing directories (owner Administrators, foreign ACEs removed), including
@@ -51,6 +53,15 @@
     Authenticated Users, Everyone, INTERACTIVE, ...) can modify or create files in, e.g. C:\Python312 below a
     volume root that lets users create files. Code planted there runs in the service, and in this script (as
     Administrator) as soon as it runs the interpreter. Not recommended.
+
+.PARAMETER AllowWritableSource
+    Accept installation sources that non-administrators can change: this script, the WinSW template next to it,
+    -WinSWExe, -SourceDir (everything below it), -RequirementsFile, -CaFile, -ControlPlaneCaFile and every folder above
+    them up to the volume root. Allowed are only SYSTEM, Administrators and TrustedInstaller as owners and as
+    principals that may write, create, delete, rename, change the permissions or take ownership (above the sources:
+    rename, delete entries, change the permissions, take ownership). The script runs and copies these files with
+    administrator rights, and the addon and the lock file decide which code runs in the service. Not recommended:
+    keep the release in a folder that only administrators control (docs/deployment/windows.md, section 2).
 
 .PARAMETER DataRoot
     Data directory (default %ProgramData%\AegisProxy\data-plane). Its parent %ProgramData%\AegisProxy is taken over
@@ -135,8 +146,8 @@
         -WinSWExe C:\Install\WinSW-x64.exe -AllowedRemoteAddress 10.20.0.0/16,10.30.0.0/16
 
 .EXAMPLE
-    # Own hash-pinned lock file, installed offline from an internal wheel share
-    .\Install-AegisDataPlane.ps1 ... -RequirementsFile \\fs\aegis\requirements-win.txt `
+    # Own hash-pinned lock file (kept with the release: its hashes decide what runs), wheels from an internal share
+    .\Install-AegisDataPlane.ps1 ... -RequirementsFile C:\Install\AegisProxy\requirements-win.txt `
         -PipArgs '--no-index','--find-links','\\fs\aegis\wheels'
 
 .NOTES
@@ -149,6 +160,9 @@ param(
 
     [Parameter(ParameterSetName = 'Install')]
     [switch]$AllowWritablePython,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowWritableSource,
 
     [Parameter(ParameterSetName = 'Install')]
     [switch]$AllowUnencryptedImport,
@@ -453,6 +467,94 @@ function ConvertTo-FileRight([int]$Rights) {
     return ($mask -band 2032127)
 }
 
+function Get-WritableSource {
+    # Installation sources that someone other than SYSTEM, Administrators and TrustedInstaller can change (allowlist),
+    # as Path/Who pairs. The installers run and copy them with administrator rights. Checked are each existing source,
+    # everything below a source directory (links are not followed) and every directory above it up to the volume root:
+    # a junction or symbolic link (its target is not checked), an owner outside that set (owners can always rewrite the
+    # ACL) and the allow ACEs of other principals, explicit or inherited. On the sources and below them any of 852038 =
+    # WriteData/CreateFiles, AppendData/CreateDirectories, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions,
+    # TakeOwnership (generic rights mapped) counts, also in ACEs that only pass on to children. Above them only what
+    # lets others replace their entries counts, on the directory itself: 852032 (Delete = rename, without creating
+    # files and folders, which the volume root allows everyone), 786496 on the volume root (it cannot be renamed).
+    # CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners, which are checked themselves.
+    param([string[]]$Path = @())
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
+    $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
+        'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests'; 'S-1-5-32-547' = 'Power Users'; 'S-1-5-32-555' = 'Remote Desktop Users'
+        'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
+    $checks = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $current = (Resolve-Path -LiteralPath $p).ProviderPath
+        if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
+        $above = $false
+        while ($current -and -not $seen.ContainsKey("$above|$current")) {
+            $seen["$above|$current"] = $true
+            $checks.Add(@{ Path = $current; Above = $above })
+            $current = [System.IO.Path]::GetDirectoryName($current)
+            $above = $true
+        }
+    }
+    $found = [ordered]@{}
+    foreach ($check in $checks) {
+        $pending = New-Object System.Collections.Stack
+        $pending.Push($check.Path)
+        while ($pending.Count) {
+            $p = [string]$pending.Pop()
+            $who = @()
+            $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+            if (-not $item) { $who += 'not readable' }
+            elseif ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $who += 'junction/symbolic link, its target is not checked' }
+            else {
+                try { $acl = Get-Acl -LiteralPath $p; $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) }
+                catch { $acl = $null; $who += 'ACL not readable' }
+                if ($acl) {
+                    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+                    $ownerSid = if ($owner) { "$($owner.Value)" } else { 'none' }
+                    if ($trusted -notcontains $ownerSid) { $who += "owner $(if ($names.ContainsKey($ownerSid)) { $names[$ownerSid] } else { $ownerSid })" }
+                    $mask = if (-not $check.Above) { 852038 } elseif ([System.IO.Path]::GetDirectoryName($p)) { 852032 } else { 786496 }
+                    foreach ($rule in $rules) {
+                        $sid = "$($rule.IdentityReference.Value)"
+                        if ("$($rule.AccessControlType)" -ne 'Allow' -or $trusted -contains $sid -or $ownerOnly -contains $sid) { continue }
+                        if ($check.Above -and "$($rule.PropagationFlags)" -match 'InheritOnly') { continue }
+                        if (-not ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band $mask)) { continue }
+                        $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid })
+                    }
+                }
+                if (-not $check.Above -and $item.PSIsContainer) {
+                    try { foreach ($child in @(Get-ChildItem -LiteralPath $p -Force)) { $pending.Push($child.FullName) } }
+                    catch { $who += 'content not readable' }
+                }
+            }
+            if ($who.Count) { $found[$p] = @(@($found[$p]) + $who | Where-Object { $_ } | Sort-Object -Unique) }
+        }
+    }
+    foreach ($p in $found.Keys) { [pscustomobject]@{ Path = $p; Who = ($found[$p] -join ', ') } }
+}
+
+function Assert-TrustedSource {
+    # Stops before anything of the sources is read, run or copied when Get-WritableSource reports them (with -Allow:
+    # warns), and shows how to keep the release in a folder that only administrators control.
+    param([string[]]$Path = @(), [switch]$Allow)
+    $writable = @(Get-WritableSource -Path $Path | Sort-Object -Property Path)
+    if (-not $writable.Count) { return }
+    $list = @($writable | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($writable.Count -gt 15) { $list += "  ... and $($writable.Count - 15) more" }
+    $folder = Join-Path $env:SystemDrive 'Install'
+    $message = ("Non-administrators can change installation sources that this script runs or copies with administrator rights:`n{0}`n" +
+        "Copy the release into a folder that only administrators control (docs/deployment/windows.md, section 2), e.g.:`n" +
+        "  New-Item -ItemType Directory -Force `"{1}`"`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`"`n" +
+        "  (copy the release into it)`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /T /L /C /Q`n" +
+        'Copy it again rather than fixing the ACLs in place: files that others could change may have been altered') -f ($list -join "`n"), $folder
+    if (-not $Allow) { throw "$message. Or pass -AllowWritableSource to accept the risk." }
+    Write-Note "$message. Continuing because of -AllowWritableSource."
+}
+
 function Get-AclProblem {
     # Deviations of Path from the expected ACL: a directory must be owned by Administrators or SYSTEM, and every
     # allow ACE (explicit or inherited) must belong to a principal of -Allowed (SID -> F|M|RX|R) and stay within
@@ -731,6 +833,16 @@ $ControlPlaneUrl = $ControlPlaneUrl.TrimEnd('/')
 if ($ControlPlaneUrl -notmatch '^https://') {
     Write-Note 'CONTROL_PLANE_URL is http:// - the data-plane key and policy bundle travel unencrypted. Use https:// across hosts.'
 }
+
+# Everything this script runs or copies as Administrator, or that decides which code runs in the service (addon, lock
+# file, WinSW, CAs), must be out of reach of other accounts, including the folders above it (whoever may rename one can
+# replace the files). The CA of a control-plane on this host (used without -CaFile) must be restricted to
+# SYSTEM/Administrators, see below; a -CaFile that names the staged copy itself (a re-run that keeps the CA) belongs to
+# this installation, whose ACLs are verified like the other staged files.
+$caSource = $CaFile
+if ($CaFile -and (Test-Path -LiteralPath $CaFile -PathType Leaf) -and
+    [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $CaFile).ProviderPath) -eq [System.IO.Path]::GetFullPath($StagedCa)) { $caSource = $null }
+Assert-TrustedSource -Path @($PSCommandPath, $Template, $WinSWExe, $SourceDir, $RequirementsFile, $caSource, $ControlPlaneCaFile) -Allow:$AllowWritableSource
 
 # WinSW (never downloaded automatically)
 if (-not (Test-Path -LiteralPath $WinSWExe -PathType Leaf)) {

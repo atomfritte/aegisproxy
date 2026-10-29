@@ -122,16 +122,43 @@ unavailable, so control-plane upgrades and restarts do not interrupt proxy traff
 > script directory on `sys.path`); the version probe of the base interpreter also skips the `site` module (`-S`).
 > `-AllowWritablePython` overrides the ACL check (not recommended).
 
-Copy a deployment package to the target host, for example:
+Copy a deployment package to the target host, into a folder that only administrators control, for example:
 
 ```
 C:\Install\AegisProxy\
   aegis-control-plane.exe
   WinSW-x64.exe
   deploy\windows\...           (scripts, template, iis\web.config)
-  data-plane\                  (aegis_addon.py, aegis_dp\)
+  data-plane\                  (aegis_addon.py, aegis_dp\, requirements-lock.txt)
   frontend\dist\               (built console)
 ```
+
+The installers run and copy these files with administrator rights - the control-plane binary runs right away, the
+addon and the lock file decide which code runs in the data-plane service, the console runs in every
+administrator's browser - so whoever can change them gets those rights. A folder created in the volume root is not
+safe by default: on Windows client editions authenticated users may modify everything below it, on Windows Server
+users may add files and folders to it. Create the folder **before** you copy the package and give it its own ACL:
+
+```powershell
+New-Item -ItemType Directory -Force C:\Install
+icacls C:\Install /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+# copy the package to C:\Install\AegisProxy, then make Administrators the owner (on client editions the files
+# belong to the administrator account that copied them):
+icacls C:\Install /setowner *S-1-5-32-544 /T /L /C /Q
+```
+
+Protect the folder directly below the drive root (`C:\Install`), not only `C:\Install\AegisProxy`: whoever may rename
+a folder above the package can put another package in its place. Before they run or copy anything, the installers
+check the script itself and every source they use - `-BinaryPath`, `-UiDir`, `-TlsCertFile`/`-TlsKeyFile`,
+`-ImportSecretsDir`/`-CaSourceDir` (control-plane); the WinSW template, `-WinSWExe`, `-SourceDir`, `-RequirementsFile`,
+`-CaFile`, `-ControlPlaneCaFile` (data-plane); `-DistDir`, `-WebConfigTemplate` (IIS) - with everything below them,
+and every folder above them up to the volume root. Only SYSTEM, Administrators and TrustedInstaller may own them or
+hold an allow ACE that lets them write, create files or folders, delete, rename, change the permissions or take
+ownership (for the folders above the sources: rename, delete entries, change the permissions, take ownership - the
+volume root's "create folders" for users is fine, the *Modify* it passes on to a folder created below it is not).
+Junctions and symbolic links on the way are refused, their targets are not checked. `-AllowWritableSource`
+overrides the check (not recommended). Keep secrets and certificates that you pass to the installers (`-TlsKeyFile`,
+`-CaFile`, ...) in the same protected folder or another one that only administrators control.
 
 If the scripts were downloaded, unblock them first: `Get-ChildItem C:\Install\AegisProxy -Recurse | Unblock-File`.
 Run them with `powershell.exe -ExecutionPolicy RemoteSigned -File ...` or sign them with your code-signing
@@ -388,7 +415,8 @@ sync is older; at least 30 s, `''` or `0` = no limit), `-WorkerId`, `-PublicUrl`
 `-PipArgs` (e.g. an internal index or an offline wheel share), `-RequirementsFile` / `-AllowUnpinnedPackages`
 (see below), `-WinSWSha256` (hash of a different WinSW build), `-NoYara` (do not install the YARA-X engine: the
 shipped lock is installed without its `yara-x` entry), `-RecreateVenv`,
-`-AllowWritablePython`, `-AllowUnencryptedImport`, `-AdoptExistingSecrets` (see above), `-Uninstall` (removes
+`-AllowWritablePython`, `-AllowUnencryptedImport`, `-AdoptExistingSecrets` (see above), `-AllowWritableSource`
+(section 2), `-Uninstall` (removes
 service, rules, program files, the staged key/CA copies and records still in the spool - links inside are removed
 as links, their targets are never touched; keeps logs). `-ExtraEnvironment` refuses the variables the template or a
 dedicated parameter sets (`CONTROL_PLANE_URL`, `AEGIS_DATAPLANE_KEY[_FILE]`, `AEGIS_OPS_ADDR`, `AEGIS_FAIL_MODE`,
@@ -659,6 +687,7 @@ systemd drop-ins). Details: [`linux.md`](linux.md#10-rolling-out-the-ca-and-prox
 | Data-plane addon | Re-run `Install-AegisDataPlane.ps1` with the new `data-plane` folder |
 | mitmproxy / Python | Deploy a release with the updated `data-plane\requirements-lock.txt` (or pass your own `-RequirementsFile`), re-run with `-RecreateVenv`; a new Python minor version recreates the venv automatically |
 | Cluster | One node at a time; wait for `/readyz` on the upgraded node before the next one. Upgrade the control-plane before the workers |
+| Packages in folders that others can change (new in 2.1) | The installers now refuse a package - or a `-TlsKeyFile`, `-CaFile`, `-RequirementsFile`, ... - that non-administrators can change, e.g. below a `C:\Install` created without its own ACL, in a download folder or on a file share. Create the package folder as in section 2 and copy the new release into it before the upgrade; `-AllowWritableSource` skips the check (not recommended) |
 
 Check `aegis-control-plane.exe version`, `GET /api/public/meta` (field `version`) and `aegis_build_info` on `/metrics`.
 Back up before every upgrade (section 12).
@@ -751,6 +780,7 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | Installer: `Refusing to adopt N file(s) that existed before this installation` | first installation (no service) or directories with an unexpected owner/ACL contain files | Check the listed files. Delete them if you do not know where they come from; re-run with `-AdoptExistingSecrets` for a restore, a reinstallation after `-Uninstall` or an interrupted first run |
 | Installer: `ACL verification failed` | an ACE or owner could not be changed (e.g. an inheritance-blocking policy, a tool that re-adds ACEs) | Fix the listed paths (`icacls <path>`), re-run; the service is not started until the check passes |
 | Installer: `Python at ... can be modified by non-administrators` | interpreter outside `Program Files` (e.g. `C:\Python312`), or an account other than SYSTEM/Administrators/TrustedInstaller/the service owns or may write to one of the listed paths (also the directory above the Python directory) | Reinstall python.org Python for all users into `C:\Program Files\Python312`, or remove the listed ACEs (`icacls <path> /remove <account>`). An `owner <SID>` entry on a Windows client edition is usually the administrator account that created the files: after checking it, `icacls <path> /setowner *S-1-5-32-544 /T /L` |
+| Installer: `Non-administrators can change installation sources that this script runs or copies with administrator rights` | the package (or a file passed by parameter) is in a folder that other accounts may change: below a folder created in the volume root without its own ACL (client editions: *Modify* for authenticated users; Windows Server: users may add files), in a user profile or on a file share; an individual account owns a listed file (on client editions usually the administrator account that copied it); or a junction is on the way | Create a folder as in section 2 (`icacls <folder> /inheritance:r /grant:r ...`), copy the release into it, `icacls <folder> /setowner *S-1-5-32-544 /T /L /C /Q`, and run the scripts from there. Copy it again rather than fixing the ACLs in place: files that others could change may have been altered. `-AllowWritableSource` skips the check (not recommended) |
 | Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share (any spelling: `//host/share`, `\\?\UNC\...`, mapped drive) | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
 | Installer: `... is a device path` | a source path like `\\?\GLOBALROOT\...` or `\\?\Volume{...}\...` | Pass a drive-letter or UNC path |
 | Installer: `Junctions/symbolic links and hard-linked files are not allowed`, `Junction/symbolic link in the installation directories`, `... has further hard links` | a link or a hard-linked file in a directory that existed before (ACL changes and deletions would reach the file elsewhere) | Remove the listed entries (`Remove-Item` on the link itself; `fsutil hardlink list <file>` shows the other names of a hard-linked file) and re-run |
@@ -779,7 +809,8 @@ Remove-Item Env:AEGIS_LOG_FILE
 - [ ] `C:\ProgramData\AegisProxy` ACL: owner Administrators, no inherited `Users` access; `secrets\` and
       `mitmproxy-ca.pem` admin/service only (verified by the installers; `icacls` output reviewed).
 - [ ] Never used `-AdoptExistingSecrets` for files of unknown origin; Python installed in `Program Files` (no
-      `-AllowWritablePython`); secrets copied between hosts only over encrypted SMB or another protected channel.
+      `-AllowWritablePython`); release copied into a folder that only administrators control (section 2, no
+      `-AllowWritableSource`); secrets copied between hosts only over encrypted SMB or another protected channel.
 - [ ] No secret values in the registry environment (only `*_FILE` paths).
 - [ ] Services run as virtual accounts (`NT SERVICE\AegisControlPlane`, `NT SERVICE\AegisDataPlane`), never as
       LocalSystem.
@@ -803,12 +834,13 @@ Remove-Item Env:AEGIS_LOG_FILE
 
 The CI job `windows` (`.github/workflows/ci.yml`) runs on every push on Windows Server 2022 and 2025:
 
-1. the installer unit tests (Pester, 273 tests against an in-memory Windows model with owners, ACL
+1. the installer unit tests (Pester, 361 tests against an in-memory Windows model with owners, ACL
    inheritance, links, hard links, SMB connections and a local user racing the installer; nothing on the runner
    changes);
 2. the control-plane Go test suite and the data-plane unit tests on Windows CPython 3.12;
-3. installs Python for all users into `C:\Program Files\Python312` and WinSW 2.12.0 (pinned SHA-256), then both
-   services, checks the event log source and the `service` ImagePath, and runs the log rotation task once as
+3. installs Python for all users into `C:\Program Files\Python312` and WinSW 2.12.0 (pinned SHA-256), gives the
+   folder that holds the checkout and WinSW the administrators-only ACL of section 2, then installs both services,
+   checks the event log source and the `service` ImagePath, and runs the log rotation task once as
    `NT SERVICE\AegisControlPlane` (result 0, archive created);
 4. rolls out the enterprise CA with the console's `windows_command` in Windows PowerShell 5.1 (download into
    memory, SHA-256 against `windows_script_sha256`, written with `CreateNew` into a new random-named directory,
