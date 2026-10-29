@@ -334,41 +334,62 @@ func mapIdPGroups(cfg models.EntraIDConfig, memberKeys []string) (models.Role, [
 	return role, groups
 }
 
-// scimLinkCandidateLocked finds the account SCIM provisioned for a person who signs in for the
-// first time: SCIM externalId = token subject (Entra: objectId = oid, Okta: user id = sub). Only this
-// immutable identifier links. Usernames and e-mail addresses never do: users can choose or change them
-// in some IdPs (OIDC Core: preferred_username is neither unique nor stable), so whoever obtains a token
-// with a provisioned userName would take over that account. Ambiguous matches link nothing. conflict
-// reports an unlinked SCIM account whose userName equals the username claim: the sign-in is refused
-// rather than creating a second account next to it (usually a wrong externalId mapping in the IdP).
-func (s *Store) scimLinkCandidateLocked(id SSOIdentity) (index int, conflict bool) {
-	unlinked := func(u models.User) bool { return u.SCIM != nil && u.ExternalID == "" && u.AuthProvider == "oidc" }
+// scimLinkCandidateLocked finds the account SCIM provisioned for a person whose subject is not linked
+// to any account: SCIM externalId = token subject (Entra: objectId = oid, Okta: user id = sub), compared
+// exactly — OIDC subjects are case-sensitive, and case or Unicode folding (U+212A KELVIN SIGN folds to
+// "k") would let a different subject link. Only this immutable identifier links. Usernames and e-mail
+// addresses never do: users can choose or change them in some IdPs (OIDC Core: preferred_username is
+// neither unique nor stable), so whoever obtains a token with a provisioned userName would take over
+// that account. Records the SCIM client deleted never link (the subject is refused as deprovisioned).
+// A candidate still linked to another subject (a link left by an earlier version, or one made through
+// a previous issuer) is linked anew: SCIM, which is authoritative, says it belongs to this subject.
+// refused explains why the sign-in is refused instead: several accounts carry the subject, or an
+// unlinked SCIM account has the username claim as userName — a second account next to it would hide a
+// wrong externalId mapping in the IdP (case-insensitive: this only refuses, it never links).
+func (s *Store) scimLinkCandidateLocked(id SSOIdentity) (index int, refused string) {
 	found := -1
 	if id.Subject != "" {
 		for i, u := range s.state.Users {
-			if !unlinked(u) || u.SCIM.ExternalID == "" || !strings.EqualFold(u.SCIM.ExternalID, id.Subject) {
+			if u.SCIM == nil || u.SCIM.Deleted || u.AuthProvider != "oidc" || u.SCIM.ExternalID == "" || u.SCIM.ExternalID != id.Subject {
 				continue
 			}
 			if found >= 0 {
-				return -1, false
+				return -1, "several SCIM-provisioned accounts carry the token subject as externalId (accounts are linked by a unique immutable user ID only)"
 			}
 			found = i
 		}
 	}
 	if found >= 0 {
-		return found, false
+		return found, ""
 	}
-	conflict = id.LoginName != "" && slices.ContainsFunc(s.state.Users, func(u models.User) bool {
-		return unlinked(u) && !u.SCIM.Deleted && strings.EqualFold(u.SCIM.UserName, id.LoginName)
-	})
-	return -1, conflict
+	if id.LoginName != "" && slices.ContainsFunc(s.state.Users, func(u models.User) bool {
+		return u.SCIM != nil && u.ExternalID == "" && u.AuthProvider == "oidc" && !u.SCIM.Deleted && strings.EqualFold(u.SCIM.UserName, id.LoginName)
+	}) {
+		return -1, "a SCIM-provisioned account has this userName but its externalId does not match the token subject " +
+			"(accounts are linked by the immutable user ID only; map the SCIM externalId to it)"
+	}
+	return -1, ""
+}
+
+// staleSCIMLink reports why the account linked to the subject of id must not be used: SCIM is
+// authoritative for the immutable user ID of the accounts it manages, so a SCIM-managed account with an
+// externalId accepts only a token subject exactly equal to it. Links of other subjects are left by
+// earlier builds, which revived deleted records by userName and kept their link when the externalId
+// changed (both now remove it, see unlinkSSOLocked); the owner's next sign-in replaces them
+// (scimLinkCandidateLocked).
+func staleSCIMLink(u models.User, id SSOIdentity) string {
+	if u.SCIM == nil || u.SCIM.ExternalID == "" || u.SCIM.ExternalID == id.Subject {
+		return ""
+	}
+	return fmt.Sprintf("the account %s is linked to this subject, but its SCIM externalId is a different immutable user ID "+
+		"(stale link; the sign-in of the subject equal to the externalId replaces it)", u.Username)
 }
 
 // ErrSSONotAuthorized is returned when none of the user's IdP groups is mapped to a role.
 var (
 	ErrSSONotAuthorized = errors.New("your account is not assigned to an AegisProxy role")
 	ErrSSOUserDisabled  = errors.New("your account was disabled by an administrator")
-	ErrSSOLinkConflict  = errors.New("an account provisioned for your user name exists, but its SCIM externalId does not match your sign-in")
+	ErrSSOLinkConflict  = errors.New("an account provisioned for you exists, but its SCIM externalId (your immutable user ID) does not match your sign-in")
 )
 
 // ProvisionSSOUser maps IdP groups to a role and creates or updates the local user record.
@@ -382,27 +403,45 @@ func (s *Store) ProvisionSSOUser(id SSOIdentity) (*models.User, error) {
 		}
 		ext := externalID(id.Issuer, id.Subject)
 		i := slices.IndexFunc(s.state.Users, func(u models.User) bool { return u.ExternalID == ext })
-		if i < 0 {
-			if i, conflict = s.scimLinkCandidateLocked(id); conflict {
-				s.appendAuditLocked(models.AuditEvent{
-					Actor: id.Username, ActorRole: "SSO", Action: "LOGIN_SSO_DENIED", Category: "IDENTITY",
-					EntityType: "user", EntityID: ext, EntityName: id.Username,
-					Summary: fmt.Sprintf("Single sign-on denied for %s: a SCIM-provisioned account has this userName but its externalId does not "+
-						"match the token subject (accounts are linked by the immutable user ID only; map the SCIM externalId to it)", id.Username),
-				})
-				s.markDirtyLocked()
-				return nil
-			}
-			if i >= 0 {
+		refused, entityID, entityName := "", ext, id.Username
+		linkedAt := time.Now().UTC()
+		if i >= 0 {
+			if refused = staleSCIMLink(s.state.Users[i], id); refused != "" {
+				// Sessions obtained through the stale link end now; the link stays until the owner replaces it.
 				u := &s.state.Users[i]
-				u.ExternalID = ext
-				s.appendAuditLocked(models.AuditEvent{
-					Actor: "system", ActorRole: "SSO", Action: "USER_LINKED_SSO", Category: "IDENTITY",
-					EntityType: "user", EntityID: u.ID, EntityName: u.Username,
-					Summary: fmt.Sprintf("First single sign-on of %s linked to the SCIM-provisioned account (userName %s)", u.Username, u.SCIM.UserName),
-				})
-				s.markDirtyLocked()
+				entityID, entityName, u.SessionsNotBefore = u.ID, u.Username, &linkedAt
 			}
+		} else if i, refused = s.scimLinkCandidateLocked(id); i >= 0 {
+			u := &s.state.Users[i]
+			summary := fmt.Sprintf("First single sign-on of %s linked to the SCIM-provisioned account (userName %s, externalId = token subject)", u.Username, u.SCIM.UserName)
+			if u.ExternalID != "" {
+				summary = fmt.Sprintf("Single sign-on of %s linked to the SCIM-provisioned account (userName %s, externalId = token subject); "+
+					"it replaces a link to another subject, whose sessions are revoked", u.Username, u.SCIM.UserName)
+				u.SessionsNotBefore = &linkedAt
+			}
+			s.appendAuditLocked(models.AuditEvent{
+				Actor: "system", ActorRole: "SSO", Action: "USER_LINKED_SSO", Category: "IDENTITY",
+				EntityType: "user", EntityID: u.ID, EntityName: u.Username, Summary: summary,
+				BeforeState: "sso_link=" + u.ExternalID, AfterState: "sso_link=" + ext,
+			})
+			u.ExternalID = ext
+			s.markDirtyLocked()
+		} else if refused == "" && id.Subject != "" {
+			// A subject the SCIM client deleted is refused as deprovisioned (below), without linking the record:
+			// it no longer belongs to anybody, and only the same externalId revives it.
+			i = slices.IndexFunc(s.state.Users, func(u models.User) bool {
+				return u.SCIM != nil && u.SCIM.Deleted && u.SCIM.ExternalID == id.Subject
+			})
+		}
+		if refused != "" {
+			s.appendAuditLocked(models.AuditEvent{
+				Actor: id.Username, ActorRole: "SSO", Action: "LOGIN_SSO_DENIED", Category: "IDENTITY",
+				EntityType: "user", EntityID: entityID, EntityName: entityName,
+				Summary: fmt.Sprintf("Single sign-on denied for %s: %s", id.Username, refused),
+			})
+			s.markDirtyLocked()
+			conflict = true
+			return nil
 		}
 		// SCIM is authoritative for the accounts it manages: their role comes from the SCIM group
 		// memberships, not from the groups claim of the ID token.

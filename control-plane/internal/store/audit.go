@@ -860,8 +860,10 @@ type AuditVerification struct {
 // that it reaches the newest event of the store, and that this newest event is exactly where the
 // sealed checkpoint saved with the configuration says (no events cut off the end). The result counts
 // as a complete verification (AuditFullCheck): a modified trail is recorded as an integrity violation.
+// A caller that arrives while a complete verification is in progress (another request, the background
+// verification) gets the outcome of that pass instead of starting another; ctx bounds the wait.
 func (s *Store) VerifyCompleteAudit(ctx context.Context, auditLogPath string) AuditVerification {
-	res, err := s.checkCompleteTrail(ctx, auditLogPath, false, "api")
+	res, err := s.checkCompleteTrail(ctx, auditLogPath, "api")
 	if err != nil {
 		res.OK, res.Error = false, err.Error()
 	} else {

@@ -1716,10 +1716,12 @@ paths:
         case-insensitive; `409 uniqueness` otherwise). Stored: `externalId`, `active`, `displayName`, `name`,
         `title`, `emails`, enterprise `department`; other attributes (password, phone numbers, addresses, manager,
         `groups` …) are ignored. The console username is derived from `userName` like single sign-on does (`@` →
-        `.`); it never takes over a local account (a suffix is added). A single-sign-on account that signed in
-        before (same subject or username) is taken over instead of duplicated (`USER_LINKED_SCIM`), and a user
-        deleted earlier by SCIM is revived. Role and Team Lead scope come from the SCIM groups the user is a member
-        of (see `Groups`); without a mapped group the account stays disabled. Audited as `USER_PROVISIONED_SCIM`.
+        `.`); it never takes over a local account or the name of a deleted user's record (a suffix is added). A
+        single-sign-on account that signed in before with `externalId` as its subject is taken over instead of
+        duplicated (`USER_LINKED_SCIM`), and a user deleted earlier by SCIM is revived when the `externalId` is
+        the same (compared exactly; a `userName` alone never revives a record or takes over an account). Role and
+        Team Lead scope come from the SCIM groups the user is a member of (see `Groups`); without a mapped group
+        the account stays disabled. Audited as `USER_PROVISIONED_SCIM`.
       security:
         - scimToken: []
       requestBody:
@@ -1826,6 +1828,8 @@ paths:
       description: |
         Replaces all writable attributes (absent attributes are cleared; absent `active` means active). Changing
         `active` to false disables the account and revokes its sessions at once (`USER_DEPROVISIONED_SCIM`).
+        Changing `externalId` (here or with PATCH) removes the single sign-on link and revokes the sessions
+        (`USER_UNLINKED_SSO`): only a subject equal to the new `externalId` links the account again.
       security:
         - scimToken: []
       parameters:
@@ -1907,9 +1911,10 @@ paths:
       operationId: deleteScimUser
       summary: Delete a user
       description: |
-        Deprovisions the account: it is disabled, all sessions are revoked, it leaves every SCIM group and is no
-        longer a SCIM resource (`404` afterwards). The console record stays (disabled) for the audit trail;
-        provisioning the same user again revives it. Audited as `USER_DEPROVISIONED_SCIM`.
+        Deprovisions the account: it is disabled, all sessions are revoked, its single sign-on link is removed
+        (`USER_UNLINKED_SSO`), it leaves every SCIM group and is no longer a SCIM resource (`404` afterwards). The
+        console record stays (disabled) for the audit trail; provisioning a user with the same `externalId`
+        revives it. Audited as `USER_DEPROVISIONED_SCIM`.
       security:
         - scimToken: []
       responses:
@@ -4805,7 +4810,9 @@ paths:
         still awaits acceptance (`legacy_pending: true`, error starting with `legacy_pending:`). A changed,
         inserted or deleted event found here is recorded as an integrity violation (audited, alerted);
         a trail that does not start at its sealed origin is alerted but not recorded (retention in
-        progress). The same verification runs in the background (`AEGIS_AUDIT_VERIFY_INTERVAL`).
+        progress). The same verification runs in the background (`AEGIS_AUDIT_VERIFY_INTERVAL`). Single
+        flight: while a complete verification is in progress (another request's or the background one),
+        the request waits for it and returns its outcome instead of starting another pass.
 
         **Roles:** Super Admin, InfoSec Approver, Auditor (Team Leads: 403).
       responses:

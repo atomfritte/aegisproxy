@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,6 +126,97 @@ func TestOverlappingVerificationsKeepNewestOutcome(t *testing.T) {
 	v.st.finishFullCheck(ctx, older, "start-up", AuditVerification{Events: 7}, nil, nil)
 	if c := v.st.AuditFullCheck(); c.OK || c.Trigger != "api" || !strings.Contains(c.Error, "generation unreadable") || c.Running {
 		t.Fatalf("an older verification replaced the newer outcome: %+v", c)
+	}
+}
+
+// Round-4 finding RD4-3: concurrent requests for a complete verification (GET /api/audit/verify) share
+// the pass in progress instead of starting one each, and so does the background verification; every
+// caller gets the outcome of that one pass. A caller that stops waiting (request context) returns at
+// once while the pass goes on.
+func TestConcurrentVerificationsShareOnePass(t *testing.T) {
+	minGap := auditVerifyMinGap
+	auditVerifyMinGap = 0 // a rotation verifies at once
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	release := make(chan struct{})
+	releasePass := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() { // after the store closed (cleanups run in reverse order)
+		auditVerifyMinGap = minGap
+		auditVerifyPassHook.Store(nil)
+	})
+	v := openVerifyingStore(t, dir, path)
+	t.Cleanup(releasePass) // before the store closes: a held pass would block Close
+	waitFullCheck(t, v.st)
+	mkAuditGroups(t, v.st, 3)
+	flight := func() (passes uint64, callers int) {
+		v.st.full.mu.Lock()
+		defer v.st.full.mu.Unlock()
+		if f := v.st.full.flights[""]; f != nil {
+			callers = f.callers
+		}
+		return v.st.full.started, callers
+	}
+	eventually(t, "start-up pass done", func() bool { _, c := flight(); return c == 0 })
+	startedBefore, _ := flight()
+	hold := func(st *Store) {
+		if st == v.st {
+			<-release
+		}
+	}
+	auditVerifyPassHook.Store(&hold)
+
+	const callers = 12
+	results := make(chan AuditVerification, callers)
+	for range callers {
+		go func() { results <- v.st.VerifyCompleteAudit(context.Background(), path) }()
+	}
+	eventually(t, "every caller waits for the pass", func() bool { _, c := flight(); return c == callers })
+	v.st.kickAuditVerify("rotation")
+	eventually(t, "the background verification joins the pass", func() bool { _, c := flight(); return c == callers+1 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	gone := make(chan AuditVerification, 1)
+	go func() { gone <- v.st.VerifyCompleteAudit(ctx, path) }()
+	eventually(t, "the last caller waits", func() bool { _, c := flight(); return c == callers+2 })
+	cancel()
+	select {
+	case res := <-gone:
+		if res.OK || !strings.Contains(res.Error, "context canceled") {
+			t.Fatalf("caller that stopped waiting: %+v", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a caller whose context ended is still waiting")
+	}
+	if c := v.st.AuditFullCheck(); !c.Running {
+		t.Fatalf("the pass stopped with its caller: %+v", c)
+	}
+
+	releasePass()
+	var first AuditVerification
+	for i := range callers {
+		res := <-results
+		if !res.OK || res.Events == 0 {
+			t.Fatalf("caller %d: %+v", i, res)
+		}
+		if i == 0 {
+			first = res
+		} else if res != first {
+			t.Fatalf("callers got different outcomes: %+v / %+v", first, res)
+		}
+	}
+	if passes, _ := flight(); passes-startedBefore != 1 {
+		t.Fatalf("%d concurrent callers and the background verification started %d passes, want 1", callers+2, passes-startedBefore)
+	}
+	if c := waitFullCheck(t, v.st); !c.OK || c.Trigger != "api" || c.Events != first.Events {
+		t.Fatalf("outcome kept as the last complete verification: %+v", c)
+	}
+	// The outcome is not cached: a later request verifies the trail again.
+	eventually(t, "pass finished", func() bool { _, c := flight(); return c == 0 })
+	if res := v.st.VerifyCompleteAudit(context.Background(), path); !res.OK {
+		t.Fatalf("later request: %+v", res)
+	}
+	if passes, _ := flight(); passes-startedBefore != 2 {
+		t.Fatalf("a later request started %d passes in total, want 2", passes-startedBefore)
 	}
 }
 
