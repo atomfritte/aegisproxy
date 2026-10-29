@@ -7,6 +7,8 @@
 .DESCRIPTION
     * refuses installation sources that non-administrators can change (this script, -DistDir, the web.config
       template, and every folder above them), before it copies any of them
+    * refuses a -PhysicalPath below a directory that non-administrators may rename or replace (every directory up
+      to the volume root); directories it creates above the site directory get an ACL of their own
     * installs the required IIS role services (Web-Server, Web-Static-Content, optionally Web-Http-Redirect)
     * verifies that the IIS URL Rewrite module is installed (required by web.config: SPA fallback, HTTPS redirect)
     * creates a dedicated application pool ("No Managed Code", ApplicationPoolIdentity) and site
@@ -64,6 +66,14 @@
     Not recommended: keep the release in a folder that only administrators control (docs/deployment/windows.md,
     section 2).
 
+.PARAMETER AllowWritableParent
+    Accept a -PhysicalPath below a directory that non-administrators own or may rename, delete entries in, change
+    the permissions of or take ownership of, or below a junction or symbolic link - every directory up to the volume
+    root counts. Whoever may rename such a directory can put another console (scripts in every administrator's
+    browser) and web.config in place of the site directory. Directories above it that do not exist yet are not a
+    reason: the script creates them with an ACL of their own (owner Administrators; SYSTEM/Administrators full
+    control, Users read). Not recommended.
+
 .EXAMPLE
     .\Install-AegisConsole-IIS.ps1 -HostName aegis-console.corp.example -CertificateThumbprint 3F2A...C9 `
         -ApiBaseUrl https://aegis-api.corp.example -AddHttpBinding
@@ -116,7 +126,9 @@ param(
 
     [switch]$SkipUrlRewriteCheck,
 
-    [switch]$AllowWritableSource
+    [switch]$AllowWritableSource,
+
+    [switch]$AllowWritableParent
 )
 
 Set-StrictMode -Version Latest
@@ -165,22 +177,32 @@ function Get-WritableSource {
     # lets others replace their entries counts, on the directory itself: 852032 (Delete = rename, without creating
     # files and folders, which the volume root allows everyone), 786496 on the volume root (it cannot be renamed).
     # CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners, which are checked themselves.
-    param([string[]]$Path = @())
+    # -Location takes directories that the installers take over themselves (program, data and site directories) or
+    # check otherwise (the Python directory): only the directories above them count, like those above a source.
+    # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
+    param([string[]]$Path = @(), [string[]]$Location = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
         'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests'; 'S-1-5-32-547' = 'Power Users'; 'S-1-5-32-555' = 'Remote Desktop Users'
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
+    $starts = New-Object System.Collections.Generic.List[object]
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+    }
+    foreach ($p in @($Location | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+    }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
-    foreach ($p in @($Path | Where-Object { $_ })) {
-        if (-not (Test-Path -LiteralPath $p)) { continue }
-        $current = (Resolve-Path -LiteralPath $p).ProviderPath
+    foreach ($start in $starts) {
+        $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
-        $above = $false
+        $above = $start.Above
         while ($current -and -not $seen.ContainsKey("$above|$current")) {
             $seen["$above|$current"] = $true
-            $checks.Add(@{ Path = $current; Above = $above })
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
         }
@@ -240,6 +262,40 @@ function Assert-TrustedSource {
         'Copy it again rather than fixing the ACLs in place: files that others could change may have been altered') -f ($list -join "`n"), $folder
     if (-not $Allow) { throw "$message. Or pass -AllowWritableSource to accept the risk." }
     Write-Note "$message. Continuing because of -AllowWritableSource."
+}
+
+function Assert-TrustedLocation {
+    # Stops before the program, data or site directories are created or taken over when Get-WritableSource reports a
+    # directory above them (with -Allow: warns), and shows how to give such a directory an ACL of its own.
+    param([string[]]$Path = @(), [switch]$Allow)
+    $writable = @(Get-WritableSource -Location $Path | Sort-Object -Property Path)
+    if (-not $writable.Count) { return }
+    $list = @($writable | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($writable.Count -gt 15) { $list += "  ... and $($writable.Count - 15) more" }
+    $folder = @($writable | Where-Object { [System.IO.Path]::GetDirectoryName($_.Path) } | ForEach-Object { $_.Path }) + @('<folder>')
+    $message = ("Non-administrators can rename or replace directories above the directories this script installs into:`n{0}`n" +
+        'Whoever may rename one of them can put other files in place of the installation (programs that run as a service, ' +
+        "its secrets, the console). Keep the default directories, or give the listed directory an ACL that only administrators control:`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`"`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /L`n" +
+        '(this also changes what the directories below it inherit; docs/deployment/windows.md, troubleshooting) and remove a listed junction or symbolic link') -f
+        ($list -join "`n"), $folder[0]
+    if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
+    Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Get-NewParent([string[]]$Path) {
+    # Directories above Path that do not exist yet, top-down. The installers create them together with Path and then
+    # give them an ACL of their own: they would inherit what the directory above passes on (on a client edition the
+    # volume root passes Modify for authenticated users to every new folder).
+    $new = @()
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -le 3) { continue }
+        $current = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/'))
+        while ($current -and -not (Test-Path -LiteralPath $current)) { $new += $current; $current = [System.IO.Path]::GetDirectoryName($current) }
+    }
+    return @($new | Sort-Object -Unique | Sort-Object -Property Length)
 }
 
 function Get-AclProblem {
@@ -335,6 +391,9 @@ if (-not (Test-Path -LiteralPath $WebConfigTemplate)) { throw "web.config templa
 # accounts, including the folders above them (whoever may rename one can replace the files).
 Assert-TrustedSource -Path @($PSCommandPath, $DistDir, $WebConfigTemplate) -Allow:$AllowWritableSource
 $PhysicalPath = [System.IO.Path]::GetFullPath($PhysicalPath)
+# The site directory is taken over below; whoever may rename a directory above it could put another console in its
+# place. Checked again right before the site directory is created (IIS setup creates C:\inetpub in between).
+Assert-TrustedLocation -Path @($PhysicalPath) -Allow:$AllowWritableParent
 # The site directory may exist already (created by anyone who can write to its parent). Links in it are refused:
 # ACL changes and robocopy /MIR would act on their targets (hard-linked files: on the file elsewhere).
 # Protect-Directory checks again while it takes the directory over.
@@ -446,7 +505,14 @@ if ($PSCmdlet.ShouldProcess($AppPoolName, 'Create/update application pool')) {
 
 # --- content -----------------------------------------------------------------------------------------
 if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Take ownership, restrict ACL and deploy console files, web.config and config.js')) {
+    # Directories above the site directory that do not exist yet are listed before the check: whoever creates them
+    # meanwhile, they get an ACL of their own (owner Administrators), top-down, once the site directory exists.
+    $newParents = @(Get-NewParent @($PhysicalPath))
+    Assert-TrustedLocation -Path @($PhysicalPath) -Allow:$AllowWritableParent
     if (-not (Test-Path -LiteralPath $PhysicalPath)) { New-Item -ItemType Directory -Path $PhysicalPath -Force | Out-Null }
+    foreach ($dir in $newParents) {
+        Protect-Directory -Root $dir -Grant @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX') -Allowed @{ 'S-1-5-18' = 'F'; 'S-1-5-32-544' = 'F'; 'S-1-5-32-545' = 'RX' }
+    }
     # Before anything is written: Administrators take ownership, only SYSTEM/Administrators (full) and the pool
     # identity (read) keep access, and existing content is reset to inherit that (planted ACEs are removed).
     Protect-Directory -Root $PhysicalPath -Grant @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "IIS AppPool\${AppPoolName}:(OI)(CI)RX") -Allowed $SiteAcl

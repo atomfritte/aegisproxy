@@ -13,6 +13,8 @@
     What the script does (idempotent - a re-run upgrades the binary and keeps all secrets/state):
       * refuses installation sources that non-administrators can change (this script, the binary, the console, TLS
         and cluster imports, and every folder above them), before it runs or copies any of them
+      * refuses -InstallDir / -DataRoot below a directory that non-administrators may rename or replace (every
+        directory up to the volume root); directories it creates above them get an ACL of their own
       * copies the binary (and optionally the built web console) to -InstallDir
       * creates <DataRoot>\data, \certs, \secrets, \logs with restrictive ACLs; existing directories are taken
         over (owner Administrators, foreign ACEs removed) and the result is verified. Files that existed
@@ -116,6 +118,14 @@
     change the permissions, take ownership). The script runs and copies these files with administrator rights, so
     whoever can change them gets those rights. Not recommended: keep the release in a folder that only
     administrators control (docs/deployment/windows.md, section 2).
+
+.PARAMETER AllowWritableParent
+    Accept -InstallDir or -DataRoot below a directory that non-administrators own or may rename, delete entries in,
+    change the permissions of or take ownership of, or below a junction or symbolic link - every directory up to the
+    volume root counts. Whoever may rename such a directory can put other files in place of the installation: a
+    binary that runs as the service, its secrets, the CA, the state. Directories above them that do not exist yet are
+    not a reason: the script creates them with an ACL of their own (owner Administrators; SYSTEM/Administrators full
+    control, Users read). Not recommended.
 
 .PARAMETER Force
     Allow replacing an existing, different CA or secrets with -CaSourceDir / -ImportSecretsDir.
@@ -223,6 +233,9 @@ param(
 
     [Parameter(ParameterSetName = 'Install')]
     [switch]$AllowWritableSource,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowWritableParent,
 
     # Creates secrets\metrics.token and protects /metrics with it (AEGIS_METRICS_TOKEN_FILE).
     [Parameter(ParameterSetName = 'Install')]
@@ -457,22 +470,32 @@ function Get-WritableSource {
     # lets others replace their entries counts, on the directory itself: 852032 (Delete = rename, without creating
     # files and folders, which the volume root allows everyone), 786496 on the volume root (it cannot be renamed).
     # CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners, which are checked themselves.
-    param([string[]]$Path = @())
+    # -Location takes directories that the installers take over themselves (program, data and site directories) or
+    # check otherwise (the Python directory): only the directories above them count, like those above a source.
+    # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
+    param([string[]]$Path = @(), [string[]]$Location = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
         'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests'; 'S-1-5-32-547' = 'Power Users'; 'S-1-5-32-555' = 'Remote Desktop Users'
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
+    $starts = New-Object System.Collections.Generic.List[object]
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+    }
+    foreach ($p in @($Location | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+    }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
-    foreach ($p in @($Path | Where-Object { $_ })) {
-        if (-not (Test-Path -LiteralPath $p)) { continue }
-        $current = (Resolve-Path -LiteralPath $p).ProviderPath
+    foreach ($start in $starts) {
+        $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
-        $above = $false
+        $above = $start.Above
         while ($current -and -not $seen.ContainsKey("$above|$current")) {
             $seen["$above|$current"] = $true
-            $checks.Add(@{ Path = $current; Above = $above })
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
         }
@@ -532,6 +555,40 @@ function Assert-TrustedSource {
         'Copy it again rather than fixing the ACLs in place: files that others could change may have been altered') -f ($list -join "`n"), $folder
     if (-not $Allow) { throw "$message. Or pass -AllowWritableSource to accept the risk." }
     Write-Note "$message. Continuing because of -AllowWritableSource."
+}
+
+function Assert-TrustedLocation {
+    # Stops before the program, data or site directories are created or taken over when Get-WritableSource reports a
+    # directory above them (with -Allow: warns), and shows how to give such a directory an ACL of its own.
+    param([string[]]$Path = @(), [switch]$Allow)
+    $writable = @(Get-WritableSource -Location $Path | Sort-Object -Property Path)
+    if (-not $writable.Count) { return }
+    $list = @($writable | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($writable.Count -gt 15) { $list += "  ... and $($writable.Count - 15) more" }
+    $folder = @($writable | Where-Object { [System.IO.Path]::GetDirectoryName($_.Path) } | ForEach-Object { $_.Path }) + @('<folder>')
+    $message = ("Non-administrators can rename or replace directories above the directories this script installs into:`n{0}`n" +
+        'Whoever may rename one of them can put other files in place of the installation (programs that run as a service, ' +
+        "its secrets, the console). Keep the default directories, or give the listed directory an ACL that only administrators control:`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`"`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /L`n" +
+        '(this also changes what the directories below it inherit; docs/deployment/windows.md, troubleshooting) and remove a listed junction or symbolic link') -f
+        ($list -join "`n"), $folder[0]
+    if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
+    Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Get-NewParent([string[]]$Path) {
+    # Directories above Path that do not exist yet, top-down. The installers create them together with Path and then
+    # give them an ACL of their own: they would inherit what the directory above passes on (on a client edition the
+    # volume root passes Modify for authenticated users to every new folder).
+    $new = @()
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -le 3) { continue }
+        $current = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/'))
+        while ($current -and -not (Test-Path -LiteralPath $current)) { $new += $current; $current = [System.IO.Path]::GetDirectoryName($current) }
+    }
+    return @($new | Sort-Object -Unique | Sort-Object -Property Length)
 }
 
 function Get-AclProblem {
@@ -816,6 +873,13 @@ if ($loopbackTrusted -and $ExtraEnvironment -and $ExtraEnvironment.ContainsKey('
 # must be out of reach of other accounts, including the folders above it (whoever may rename one can replace the files).
 Assert-TrustedSource -Path @($PSCommandPath, $BinaryPath, $UiDir, $TlsCertFile, $TlsKeyFile, $ImportSecretsDir, $CaSourceDir) -Allow:$AllowWritableSource
 
+# The program and data directories are taken over below; whoever may rename a directory above them could put other ones
+# in their place (a binary that runs as the service, its secrets, the CA). Directories that do not exist yet are listed
+# first: whoever creates them meanwhile, this script gives them an ACL of their own once it has created the
+# installation directories.
+$newParents = @(Get-NewParent @($InstallDir, $DataRoot))
+Assert-TrustedLocation -Path @($InstallDir, $DataRoot) -Allow:$AllowWritableParent
+
 # --- binary ------------------------------------------------------------------------------------------
 $newBinary = $null
 if ($BinaryPath -and (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
@@ -885,6 +949,9 @@ if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and r
     foreach ($dir in @($InstallDir, $DataRoot, $DataDir, $CertsDir, $SecretsDir, $LogsDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
+    # Directories above them that this run created (or that someone created since the check): owner Administrators and
+    # an ACL of their own, top-down - they would inherit what the directory above passes on to new folders.
+    foreach ($dir in $newParents) { Protect-Directory -Root $dir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed ($AclAdmins + @{ 'S-1-5-32-545' = 'RX' }) }
     # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
     # protected roots. A custom -InstallDir outside %ProgramFiles% inherits "create files/folders" for users from
     # the volume root; the binary and the log rotation script must not be replaceable by them.

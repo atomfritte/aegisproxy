@@ -59,7 +59,8 @@ Describe '<Name>' -ForEach $Installers {
 
 Describe 'installation source check' {
     It 'is the same code in every installer (<Name>)' -TestCases @(
-        @{ Name = 'ConvertTo-FileRight' }, @{ Name = 'Get-WritableSource' }, @{ Name = 'Assert-TrustedSource' }
+        @{ Name = 'ConvertTo-FileRight' }, @{ Name = 'Get-WritableSource' }, @{ Name = 'Assert-TrustedSource' },
+        @{ Name = 'Assert-TrustedLocation' }, @{ Name = 'Get-NewParent' }
     ) {
         $scripts = @(Get-ChildItem -LiteralPath $Root -Filter 'Install-Aegis*.ps1' -File)
         $scripts.Count | Should -Be 3
@@ -80,6 +81,32 @@ Describe 'installation source check' {
             $check | Should -BeGreaterThan 0 -Because $case.Script
             $check | Should -BeLessThan $text.IndexOf($case.Before) -Because $case.Script
         }
+    }
+}
+
+Describe 'installation directory check' {
+    It 'lists the directories to create, then checks the way to the installation directories before <Before> (<Script>)' -TestCases @(
+        @{ Script = 'Install-AegisControlPlane.ps1'; Paths = '@($InstallDir, $DataRoot)'; Before = "ShouldProcess(`$ServiceName, 'Stop service for upgrade')" },
+        @{ Script = 'Install-AegisDataPlane.ps1'; Paths = '@($InstallDir, $dataTop)'; Before = "ShouldProcess(`$ServiceName, 'Stop service for upgrade')" },
+        @{ Script = 'Install-AegisConsole-IIS.ps1'; Paths = '@($PhysicalPath)'; Before = "ShouldProcess('IIS', 'Install role services')" },
+        @{ Script = 'Install-AegisConsole-IIS.ps1'; Paths = '@($PhysicalPath)'; Before = 'New-Item -ItemType Directory -Path $PhysicalPath'; Last = $true }
+    ) {
+        $text = [System.IO.File]::ReadAllText((Join-Path $Root $Script))
+        $check = if ($Last) { $text.LastIndexOf("Assert-TrustedLocation -Path $Paths") } else { $text.IndexOf("Assert-TrustedLocation -Path $Paths") }
+        $check | Should -BeGreaterThan 0
+        $check | Should -BeLessThan $text.IndexOf($Before)
+        if ($Script -ne 'Install-AegisConsole-IIS.ps1' -or $Last) {
+            $listed = $text.LastIndexOf("Get-NewParent $Paths", $check)
+            $listed | Should -BeGreaterThan 0 -Because 'directories that someone creates after the check must still be listed'
+            $text.Substring($listed, $check - $listed).Split("`n").Count | Should -Be 2 -Because 'the list is taken right before the check'
+        }
+    }
+
+    It 'checks the directories above the Python directory before the data-plane installer runs Python' {
+        $text = [System.IO.File]::ReadAllText((Join-Path $Root 'Install-AegisDataPlane.ps1'))
+        $check = $text.IndexOf('Get-WritableSource -Location @($pyHome)')
+        $check | Should -BeGreaterThan 0
+        $check | Should -BeLessThan $text.IndexOf('Invoke-Native -FilePath $pythonBase')
     }
 }
 

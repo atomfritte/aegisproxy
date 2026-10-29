@@ -70,6 +70,10 @@ function Initialize-FakeWindows {
     # %ProgramFiles% as shipped: read/execute for users.
     $global:FakeWin.Acl[(Get-FakeFullPath $env:ProgramFiles)] = @{ Protected = $true; Grants = [ordered]@{
             $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX' } }
+    # %ProgramData% as shipped: users may read and add files and folders (that they then own), not rename or delete those
+    # of others.
+    $global:FakeWin.Acl[(Get-FakeFullPath $env:ProgramData)] = @{ Protected = $true; Grants = [ordered]@{
+            $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX'; 'BUILTIN\Users' = '(CI)(WD,AD,WEA,WA)' } }
     # System drive as on a Windows client SKU: authenticated users may create folders in the volume root and modify
     # everything below it. Paths there that the installers do not lock down explicitly show up as user-writable.
     $global:FakeWin.Acl[(Get-FakeFullPath $drive)] = @{ Protected = $true; Grants = [ordered]@{

@@ -130,7 +130,7 @@ Describe 'Install-AegisDataPlane.ps1' {
             New-TestCa -Dir $certs | Out-Null
             { & $Installer @p } | Should -Throw '*-CaFile is required*' -Because 'without a control-plane service anybody may have put the file there'
             $FakeWin.Services['AegisControlPlane'] = @{ Status = 'Running'; StartType = 'Automatic' }
-            { & $Installer @p } | Should -Throw '*control-plane CA on this host is not restricted*S-1-5-11*'
+            { & $Installer @p } | Should -Throw '*control-plane CA on this host is not restricted*S-1-5-32-545*'
             $FakeWin.Acl[(Get-FakeFullPath $certs)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F' } }
             $run = Invoke-Installer -Path $Installer -Parameters $p
             $run.ExitCode | Should -Be 0
@@ -228,6 +228,42 @@ Describe 'Install-AegisDataPlane.ps1' {
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py })
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Not -Match 'can be modified by non-administrators'
+        }
+
+        It 'refuses a protected base interpreter when <Case>, before it runs it' -TestCases @(
+            @{ Case = 'a directory two levels above inherits Modify for authenticated users (client volume root)'; PyDir = 'Tools\Lang\Python313'; Weak = 'Tools'; Expect = 'Authenticated Users' },
+            @{ Case = 'users may rename the directory above'; PyDir = 'Tools\Python313'; Weak = 'Tools'; Ace = '(D)'; Expect = 'Users' },
+            @{ Case = 'everyone may take ownership of a directory two levels above'; PyDir = 'Tools\Lang\Python313'; Weak = 'Tools'; Ace = '(WO)'; Expect = 'Everyone' },
+            @{ Case = 'a directory above is a junction'; PyDir = 'Tools\Lang\Python313'; Link = 'Tools\Lang'; Expect = 'junction/symbolic link, its target is not checked' },
+            @{ Case = 'the Python directory is a junction'; PyDir = 'Tools\Python313'; Link = 'Tools\Python313'; Expect = 'junction/symbolic link, its target is not checked' }
+        ) {
+            $tools = Join-Path $env:SystemDrive 'Tools'
+            New-Item -ItemType Directory -Path $tools | Out-Null
+            if ($Link) {
+                # The real directory lives elsewhere (only administrators can change it there); a link points to it.
+                $target = Join-Path $FakeWin.Root ('elsewhere\' + (Split-Path -Leaf $Link))
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+                New-Item -ItemType SymbolicLink -Path (Join-Path $env:SystemDrive $Link) -Target $target | Out-Null
+            }
+            $py = New-FakePythonHome (Join-Path $env:SystemDrive $PyDir)
+            if ($Ace -or $Link) {
+                $FakeWin.Acl[(Get-FakeFullPath $tools)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
+            }
+            if ($Ace) { $FakeWin.Acl[(Get-FakeFullPath $tools)].Grants[@{ Users = 'BUILTIN\Users'; Everyone = '*S-1-1-0' }[$Expect]] = $Ace }
+            $reported = Get-FakeFullPath (Join-Path $env:SystemDrive $(if ($Link) { $Link } else { $Weak }))
+            $err = { & $Installer @Base -PythonExe $py } | Should -Throw '*can be modified by non-administrators*-AllowWritablePython*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$reported ($Expect)"))
+            "$err" | Should -Match ([regex]::Escape('icacls <directory> /inheritance:r /grant:r'))
+            (Get-FakeCall 'python').Count | Should -Be 0 -Because 'the elevated installer must not start an untrusted interpreter'
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'continues with -AllowWritablePython when a directory above the interpreter can be renamed' {
+            $py = New-FakePythonHome (Join-Path $env:SystemDrive 'Tools\Lang\Python313')
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PythonExe = $py; AllowWritablePython = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match ([regex]::Escape("$(Get-FakeFullPath (Join-Path $env:SystemDrive 'Tools')) (Authenticated Users)"))
+            $run.Output | Should -Match 'Continuing because of -AllowWritablePython'
         }
 
         It 'rejects clamd address <Address>' -TestCases @(@{ Address = 'unix:///var/run/clamd.ctl' }, @{ Address = 'clamd' }, @{ Address = 'tcp://h:p' }) {
@@ -986,27 +1022,52 @@ Describe 'Install-AegisDataPlane.ps1' {
             @(Get-ChildItem -LiteralPath $target -Force).Count | Should -Be 0
         }
 
-        It 'refuses a custom -DataRoot whose parent <Case>, before changing anything' -TestCases @(
-            @{ Case = 'a non-administrator owns'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
-            @{ Case = 'lets users delete entries of'; Ace = '(DC)'; Expect = 'Users' }
+        It 'refuses a custom -DataRoot when <Case>, before changing anything' -TestCases @(
+            @{ Case = 'a non-administrator owns its parent'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'users may delete entries of its parent'; Ace = '(DC)'; Expect = 'Users' },
+            @{ Case = 'users may rename its parent'; Ace = '(D)'; Expect = 'Users' },
+            @{ Case = 'users may change the permissions of its parent'; Ace = '(WDAC)'; Expect = 'Users' },
+            @{ Case = 'its parent inherits Modify for authenticated users from the volume root (client edition)'; Inherit = $true; Expect = 'Authenticated Users' }
         ) {
             $parent = Join-Path $env:SystemDrive 'AegisData'
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            if ($Owner) { $FakeWin.Owner[(Get-FakeFullPath $parent)] = $Owner }
-            else { $FakeWin.Acl[(Get-FakeFullPath $parent)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-32-545' = $Ace } } }
+            $key = Get-FakeFullPath $parent
+            if (-not $Inherit) { $FakeWin.Acl[$key] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } } }
+            if ($Owner) { $FakeWin.Owner[$key] = $Owner }
+            if ($Ace) { $FakeWin.Acl[$key].Grants['BUILTIN\Users'] = $Ace }
             $p = Join-Parameters $Base @{ DataRoot = (Join-Path $parent 'data-plane') }
-            { & $Installer @p } | Should -Throw "*parent directory of -DataRoot can be modified by non-administrators*$parent ($Expect)*"
+            $err = { & $Installer @p } | Should -Throw '*Non-administrators can rename or replace directories above the directories this script installs into*-AllowWritableParent*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$key ($Expect)"))
             (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            (Get-FakeCall 'python').Count | Should -Be 0
             Test-Path -LiteralPath (Join-Path $parent 'data-plane') | Should -BeFalse
+        }
+
+        It 'installs a custom -DataRoot below a renamable parent with -AllowWritableParent and repeats the warning' {
+            $parent = Join-Path $env:SystemDrive 'AegisData'
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ DataRoot = (Join-Path $parent 'data-plane'); AllowWritableParent = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match ([regex]::Escape("$(Get-FakeFullPath $parent) (Authenticated Users)"))
+            $run.Output | Should -Match 'Continuing because of -AllowWritableParent'
         }
 
         It 'accepts a custom -DataRoot below a parent that administrators control and leaves that parent as it is' {
             $parent = Join-Path $env:SystemDrive 'AegisData'
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            icacls.exe $parent /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
             $p = Join-Parameters $Base @{ DataRoot = (Join-Path $parent 'data-plane') }
+            $FakeWin.Calls.Clear()
             (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
             @(Get-FakeCall 'icacls.exe' | Where-Object { (Get-FakeFullPath $_.Args[0]) -eq (Get-FakeFullPath $parent) }).Count | Should -Be 0
             Test-Path -LiteralPath (Split-Path -Parent $DataRoot) | Should -BeFalse -Because '%ProgramData%\AegisProxy is not used'
+        }
+
+        It 'checks the directories above %ProgramData%\AegisProxy' {
+            $FakeWin.Acl[(Get-FakeFullPath $env:ProgramData)].Grants['NT AUTHORITY\Authenticated Users'] = '(D)'
+            $err = { & $Installer @Base } | Should -Throw '*Non-administrators can rename or replace directories above*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $env:ProgramData) (Authenticated Users)"))
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
         }
     }
 
@@ -1020,6 +1081,38 @@ Describe 'Install-AegisDataPlane.ps1' {
             foreach ($path in @($custom, (Join-Path $custom 'app'), (Join-Path (Join-Path $custom 'venv') 'Scripts'), (Join-Path $custom 'aegis-dataplane.exe'))) {
                 Test-FakeWritable $path | Should -BeFalse -Because "$path is loaded by the service"
             }
+            # C:\AegisProxy, created by the installer, would inherit Modify for authenticated users from the volume root.
+            $created = Split-Path -Parent $custom
+            (Get-Acl -LiteralPath $created).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+            Get-PrincipalList $created | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545')
+        }
+
+        It 'refuses an -InstallDir below a directory that authenticated users may rename, before it changes or runs anything' {
+            $tools = Join-Path $env:SystemDrive 'Tools'
+            New-Item -ItemType Directory -Path $tools | Out-Null
+            $err = { & $Installer @Base -InstallDir (Join-Path $tools 'AegisProxy\data-plane') } | Should -Throw '*Non-administrators can rename or replace directories above*-AllowWritableParent*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $tools) (Authenticated Users)"))
+            (Get-FakeCall 'python').Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $tools 'AegisProxy') | Should -BeFalse
+        }
+
+        It 'installs into that -InstallDir once the directory has an ACL of its own, or with -AllowWritableParent' {
+            $tools = Join-Path $env:SystemDrive 'Tools'
+            New-Item -ItemType Directory -Path $tools | Out-Null
+            $custom = [System.IO.Path]::GetFullPath((Join-Path $tools 'AegisProxy\data-plane'))
+            Register-FakeExecutable -Path (Join-Path (Join-Path $custom 'venv') 'Scripts\python.exe') -Function FakePython
+            Register-FakeExecutable -Path (Join-Path $custom 'aegis-dataplane.exe') -Function FakeWinSW
+            $script:WrapperXml = Join-Path $custom 'aegis-dataplane.xml'
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $custom; AllowWritableParent = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Continuing because of -AllowWritableParent'
+            icacls.exe $tools /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            icacls.exe $tools /setowner '*S-1-5-32-544' /L | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $custom })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'rename or replace directories above'
         }
     }
 
