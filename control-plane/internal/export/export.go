@@ -6,6 +6,7 @@
 package export
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -454,6 +455,7 @@ type runtime struct {
 	lastErrAt *time.Time
 	nextRetry time.Time
 	backoff   time.Duration
+	streams   map[string]*models.ExportStreamStatus // per-stream outcome (noteStreams)
 }
 
 // record is an event on its way to the destination.
@@ -763,6 +765,7 @@ func (rt *runtime) unsendable(recs []record, reasons []string, kind string) {
 		rt.dropped.Add(uint64(len(recs)))
 	}
 	rt.recordErr(reasons[0])
+	rt.noteStreams(recs, time.Now().UTC(), reasons[0], true)
 	rt.log.Warn("export records cannot be sent", "records", len(recs), "dead_letter", kept, "error", scrubError(rt.cfg, reasons[0]))
 	if slices.ContainsFunc(recs, isCritical) {
 		rt.alert(kind, kept)
@@ -800,6 +803,7 @@ func (rt *runtime) toSpool(recs []record) {
 	if err != nil {
 		rt.dropped.Add(uint64(len(recs)))
 		rt.recordErr("spool write failed: " + err.Error())
+		rt.noteStreams(recs, time.Now().UTC(), "spool write failed: "+err.Error(), true)
 		rt.log.Error("spool write failed; records dropped", "records", len(recs), "error", err)
 		rt.settle(recs, true)
 		return
@@ -816,6 +820,7 @@ func (rt *runtime) toSpool(recs []record) {
 			rt.dropped.Add(uint64(len(big)))
 		}
 		rt.recordErr(reason)
+		rt.noteStreams(big, time.Now().UTC(), reason, true)
 		rt.log.Error("export record too large for the spool", "records", len(big), "dead_letter", keptBig)
 		if slices.ContainsFunc(big, isCritical) {
 			rt.alert(alertOversize, keptBig)
@@ -880,6 +885,7 @@ func (rt *runtime) handle(batch []record, err error) int {
 		rt.mu.Lock()
 		rt.lastOK, rt.backoff, rt.nextRetry = &now, 0, time.Time{}
 		rt.mu.Unlock()
+		rt.noteStreams(batch, now, "", false)
 		rt.settle(batch, false)
 		return n
 	case errors.As(err, &part):
@@ -891,6 +897,13 @@ func (rt *runtime) handle(batch []record, err error) int {
 			if i >= 0 && i < from {
 				rej = append(rej, batch[i])
 				reasons = append(reasons, part.rejected[i])
+			}
+		}
+		for i := 0; i < from; i++ {
+			if reason, rejected := part.rejected[i]; !rejected {
+				rt.noteStreams(batch[i:i+1], now, "", false)
+			} else {
+				rt.noteStreams(batch[i:i+1], now, cmp.Or(reason, part.msg), true)
 			}
 		}
 		if delivered := from - len(rej); delivered > 0 {
@@ -915,6 +928,7 @@ func (rt *runtime) handle(batch []record, err error) int {
 		rt.failed.Add(uint64(n))
 		rt.discarded.Add(1)
 		rt.recordErr(pe.msg)
+		rt.noteStreams(batch, now, pe.msg, true)
 		kept := rt.deadLetter(batch, nil, pe.msg)
 		rt.log.Warn("export batch rejected", "records", n, "dead_letter", kept, "error", scrubError(rt.cfg, pe.msg))
 		if slices.ContainsFunc(batch, isCritical) {
@@ -924,6 +938,7 @@ func (rt *runtime) handle(batch []record, err error) int {
 		return n
 	case errors.As(err, &pend):
 		rt.recordErr(pend.msg)
+		rt.noteStreams(batch, now, pend.msg, false)
 		rt.mu.Lock()
 		rt.nextRetry = time.Now().Add(pendingRetry)
 		rt.mu.Unlock()
@@ -931,6 +946,7 @@ func (rt *runtime) handle(batch []record, err error) int {
 		return 0
 	default:
 		rt.recordErr(err.Error())
+		rt.noteStreams(batch, now, err.Error(), false)
 		rt.mu.Lock()
 		rt.backoff = min(max(rt.backoff*2, time.Second), 5*time.Minute)
 		jitter := time.Duration(rand.Int64N(int64(rt.backoff / 4)))
@@ -938,6 +954,37 @@ func (rt *runtime) handle(batch []record, err error) int {
 		rt.mu.Unlock()
 		rt.log.Warn("export destination unavailable; spooling", "records", n, "retry_in", rt.backoff.String(), "error", scrubError(rt.cfg, err.Error()))
 		return 0
+	}
+}
+
+// noteStreams records the outcome of a delivery attempt per stream: a destination may accept the traffic
+// records of a mixed sink and reject every audit record, so the sink-wide last success says nothing about
+// the audit stream (posture "Audit trail forwarded to a SIEM"). errMsg "" is a delivery; rejected marks
+// records that are not retried (dead-lettered or lost). Legacy spool records have no known stream.
+func (rt *runtime) noteStreams(recs []record, now time.Time, errMsg string, rejected bool) {
+	if errMsg != "" {
+		errMsg = scrubError(rt.cfg, errMsg)
+	}
+	at := &now
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, r := range recs {
+		if r.raw || r.ev.Stream == "" {
+			continue
+		}
+		st := rt.streams[r.ev.Stream]
+		if st == nil {
+			if rt.streams == nil {
+				rt.streams = map[string]*models.ExportStreamStatus{}
+			}
+			st = &models.ExportStreamStatus{}
+			rt.streams[r.ev.Stream] = st
+		}
+		if errMsg == "" {
+			st.LastSuccessAt = at
+		} else {
+			st.LastErrorAt, st.LastError, st.Rejected = at, errMsg, rejected
+		}
 	}
 }
 
@@ -1128,6 +1175,12 @@ func (rt *runtime) status(node string) models.ExportSinkStatus {
 	}
 	rt.mu.Lock()
 	st.LastSuccessAt, st.LastError, st.LastErrorAt = rt.lastOK, rt.lastErr, rt.lastErrAt
+	if len(rt.streams) > 0 {
+		st.Streams = make(map[string]models.ExportStreamStatus, len(rt.streams))
+		for name, s := range rt.streams {
+			st.Streams[name] = *s
+		}
+	}
 	retrying := time.Now().Before(rt.nextRetry) || st.SpoolRecords > 0
 	rt.mu.Unlock()
 	switch {

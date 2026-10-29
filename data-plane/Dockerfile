@@ -21,9 +21,12 @@ COPY aegis_dp/ /opt/aegis/aegis_dp/
 # pip check may only report mitmproxy's upper bounds that the security overrides exceed.
 # Bytecode comes only from the copied sources: any .pyc that slipped through the build context is deleted first
 # (compileall keeps, and Python then runs, a .pyc whose header matches the source's mtime and size).
+# aegis_dp holds plain modules only: a directory (package) or an extension module next to policy.py would be
+# imported instead of it; .dockerignore lets only the tracked *.py files through, and the build fails otherwise.
 RUN chmod 0755 /opt/aegis/entrypoint.sh /opt/aegis/healthcheck.py \
  && install -d -o 65532 -g 65532 -m 0700 /var/lib/aegis/flow-spool \
  && find /opt/aegis \( -name '*.pyc' -o -name '*.pyo' \) -delete \
+ && if find /opt/aegis/aegis_dp -mindepth 1 \( ! -type f -o ! -name '*.py' \) | grep .; then echo "aegis_dp: only *.py modules are allowed" >&2; exit 1; fi \
  && python3 -m compileall -q /opt/aegis \
  && chmod -R a+rX /opt/aegis \
  && sed -nE 's/^([A-Za-z0-9_.-]+)==.*/^mitmproxy .* has requirement \1[<>=!~,]/p' /opt/aegis/requirements-security.txt > /tmp/pip-tolerated \

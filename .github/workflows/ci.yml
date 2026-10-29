@@ -57,9 +57,9 @@ jobs:
       # The venv above holds only what Linux CPython 3.14 installs. The lock also pins packages for Windows (pydivert,
       # mitmproxy-windows), macOS and CPython 3.12/3.13 (backports-zstd), and the console regression suite has its own
       # lock: every pin of both, with the environment markers removed, is audited as well (still hash-locked).
-      - name: pip-audit (every pin of the data-plane and e2e locks, any platform or Python version)
+      - name: pip-audit (every pin of the data-plane, image and e2e locks, any platform or Python version)
         run: |
-          for lock in data-plane/requirements-lock.txt frontend/e2e/requirements.txt; do
+          for lock in data-plane/requirements-lock.txt data-plane/requirements-image.txt data-plane/requirements-extra.txt frontend/e2e/requirements.txt; do
             sed -E '/^[^#]/ s/ *;[^\\]*( \\)$/\1/' "$lock" > "$RUNNER_TEMP/all-pins.txt"
             if grep -qE '^[A-Za-z0-9][^#]*;' "$RUNNER_TEMP/all-pins.txt"; then echo "::error::$lock: environment marker left"; exit 1; fi
             /tmp/audit/bin/pip-audit --disable-pip --require-hashes -r "$RUNNER_TEMP/all-pins.txt"
@@ -80,7 +80,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 24, cache: npm, cache-dependency-path: frontend/package-lock.json }
       - run: npm --prefix frontend ci --no-fund
-      - run: npm --prefix frontend audit --omit=dev --audit-level=high
+      # Development dependencies included: the build toolchain (Vite, Rolldown, Tailwind, plugins) produces the
+      # shipped bundle.
+      - run: npm --prefix frontend audit --audit-level=high
       - run: npm --prefix frontend run build
 
   # Browser regression suite (frontend/e2e): the built console against fresh control planes, as every role.
@@ -149,7 +151,11 @@ jobs:
         shell: pwsh
         run: ./deploy/windows/tests/Invoke-InstallerTests.ps1 -OutputDir test-results
       - name: shell syntax (bash -n checks one file per call)
-        run: for f in deploy/systemd/install-linux.sh scripts/gen-secrets.sh frontend/e2e/run.sh; do bash -n "$f"; done
+        run: for f in deploy/systemd/install-linux.sh scripts/gen-secrets.sh scripts/gen-dockerignore.sh scripts/build-images.sh scripts/audit-image-python.sh frontend/e2e/run.sh; do bash -n "$f"; done
+      # The .dockerignore files allowlist exactly the tracked files of each image build context: a file added,
+      # renamed or deleted without regenerating them fails here (and in make images).
+      - name: image build contexts allowlist the tracked files
+        run: scripts/gen-dockerignore.sh --check
 
   # Both Windows installers on real Windows Server runners: services, virtual service accounts, ACLs,
   # CA roll-out script, proxying through the data-plane service, uninstall.
@@ -384,6 +390,16 @@ jobs:
             if [ "$got" != "$want" ]; then echo "::error::$f builds with $got, control-plane/go.mod requires $want: bump them together"; exit 1; fi
           done
       - run: make images VERSION=${{ github.sha }} IMAGE_TAG=${{ github.sha }}
+      # What the data-plane image actually ships (the mitmproxy base image's packages plus requirements-image.txt
+      # and requirements-extra.txt), not only the lock files: its site-packages are copied out of the built image
+      # and audited with the hash-locked pip-audit. Unlike the Trivy gate below this also fails on medium/low and
+      # unrated advisories.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with: { python-version: "3.14" }
+      - name: pip-audit (the packages in the data-plane image)
+        env:
+          IMAGE: ghcr.io/atomfritte/aegisproxy-data-plane:${{ github.sha }}
+        run: scripts/audit-image-python.sh "$IMAGE" "$RUNNER_TEMP/image-audit" mitmproxy msgpack urllib3 tornado brotli yara-x certifi
       - name: vulnerability scan (fails on fixable critical/high)
         # Trivy CLI image pinned by digest (no third-party action in the pipeline).
         env:

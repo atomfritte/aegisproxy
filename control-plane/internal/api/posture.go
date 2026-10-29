@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"aegisproxy/control-plane/internal/auth"
+	"aegisproxy/control-plane/internal/export"
 	"aegisproxy/control-plane/internal/models"
 	"aegisproxy/control-plane/internal/sealed"
 )
@@ -246,6 +247,11 @@ type postureAdd func(id, cat, title, status, detail, fix, doc string)
 // trustedProxyPostureCheck: only the reverse proxy can assert client addresses. Loopback is shared by every
 // local account and a broad range by every host in it; without the proxy secret each of them can choose the
 // address used for CIDR-bound API keys, sign-in throttling and the audit trail.
+//
+// With the secret only the proxy itself asserts addresses, and a loopback address in X-Forwarded-For counts as
+// the (local) client, never as a proxy hop (clientIP), so trusted loopback is safe. A broad range is not: a
+// host in it that connects through the proxy is skipped as a proxy hop, so it chooses its address when the
+// proxy appends to X-Forwarded-For (and counts as the proxy when it replaces the header).
 func (s *Server) trustedProxyPostureCheck(add postureAdd) {
 	const title = "Client addresses asserted only by the reverse proxy"
 	doc := "docs/configuration.md#trusted-proxies-and-sign-in-throttling"
@@ -253,15 +259,24 @@ func (s *Server) trustedProxyPostureCheck(add postureAdd) {
 		add("trusted-proxies", "platform", title, "pass", "no trusted proxies: the TCP peer is the client", "", doc)
 		return
 	}
-	if s.cfg.TrustedProxySecret != "" {
-		add("trusted-proxies", "platform", title, "pass", "trusted proxies authenticate with AEGIS_TRUSTED_PROXY_SECRET", "", doc)
-		return
-	}
-	var shared []string
+	var shared, broad []string
 	for _, p := range s.cfg.TrustedProxies {
 		if broadProxyRange(p) {
 			shared = append(shared, p.String())
+			if !p.Addr().IsLoopback() {
+				broad = append(broad, p.String())
+			}
 		}
+	}
+	if s.cfg.TrustedProxySecret != "" {
+		if len(broad) > 0 {
+			add("trusted-proxies", "platform", title, "warn", "AEGIS_TRUSTED_PROXIES trusts "+strings.Join(broad, ", ")+
+				": every host in that range that connects through the proxy is skipped as a proxy hop (it chooses its client address when the proxy appends to X-Forwarded-For)",
+				"Trust only the addresses (or names, AEGIS_TRUSTED_PROXY_HOSTS) of the proxies themselves, and let the edge proxy replace X-Forwarded-For with the address it sees (nginx: proxy_set_header X-Forwarded-For $remote_addr).", doc)
+			return
+		}
+		add("trusted-proxies", "platform", title, "pass", "trusted proxies authenticate with AEGIS_TRUSTED_PROXY_SECRET; a loopback address in X-Forwarded-For counts as a local client, never as a proxy hop", "", doc)
+		return
 	}
 	if len(shared) == 0 {
 		add("trusted-proxies", "platform", title, "pass", "trusted proxies listed by address or name", "", doc)
@@ -305,6 +320,28 @@ func (s *Server) encryptionPostureCheck(add postureAdd) {
 // forwarding the trail.
 const auditSinkStale = 15 * time.Minute
 
+// auditSinkDelivering reports whether a sink with the audit stream forwards the audit trail. Only the audit
+// stream's own outcome counts once audit records were sent: a mixed sink whose destination accepts the
+// traffic records but rejects every audit record does not deliver the trail. Rejected audit records are not
+// retried, so they count at once; an unavailable destination is tolerated for auditSinkStale after the last
+// audit delivery. Before the first audit record (and while the sink is not running yet, i.e. its
+// configuration is being applied) the sink-wide state decides.
+func auditSinkDelivering(st models.ExportSinkStatus, running bool) bool {
+	if !running {
+		return true
+	}
+	fresh := func(t *time.Time) bool { return t != nil && time.Since(*t) < auditSinkStale }
+	a, seen := st.Streams[models.StreamAudit]
+	switch {
+	case seen && a.Failing():
+		return !a.Rejected && fresh(a.LastSuccessAt)
+	case seen && st.State != "retrying":
+		return true // the last audit records were delivered; a sink-wide error is another stream's
+	default:
+		return st.State == "ok" || st.State == "idle" || fresh(st.LastSuccessAt)
+	}
+}
+
 // auditPostureChecks: the audit trail is forwarded, intact (verified completely), trusted end to end
 // and writable.
 func (s *Server) auditPostureChecks(add postureAdd) {
@@ -323,13 +360,30 @@ func (s *Server) auditPostureChecks(add postureAdd) {
 		}
 		configured++
 		st, running := status[sink.ID]
-		if !running || st.State == "ok" || st.State == "idle" || st.LastSuccessAt != nil && time.Since(*st.LastSuccessAt) < auditSinkStale {
-			delivering++ // not running yet: the configuration is being applied
+		if auditSinkDelivering(st, running) {
+			delivering++
 			continue
 		}
 		msg := sink.Name + ": " + st.State
+		if a, seen := st.Streams[models.StreamAudit]; seen && a.Failing() {
+			what := "audit records not delivered"
+			if a.Rejected {
+				what = "audit records rejected"
+			}
+			if a.LastError != "" {
+				what += ": " + export.ShortError(a.LastError) // InfoSec Approvers see the posture, too
+			}
+			msg += " (" + what + ")"
+			if a.LastSuccessAt != nil {
+				msg += ", last audit delivery " + a.LastSuccessAt.UTC().Format(time.RFC3339)
+			} else {
+				msg += ", no audit record delivered yet"
+			}
+			failing = append(failing, msg)
+			continue
+		}
 		if st.LastError != "" {
-			msg += " (" + st.LastError + ")"
+			msg += " (" + export.ShortError(st.LastError) + ")"
 		}
 		if st.LastSuccessAt != nil {
 			msg += ", last delivery " + st.LastSuccessAt.UTC().Format(time.RFC3339)

@@ -252,8 +252,33 @@ installations get both with `install-linux.sh --proxy-secret`; add the include t
 before reloading it. With nginx on another host (or a cluster), copy `nginx-proxy-auth.conf` to the nginx host
 and the same `trusted-proxy-secret` to every control-plane node.
 
+**nginx replaces `X-Forwarded-For`.** The secret proves that a request came through nginx, not who sent it to
+nginx. Every local account can also connect *through* nginx on loopback. If nginx appended to the client's header
+(`$proxy_add_x_forwarded_for`), such a user would send `X-Forwarded-For: 10.20.30.7` and nginx would forward
+`10.20.30.7, 127.0.0.1` together with the secret. `aegis-console.conf` therefore sets
+`proxy_set_header X-Forwarded-For $remote_addr;`, so only the address nginx sees reaches the control-plane. As a
+second line of defense, the control-plane never skips a loopback entry of `X-Forwarded-For` as a proxy hop: the
+request counts as coming from that loopback address. This rule covers loopback only, not other addresses of the
+nginx host. If you keep a configuration from an earlier release, change that line; `install-linux.sh` warns about
+nginx files that include `nginx-proxy-auth.conf` and still append.
+
+**Behind a corporate load balancer.** When a load balancer or WAF connects to nginx, either let nginx take the
+client address from it with the realip module, for exactly the load balancer's addresses (never `127.0.0.1` or a
+shared range):
+
+```nginx
+set_real_ip_from 10.50.0.10;     # the load balancer(s)
+real_ip_header   X-Forwarded-For;
+real_ip_recursive on;
+```
+
+so that `$remote_addr`, and therefore the forwarded header, is the client. Or append deliberately
+(`$proxy_add_x_forwarded_for`) and add the load balancer's addresses to `AEGIS_TRUSTED_PROXIES`, so the
+control-plane skips that hop. The load balancer itself must replace or append to the header it receives
+(HAProxy `http-request set-header X-Forwarded-For %[src]` or `option forwardfor`) and never pass it on unchanged.
+
 The nginx configuration enforces TLS 1.2/1.3 with Mozilla *intermediate* ciphers, HSTS, `client_max_body_size 16m`,
-`X-Forwarded-For`/`X-Forwarded-Proto`, disables buffering for the SSE stream `/api/flows/stream`
+`X-Forwarded-For` (replaced with the address nginx sees) and `X-Forwarded-Proto`, disables buffering for the SSE stream `/api/flows/stream`
 (`proxy_read_timeout 1h`), restricts `/metrics` to allowed networks and redirects HTTP to HTTPS. It uses
 `listen 443 ssl http2` for compatibility with nginx < 1.25.1 (newer versions print a deprecation warning; switch
 to `http2 on;` there). On Debian/Ubuntu, consider disabling the default site
@@ -358,7 +383,8 @@ networks. Load balancers in front of workers must not SNAT client traffic unless
 * `DATA_DIR` is only a cache in cluster mode.
 * **Control-plane load balancer** (or nginx `upstream` with all nodes): round robin, no stickiness (JWT sessions,
   change propagation via PostgreSQL `LISTEN/NOTIFY`), health check `GET /readyz` (includes the database), idle
-  timeout ≥ 1 h for `/api/flows/stream`, `X-Forwarded-For` + `AEGIS_TRUSTED_PROXIES` on every node,
+  timeout ≥ 1 h for `/api/flows/stream`, `X-Forwarded-For` (set by the load balancer to the address it sees, or
+  appended; see [section 5](#5-tls-and-nginx)) + `AEGIS_TRUSTED_PROXIES` on every node,
   `AEGIS_PUBLIC_URL` = load balancer URL.
 * **Worker load balancer:** TCP with **source-IP affinity** - redirect-object grants (allowed `302` to a signed
   CDN object) are kept per worker, so the follow-up request must hit the same worker. Preserve the client IP
@@ -518,6 +544,7 @@ sudo systemd-run --pty --uid=aegis --gid=aegis -p EnvironmentFile=/etc/aegis/con
 
 - [ ] `AEGIS_PUBLIC_URL` is `https://`; nginx (or native TLS) with a PKI certificate; HSTS active.
 - [ ] `AEGIS_LISTEN_ADDR=127.0.0.1:8081` behind a local nginx; `AEGIS_TRUSTED_PROXIES` lists exactly the proxies/LBs, and loopback only together with the proxy secret (nginx includes `/etc/aegis/nginx-proxy-auth.conf`).
+- [ ] nginx replaces `X-Forwarded-For` (`proxy_set_header X-Forwarded-For $remote_addr;`, or the realip module for exactly the load balancer's addresses) instead of appending the client's header.
 - [ ] Admin password changed, password files removed, personal accounts with least privilege, `AEGIS_DEMO_MODE=false`.
 - [ ] `/etc/aegis/secrets` 0700 and files 0600 root; `/etc/aegis/ca/mitmproxy-ca.pem` 0600 root; no secrets in `*.env`.
 - [ ] Units unchanged or changed only via drop-ins; `systemd-analyze security aegis-control-plane aegis-dataplane` reviewed.

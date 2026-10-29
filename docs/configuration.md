@@ -20,7 +20,7 @@ is versioned and recorded in the audit trail.
 | `AEGIS_DASHBOARD_URL` | = `AEGIS_PUBLIC_URL` | Console URL when the console is hosted separately (links in block pages and Teams/Slack messages). |
 | `AEGIS_PROXY_ADDRESS` | host of `AEGIS_PUBLIC_URL` + `:8080` | `host:port` that servers use as their HTTP(S) proxy (data-plane load balancer). Used in the onboarding snippets shown after rotating a server's proxy token. |
 | `AEGIS_TLS_CERT_FILE` / `AEGIS_TLS_KEY_FILE` | – | Native HTTPS (TLS ≥ 1.2). Alternatively terminate TLS at a reverse proxy or ingress controller. |
-| `AEGIS_TRUSTED_PROXIES` | – | CIDRs of reverse proxies / load balancers whose `X-Forwarded-For` header is trusted (login and SCIM throttling, CIDR-bound service accounts, audit IPs). Empty = the TCP peer is the client. List exactly the proxy addresses (e.g. `127.0.0.1/32,::1/128` for a local nginx), never whole private ranges: any client inside a trusted range could choose its own address. The right-most untrusted `X-Forwarded-For` entry is used, so appending proxies (`$proxy_add_x_forwarded_for`, HAProxy `option forwardfor`) are safe. See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
+| `AEGIS_TRUSTED_PROXIES` | – | CIDRs of reverse proxies / load balancers whose `X-Forwarded-For` header is trusted (login and SCIM throttling, CIDR-bound service accounts, audit IPs). Empty = the TCP peer is the client. List exactly the proxy addresses (e.g. `127.0.0.1/32,::1/128` for a local nginx), never whole private ranges: any client inside a trusted range could choose its own address. The right-most untrusted `X-Forwarded-For` entry is used; a loopback entry is never skipped as a proxy hop (it is a local client of the proxy). The edge proxy should replace the header with the address it sees (nginx `proxy_set_header X-Forwarded-For $remote_addr`). See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
 | `AEGIS_TRUSTED_PROXY_HOSTS` | – | Comma-separated DNS names whose current addresses are trusted like `AEGIS_TRUSTED_PROXIES`, for proxies with changing IPs: a headless Service selecting the ingress controller (or console) pods in Kubernetes, service names in Compose. Resolved every 30 s; names containing a dot are resolved as absolute names, so write them fully qualified. A name whose lookup fails keeps its last good addresses for at most 5 minutes. Names only (no IPs or ports). See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
 | `AEGIS_TRUSTED_PROXY_SECRET` (`_FILE`) | – | Shared secret of the trusted reverse proxies (≥ 32 characters of `A-Z a-z 0-9 -._~+/=`). When set, forwarding headers count only from trusted peers that also send `X-Aegis-Proxy-Auth: <secret>`; requests without it are attributed to the peer itself. Required whenever the trusted address is shared with other local accounts (loopback, a Docker bridge gateway). See [trusted proxies](#trusted-proxies-and-sign-in-throttling). |
 | `AEGIS_CORS_ORIGINS` | – | Comma-separated origins of a **separately hosted console**, e.g. `https://console.corp.example`. Credentials (the session cookie) are allowed for these origins. |
@@ -42,7 +42,28 @@ control-plane takes it from `X-Forwarded-For` only when the TCP peer is a truste
   `Install-AegisControlPlane.ps1` creates the secret for a loopback `-TrustedProxies` and
   `Install-AegisConsole-IIS.ps1 -ApiProxyTarget` lets ARR send it); forwarding headers from a trusted
   address without it are ignored and logged once. The posture report warns about loopback or broad ranges
-  (/16 or larger, IPv6 /48) trusted without the secret.
+  (/16 or larger, IPv6 /48) trusted without the secret, and about broad ranges trusted with it.
+
+- **The edge proxy replaces `X-Forwarded-For`:** the secret shows that a request came through the proxy, not who
+  sent it there, and every local account can connect *through* nginx on the same host. A proxy that appends
+  (`$proxy_add_x_forwarded_for`) forwards what the client wrote in front of the address it adds. The first proxy
+  that clients connect to must therefore set the header to the address it sees: nginx
+  `proxy_set_header X-Forwarded-For $remote_addr;` (`deploy/nginx/aegis-console.conf`), HAProxy
+  `http-request set-header X-Forwarded-For %[src]`. Proxies behind it may append, because the address the edge
+  recorded is not trusted, so the walk stops there. As defense in depth the control-plane never skips a
+  loopback address found *inside* `X-Forwarded-For` (`127.0.0.0/8`, `::1`, also written as
+  `::ffff:127.0.0.1`), even when loopback is a trusted proxy: it is a client on the proxy's own host, and the
+  request is attributed to that loopback address. Only the TCP peer itself is a trusted loopback proxy. Other
+  addresses of the proxy host, such as a Docker bridge gateway or the host's own address, are not covered by
+  this rule, so do not let clients reach the edge proxy from an address that is also trusted.
+- **Behind a corporate load balancer:** when a load balancer or WAF connects to nginx, either let nginx take
+  the client address from it with the realip module for exactly the load balancer's addresses
+  (`set_real_ip_from <LB>; real_ip_header X-Forwarded-For; real_ip_recursive on;`, never for `127.0.0.1` or a
+  shared range), or append deliberately and list the load balancer in `AEGIS_TRUSTED_PROXIES`. The load
+  balancer must replace or append to the header it receives from clients, never pass it on unchanged.
+  The Compose HA variant appends at HAProxy and at the console container on purpose: both are trusted by
+  name (`AEGIS_TRUSTED_PROXY_HOSTS=lb,console`), and no client can connect to them from those container
+  addresses.
 
 - **Kubernetes ingress:** trust the ingress controller by name instead of by a pod CIDR. A regular Service name
   resolves to its ClusterIP, not to the pod addresses that actually connect to the control-plane. Add a

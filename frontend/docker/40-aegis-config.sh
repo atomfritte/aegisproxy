@@ -27,7 +27,10 @@ add_header Cross-Origin-Opener-Policy "same-origin" always;
 HDR
 
 # Optional AEGIS_TRUSTED_PROXY_SECRET(_FILE): sent to the control-plane in X-Aegis-Proxy-Auth, so that only this
-# proxy (not every container that shares its address) can supply X-Forwarded-For. Same characters as the
+# proxy (not every container that shares its address) can supply X-Forwarded-For. X-Forwarded-For is appended to,
+# not replaced: the console usually sits behind an ingress or load balancer whose entry the control-plane needs.
+# The address appended here is the console's own peer: that ingress or load balancer (a trusted hop) or a client
+# (where the control-plane's walk stops), so entries a client writes itself are never used. Same characters as the
 # control-plane accepts, so it can be embedded into the nginx configuration verbatim.
 PROXY_AUTH=""
 SECRET="${AEGIS_TRUSTED_PROXY_SECRET:-}"

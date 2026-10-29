@@ -1,7 +1,9 @@
 package api
 
 import (
+	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,4 +139,136 @@ func TestAuditExportPostureRequiresDelivery(t *testing.T) {
 		c := postureByID(t, h)["audit-export"]
 		return c.Status == "fail" && strings.Contains(c.Detail, "no destination receives it") && strings.Contains(c.Detail, "siem: retrying")
 	})
+}
+
+// RD4-4: a mixed sink (audit + traffic) whose destination accepts the traffic records but rejects every audit
+// record does not forward the audit trail. The sink-wide last success is the traffic's; the posture counts the
+// audit stream's own deliveries, and passes again once the destination takes the audit records.
+func TestAuditExportPostureCountsOnlyAuditDeliveries(t *testing.T) {
+	var acceptAudit atomic.Bool
+	var auditSeen, trafficSeen atomic.Int64
+	es := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rd := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			rd = zr
+		}
+		b, _ := io.ReadAll(rd)
+		var items []string
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		for i := 1; i < len(lines); i += 2 { // action line, document line
+			if strings.Contains(lines[i], "aegisproxy.audit") {
+				auditSeen.Add(1)
+				if !acceptAudit.Load() {
+					items = append(items, `{"create":{"status":400,"error":{"type":"mapper_parsing_exception","reason":"failed to parse field [aegisproxy.audit.after]"}}}`)
+					continue
+				}
+			} else {
+				trafficSeen.Add(1)
+			}
+			items = append(items, `{"create":{"status":201}}`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
+	}))
+	defer es.Close()
+	h := newHarness(t)
+	h.login(t)
+	if r := h.do(t, "POST", "/api/integrations/exports", map[string]any{"name": "siem", "type": "elasticsearch", "enabled": true,
+		"endpoint": es.URL, "streams": []string{"audit", "traffic"}, "flush_seconds": 1, "spool_mb": 16}, ui); r.StatusCode >= 300 {
+		t.Fatalf("create sink: %d %s", r.StatusCode, body(t, r.Body))
+	}
+	n := 0
+	activity := func() { // one audit event and one traffic record
+		n++
+		if _, err := h.st.UpsertGroup(models.ServerGroup{ID: fmt.Sprintf("grp-rd44-%d", n), Name: "g"}, adminClaimsFor(h)); err != nil {
+			t.Fatal(err)
+		}
+		h.st.RecordFlow(models.TrafficFlow{Timestamp: time.Now().UTC(), ServerIP: "10.1.0.5", Method: "GET", Scheme: "https",
+			Host: "pkgs.example.org", Port: 443, Path: "/", FullURL: "https://pkgs.example.org/", Verdict: models.VerdictAllowed})
+	}
+	waitFor(t, "posture reports the sink that rejects the audit records", func() bool {
+		activity()
+		c := postureByID(t, h)["audit-export"]
+		return auditSeen.Load() > 0 && trafficSeen.Load() > 0 && c.Status == "fail" &&
+			strings.Contains(c.Detail, "audit records rejected") && strings.Contains(c.Detail, "mapper_parsing_exception") &&
+			strings.Contains(c.Detail, "no audit record delivered yet")
+	})
+	var st models.ExportSinkStatus
+	for _, s := range h.exportStatus(t) {
+		st = s
+	}
+	if tr := st.Streams[models.StreamTraffic]; tr.LastSuccessAt == nil || tr.Failing() || st.LastSuccessAt == nil {
+		t.Fatalf("traffic must be delivered (the sink-wide last success): %+v", st)
+	}
+	if a := st.Streams[models.StreamAudit]; !a.Failing() || !a.Rejected || a.LastSuccessAt != nil {
+		t.Fatalf("audit stream status: %+v", a)
+	}
+	acceptAudit.Store(true)
+	waitFor(t, "posture passes once the audit records are accepted", func() bool {
+		activity()
+		c := postureByID(t, h)["audit-export"]
+		return c.Status == "pass" && strings.Contains(c.Detail, "1 destination(s) receive the audit stream")
+	})
+}
+
+// exportStatus is the Log export status of the API.
+func (h *harness) exportStatus(t *testing.T) []models.ExportSinkStatus {
+	t.Helper()
+	r := h.do(t, "GET", "/api/integrations/exports", nil, nil)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("export status: %d %s", r.StatusCode, body(t, r.Body))
+	}
+	var out struct {
+		Status []models.ExportSinkStatus `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Status
+}
+
+// RD4-4: which status of a sink with the audit stream counts as forwarding the trail.
+func TestAuditSinkDelivering(t *testing.T) {
+	now := time.Now()
+	ago := func(d time.Duration) *time.Time { t := now.Add(-d); return &t }
+	audit := func(a models.ExportStreamStatus) map[string]models.ExportStreamStatus {
+		return map[string]models.ExportStreamStatus{models.StreamAudit: a, models.StreamTraffic: {LastSuccessAt: ago(0)}}
+	}
+	for _, c := range []struct {
+		name    string
+		st      models.ExportSinkStatus
+		running bool
+		want    bool
+	}{
+		{"not running yet", models.ExportSinkStatus{State: "error"}, false, true},
+		{"idle, no audit record yet", models.ExportSinkStatus{State: "idle"}, true, true},
+		{"failing sink, no audit record yet", models.ExportSinkStatus{State: "error", LastErrorAt: ago(0)}, true, false},
+		{"retrying, recent success, no audit record yet", models.ExportSinkStatus{State: "retrying", LastSuccessAt: ago(time.Minute)}, true, true},
+		{"retrying for long, no audit record yet", models.ExportSinkStatus{State: "retrying", LastSuccessAt: ago(time.Hour)}, true, false},
+		{"every audit record rejected, traffic delivered", models.ExportSinkStatus{State: "ok", LastSuccessAt: ago(0),
+			Streams: audit(models.ExportStreamStatus{LastErrorAt: ago(time.Second), Rejected: true})}, true, false},
+		{"audit rejected after an earlier audit delivery", models.ExportSinkStatus{State: "ok", LastSuccessAt: ago(0),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(time.Minute), LastErrorAt: ago(time.Second), Rejected: true})}, true, false},
+		{"audit delivered and rejected in one batch", models.ExportSinkStatus{State: "ok", LastSuccessAt: ago(time.Second),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(time.Second), LastErrorAt: ago(time.Second), Rejected: true})}, true, false},
+		{"audit delivered after a rejection", models.ExportSinkStatus{State: "ok", LastSuccessAt: ago(0),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(0), LastErrorAt: ago(time.Minute), Rejected: true})}, true, true},
+		{"destination briefly unavailable", models.ExportSinkStatus{State: "retrying", LastSuccessAt: ago(time.Minute),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(time.Minute), LastErrorAt: ago(time.Second)})}, true, true},
+		{"audit not delivered for long, traffic delivered", models.ExportSinkStatus{State: "retrying", LastSuccessAt: ago(0),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(time.Hour), LastErrorAt: ago(time.Second)})}, true, false},
+		{"audit delivered, traffic rejected", models.ExportSinkStatus{State: "error", LastSuccessAt: ago(time.Hour), LastErrorAt: ago(0),
+			Streams: map[string]models.ExportStreamStatus{models.StreamAudit: {LastSuccessAt: ago(time.Hour)}, models.StreamTraffic: {LastErrorAt: ago(0), Rejected: true}}}, true, true},
+		{"audit delivered, destination down for long", models.ExportSinkStatus{State: "retrying", LastSuccessAt: ago(time.Hour),
+			Streams: audit(models.ExportStreamStatus{LastSuccessAt: ago(time.Hour)})}, true, false},
+	} {
+		if got := auditSinkDelivering(c.st, c.running); got != c.want {
+			t.Errorf("%s: delivering=%t, want %t", c.name, got, c.want)
+		}
+	}
 }

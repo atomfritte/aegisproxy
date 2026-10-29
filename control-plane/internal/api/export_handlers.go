@@ -21,6 +21,10 @@ func (s *Server) handleListExports(w http.ResponseWriter, r *http.Request, claim
 		// Destination responses may echo request details; only the sink owner sees them in full.
 		for i := range status {
 			status[i].LastError = export.ShortError(status[i].LastError)
+			for name, st := range status[i].Streams { // a copy per call
+				st.LastError = export.ShortError(st.LastError)
+				status[i].Streams[name] = st
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

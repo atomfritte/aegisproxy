@@ -9323,6 +9323,28 @@ components:
         last_error_at:
           type: string
           format: date-time
+        streams:
+          type: object
+          description: |
+            Delivery state per stream (audit, security, traffic, ...) of the records this node sent. A destination
+            may accept one stream and reject every record of another; the posture check "Audit trail forwarded to
+            a SIEM" counts the audit stream's own outcome.
+          additionalProperties:
+            $ref: '#/components/schemas/ExportStreamStatus'
+    ExportStreamStatus:
+      type: object
+      properties:
+        last_success_at:
+          type: string
+          format: date-time
+        last_error_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+        rejected:
+          type: boolean
+          description: The last failure was a rejection (records dead-lettered or lost), not an unavailable destination.
     ExportTypeInfo:
       type: object
       required: [type, label, description, formats, endpoint_hint, fields]

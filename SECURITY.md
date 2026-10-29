@@ -46,6 +46,26 @@ The Helm chart supports pinning images with `*.image.digest`; the chart attached
 filled in (docs/deployment/kubernetes.md#images). Docker Compose never pulls AegisProxy images: it builds them
 from the checkout (`pull_policy: build`) and pins every third-party image by digest.
 
+### Building images yourself
+
+An image contains what its build context contains, so build only from a checkout that nobody else can write to,
+ideally a fresh clone at a verified tag. Release and CI images are built from a fresh checkout. Three measures
+keep unreviewed files out of self-built images:
+
+- The `.dockerignore` files of the four build contexts are allowlists of the tracked files
+  (`scripts/gen-dockerignore.sh`, enforced in CI). A file that git does not track, for example one hidden from
+  `git status` by `.gitignore` or `.git/info/exclude`, never reaches the builder: a `vendor/` directory or
+  `go.work`, a package directory or extension module that Python would import instead of a reviewed module, a
+  `postcss.config.js`/`.npmrc`, or a file under `frontend/public/` that Vite would copy into the console.
+- The Go builds run with `GOFLAGS=-mod=readonly GOWORK=off`: only the modules verified against `go.sum` are
+  compiled.
+- `make images` builds from the committed tree (`git archive HEAD`, or `IMAGE_REV=<tag>`), never from the working
+  copy, and refuses `.dockerignore` files that do not match that tree. Uncommitted changes are reported and not
+  built.
+
+Changes to tracked files are not covered by any of this. `docker build <dir>` and `docker compose build` send the
+working copy, so run `git status` first and expect it to be clean, or use `make images`.
+
 Releases are signed with cosign 3 (Sigstore bundle format); verify with cosign 3.0 or newer.
 
 Dependencies are monitored with Dependabot, govulncheck, pip-audit, npm audit and Trivy in CI. Every GitHub
@@ -56,7 +76,11 @@ The data-plane image ships without pip/setuptools. `data-plane/requirements-lock
 dependency of the data-plane (including transitive ones) with SHA-256 hashes; the Linux installer installs from
 it with `--require-hashes` by default, and the CI audit runs pip-audit (itself installed hash-locked) against the
 installed environment and against every pin of the lock, including the Windows, macOS and CPython 3.12/3.13-only
-entries, and of the console regression suite's lock (`frontend/e2e/requirements.txt`).
+entries, of the image overrides (`requirements-image.txt`, `requirements-extra.txt`) and of the console regression
+suite's lock (`frontend/e2e/requirements.txt`). It also audits the package directories copied out of the built
+data-plane image (`scripts/audit-image-python.sh`), so the packages of the mitmproxy base image are covered and a
+medium, low or unrated advisory fails the build, not only the fixable critical/high findings that Trivy gates on.
+`npm audit` covers the build toolchain of the console as well as its runtime dependencies.
 Where mitmproxy's version bounds exclude a security fix of a dependency, `data-plane/requirements-security.txt`
 installs the fixed release (currently Brotli 1.2.1 for CVE-2026-111497 and tornado 6.6 for CVE-2026-116577, CVE-2026-115927 and
 CVE-2026-116578; tornado serves only mitmweb, which the worker does not run) in the image, in both installers and in the
