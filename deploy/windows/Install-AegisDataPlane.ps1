@@ -15,11 +15,15 @@
     Steps (idempotent; a re-run upgrades addon/venv/WinSW configuration and keeps the staged secrets):
       * refuses installation sources that non-administrators can change (this script, the WinSW template, WinSW,
         data-plane\, the lock file, the CA files, and every folder above them), before it runs or copies any of them
+      * refuses -InstallDir / -DataRoot below a directory that non-administrators may rename or replace (every
+        directory up to the volume root)
       * resolves Python (-PythonExe or the all-users installation of 3.12 / 3.13 / 3.14 registered in HKLM) and
-        refuses an interpreter that non-administrators can modify before it runs it for the first time
+        refuses an interpreter that non-administrators can modify (also through a directory above it) before it
+        runs it for the first time
       * takes over existing directories (owner Administrators, foreign ACEs removed), including
         %ProgramData%\AegisProxy above the default data root; files that existed before are only kept on an
-        upgrade of an intact installation or with -AdoptExistingSecrets
+        upgrade of an intact installation or with -AdoptExistingSecrets. Directories it creates above -InstallDir /
+        -DataRoot get an ACL of their own
       * creates <InstallDir>\venv and installs the hash-locked data-plane\requirements-lock.txt (mitmproxy 12.3.0,
         YARA-X and every dependency, binary wheels only) with pip --require-hashes
       * copies data-plane\aegis_addon.py + aegis_dp\ to <InstallDir>\app (byte-compiled)
@@ -51,8 +55,9 @@
 .PARAMETER AllowWritablePython
     Accept a base interpreter whose directory, Lib, DLLs or site-packages non-administrators (Users,
     Authenticated Users, Everyone, INTERACTIVE, ...) can modify or create files in, e.g. C:\Python312 below a
-    volume root that lets users create files. Code planted there runs in the service, and in this script (as
-    Administrator) as soon as it runs the interpreter. Not recommended.
+    volume root that lets users create files, or that sits below a directory they may rename (every directory up to
+    the volume root counts) or behind a junction or symbolic link. Code planted there runs in the service, and in
+    this script (as Administrator) as soon as it runs the interpreter. Not recommended.
 
 .PARAMETER AllowWritableSource
     Accept installation sources that non-administrators can change: this script, the WinSW template next to it,
@@ -63,12 +68,21 @@
     administrator rights, and the addon and the lock file decide which code runs in the service. Not recommended:
     keep the release in a folder that only administrators control (docs/deployment/windows.md, section 2).
 
+.PARAMETER AllowWritableParent
+    Accept -InstallDir or -DataRoot below a directory that non-administrators own or may rename, delete entries in,
+    change the permissions of or take ownership of, or below a junction or symbolic link - every directory up to the
+    volume root counts (for the default data root: those above %ProgramData%\AegisProxy, which is taken over). Whoever
+    may rename such a directory can put another venv, addon or WinSW in place of the installation, which then runs as
+    the service. Directories above them that do not exist yet are not a reason: the script creates them with an ACL of
+    their own (owner Administrators; SYSTEM/Administrators full control, Users read). Not recommended.
+
 .PARAMETER DataRoot
     Data directory (default %ProgramData%\AegisProxy\data-plane). Its parent %ProgramData%\AegisProxy is taken over
     as well (owner Administrators, SYSTEM/Administrators only; a control-plane on this host keeps the ACLs of its own
     subdirectories): whoever owns the parent could rename the data directory and put a junction in its place. Any
-    other parent must already be controlled by administrators - the installation stops if a non-administrator owns
-    it or may delete entries in it, change its permissions or take ownership of it.
+    other parent, and every directory above, must already be controlled by administrators - the installation stops
+    if a non-administrator owns one of them or may rename it, delete entries in it, change its permissions or take
+    ownership of it (see -AllowWritableParent; the same holds for -InstallDir).
 
 .PARAMETER SourceDir
     The repository's data-plane folder (contains aegis_addon.py and aegis_dp\). Default: ..\..\data-plane.
@@ -163,6 +177,9 @@ param(
 
     [Parameter(ParameterSetName = 'Install')]
     [switch]$AllowWritableSource,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$AllowWritableParent,
 
     [Parameter(ParameterSetName = 'Install')]
     [switch]$AllowUnencryptedImport,
@@ -478,22 +495,32 @@ function Get-WritableSource {
     # lets others replace their entries counts, on the directory itself: 852032 (Delete = rename, without creating
     # files and folders, which the volume root allows everyone), 786496 on the volume root (it cannot be renamed).
     # CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners, which are checked themselves.
-    param([string[]]$Path = @())
+    # -Location takes directories that the installers take over themselves (program, data and site directories) or
+    # check otherwise (the Python directory): only the directories above them count, like those above a source.
+    # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
+    param([string[]]$Path = @(), [string[]]$Location = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
         'S-1-5-32-545' = 'Users'; 'S-1-5-32-546' = 'Guests'; 'S-1-5-32-547' = 'Power Users'; 'S-1-5-32-555' = 'Remote Desktop Users'
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
+    $starts = New-Object System.Collections.Generic.List[object]
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+    }
+    foreach ($p in @($Location | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+    }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
-    foreach ($p in @($Path | Where-Object { $_ })) {
-        if (-not (Test-Path -LiteralPath $p)) { continue }
-        $current = (Resolve-Path -LiteralPath $p).ProviderPath
+    foreach ($start in $starts) {
+        $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
-        $above = $false
+        $above = $start.Above
         while ($current -and -not $seen.ContainsKey("$above|$current")) {
             $seen["$above|$current"] = $true
-            $checks.Add(@{ Path = $current; Above = $above })
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
         }
@@ -555,6 +582,40 @@ function Assert-TrustedSource {
     Write-Note "$message. Continuing because of -AllowWritableSource."
 }
 
+function Assert-TrustedLocation {
+    # Stops before the program, data or site directories are created or taken over when Get-WritableSource reports a
+    # directory above them (with -Allow: warns), and shows how to give such a directory an ACL of its own.
+    param([string[]]$Path = @(), [switch]$Allow)
+    $writable = @(Get-WritableSource -Location $Path | Sort-Object -Property Path)
+    if (-not $writable.Count) { return }
+    $list = @($writable | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($writable.Count -gt 15) { $list += "  ... and $($writable.Count - 15) more" }
+    $folder = @($writable | Where-Object { [System.IO.Path]::GetDirectoryName($_.Path) } | ForEach-Object { $_.Path }) + @('<folder>')
+    $message = ("Non-administrators can rename or replace directories above the directories this script installs into:`n{0}`n" +
+        'Whoever may rename one of them can put other files in place of the installation (programs that run as a service, ' +
+        "its secrets, the console). Keep the default directories, or give the listed directory an ACL that only administrators control:`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`"`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /L`n" +
+        '(this also changes what the directories below it inherit; docs/deployment/windows.md, troubleshooting) and remove a listed junction or symbolic link') -f
+        ($list -join "`n"), $folder[0]
+    if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
+    Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Get-NewParent([string[]]$Path) {
+    # Directories above Path that do not exist yet, top-down. The installers create them together with Path and then
+    # give them an ACL of their own: they would inherit what the directory above passes on (on a client edition the
+    # volume root passes Modify for authenticated users to every new folder).
+    $new = @()
+    foreach ($p in @($Path | Where-Object { $_ })) {
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full.Length -le 3) { continue }
+        $current = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/'))
+        while ($current -and -not (Test-Path -LiteralPath $current)) { $new += $current; $current = [System.IO.Path]::GetDirectoryName($current) }
+    }
+    return @($new | Sort-Object -Unique | Sort-Object -Property Length)
+}
+
 function Get-AclProblem {
     # Deviations of Path from the expected ACL: a directory must be owned by Administrators or SYSTEM, and every
     # allow ACE (explicit or inherited) must belong to a principal of -Allowed (SID -> F|M|RX|R) and stay within
@@ -585,8 +646,8 @@ function Get-NonAdminWritable {
     # principal - explicit or inherited, also one that only passes on to children - with any of 852038 =
     # WriteData/CreateFiles, AppendData/CreateDirectories, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions,
     # TakeOwnership (generic rights mapped). CREATOR OWNER / CREATOR GROUP / OWNER RIGHTS ACEs only reach owners,
-    # which are checked themselves. For -Container (directories that hold the checked tree, e.g. the parent of the
-    # Python directory) only what allows deleting, renaming or replacing their entries counts: owner and
+    # which are checked themselves. For -Container (directories that hold the checked tree, i.e. the parent of the
+    # data root) only what allows deleting, renaming or replacing their entries counts: owner and
     # DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership (786496) on the directory itself.
     param([string[]]$Path = @(), [string[]]$Container = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', $SidTrustedInstaller, (Get-ServiceSid $ServiceName))
@@ -844,6 +905,14 @@ if ($CaFile -and (Test-Path -LiteralPath $CaFile -PathType Leaf) -and
     [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $CaFile).ProviderPath) -eq [System.IO.Path]::GetFullPath($StagedCa)) { $caSource = $null }
 Assert-TrustedSource -Path @($PSCommandPath, $Template, $WinSWExe, $SourceDir, $RequirementsFile, $caSource, $ControlPlaneCaFile) -Allow:$AllowWritableSource
 
+# The program and data directories (venv, addon, WinSW, key, CA, confdir) are taken over below; whoever may rename a
+# directory above them could put other ones in their place. %ProgramData%\AegisProxy above the default data root is
+# taken over as well, so the check starts above it. Directories that do not exist yet are listed first: whoever creates
+# them meanwhile, this script gives them an ACL of their own once it has created the installation directories.
+$dataTop = if ($OwnDataParent) { $DataParent } else { $DataRoot }
+$newParents = @(Get-NewParent @($InstallDir, $dataTop))
+Assert-TrustedLocation -Path @($InstallDir, $dataTop) -Allow:$AllowWritableParent
+
 # WinSW (never downloaded automatically)
 if (-not (Test-Path -LiteralPath $WinSWExe -PathType Leaf)) {
     Write-Note "WinSW is not downloaded automatically. Download WinSW-x64.exe from $WinSWUrl,"
@@ -954,7 +1023,8 @@ if ($pythonBase -like (Join-Path $env:SystemDrive 'Users\*')) {
 }
 # The venv runs the base interpreter, its DLLs and its standard library: whoever can plant files there
 # (python3XX.dll, Lib\sitecustomize.py, site-packages\*.pth, python3XX._pth) runs code in the service, and whoever
-# can delete or rename entries of the directory above can replace the whole installation.
+# may rename a directory above it (or delete its entries) can replace the whole installation. Junctions and symbolic
+# links on the way are refused: their targets and the directories above those are not checked.
 $pyHome = Split-Path -Parent $pythonBase
 $pyLib = Join-Path $pyHome 'Lib'
 $pySite = Join-Path $pyLib 'site-packages'
@@ -964,9 +1034,14 @@ $pyTree = @($pyHome, $pythonBase, $pyLib, (Join-Path $pyHome 'DLLs'), $pySite) +
             Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like '*.pth' -or @('sitecustomize.py', 'usercustomize.py') -contains $_.Name } | ForEach-Object { $_.FullName }
         })
-$pyWritable = @(Get-NonAdminWritable -Path $pyTree -Container @(Split-Path -Parent $pyHome))
+$pyWritable = @(@(Get-NonAdminWritable -Path $pyTree) +
+    @(foreach ($p in @($pyHome, $pythonBase)) {
+            if ((Get-Item -LiteralPath $p -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { "$p (junction/symbolic link, its target is not checked)" }
+        }) +
+    @(Get-WritableSource -Location @($pyHome) | ForEach-Object { '{0} ({1})' -f $_.Path, $_.Who }) | Select-Object -Unique)
 if ($pyWritable.Count) {
-    $pyMessage = "Python at $pythonBase can be modified by non-administrators: $($pyWritable -join '; '). Install python.org Python for all users into %ProgramFiles% (C:\Program Files\Python312, InstallAllUsers=1), whose ACL only lets administrators write"
+    $pyMessage = ("Python at $pythonBase can be modified by non-administrators: $($pyWritable -join '; '). Install python.org Python for all users into %ProgramFiles% (C:\Program Files\Python312, InstallAllUsers=1), whose ACL only lets administrators write " +
+        '(a listed directory above the Python directory: icacls <directory> /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX, then icacls <directory> /setowner *S-1-5-32-544 /L; docs/deployment/windows.md, troubleshooting)')
     if (-not $AllowWritablePython) { throw "$pyMessage, or pass -AllowWritablePython to accept the risk." }
     Write-Note "$pyMessage. Continuing because of -AllowWritablePython."
 }
@@ -1007,7 +1082,8 @@ else {
 # (hard-linked files: on the file elsewhere). Protect-Directory checks again while it takes the directories over.
 # The same holds for %ProgramData%\AegisProxy above the data root: whoever owns it (or may delete its entries) can
 # rename the data root and put a junction in its place, so it is taken over too; any other parent of -DataRoot must
-# already be controlled by administrators.
+# already be controlled by administrators (Assert-TrustedLocation above; with -AllowWritableParent the installation
+# counts as not intact).
 try {
     $links = @(Find-ReparsePoint @($InstallDir, $DataRoot))
     if ($OwnDataParent -and (Test-Path -LiteralPath $DataParent) -and ((Get-Item -LiteralPath $DataParent -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
@@ -1023,9 +1099,6 @@ try {
 }
 catch { throw "Cannot inspect the existing installation directories ($($_.Exception.Message)). A directory that Administrators cannot read was not created by this script: remove it and re-run." }
 if ($links.Count) { throw "Junctions/symbolic links and hard-linked files are not allowed in the installation directories: $($links -join ', '). Remove them and re-run." }
-if ($parentIssues.Count -and -not $OwnDataParent) {
-    throw "The parent directory of -DataRoot can be modified by non-administrators: $($parentIssues -join '; '). They could replace $DataRoot (rename it and put a junction in its place). Choose a -DataRoot whose parent only administrators control."
-}
 if ($preExisting.Count -and -not $AdoptExistingSecrets) {
     throw ("Refusing to adopt {0} file(s) that existed before this installation ({1}):`n  {2}`nA local user may have planted them. Delete them, or - if they are yours (interrupted first run, files you verified) - re-run with -AdoptExistingSecrets; the script then takes ownership and resets their ACLs." -f
         $preExisting.Count, ($trustIssues -join '; '), (($preExisting | Select-Object -First 10) -join "`n  "))
@@ -1047,6 +1120,9 @@ if ($PSCmdlet.ShouldProcess($DataRoot, 'Create directories, take ownership and r
     foreach ($dir in @($InstallDir, $AppDir, $DataRoot, $ConfDir, $SecretsDir, $LogsDir, $RuntimeDir, $SpoolDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
+    # Directories above them that this run created (or that someone created since the check): owner Administrators and
+    # an ACL of their own, top-down - they would inherit what the directory above passes on to new folders.
+    foreach ($dir in $newParents) { Protect-Directory -Root $dir -Grant @("${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX") -Allowed ($AclAdmins + @{ 'S-1-5-32-545' = 'RX' }) }
     # Administrators take ownership, foreign explicit ACEs are removed and everything below inherits from the
     # protected roots. Program files (venv, addon, WinSW): users read/execute only, also for a custom -InstallDir
     # outside %ProgramFiles% that would inherit "create files/folders" for users (DLL / module planting).

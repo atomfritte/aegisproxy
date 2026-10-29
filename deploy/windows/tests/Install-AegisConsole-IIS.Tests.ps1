@@ -46,6 +46,11 @@ Describe 'Install-AegisConsole-IIS.ps1' {
         Set-Content -LiteralPath (Join-Path $Dist 'index.html') -Value '<!doctype html><title>AegisProxy</title>'
         Set-Content -LiteralPath (Join-Path (Join-Path $Dist 'assets') 'index-abc123.js') -Value 'console.log(1)'
         Set-Content -LiteralPath (Join-Path $Dist 'config.js') -Value 'window.__AEGIS_CONFIG__ = { apiBaseUrl: "" };'
+        # C:\inetpub as IIS setup creates it: an ACL of its own that only administrators control.
+        $script:Inetpub = Join-Path $env:SystemDrive 'inetpub'
+        New-Item -ItemType Directory -Path $Inetpub | Out-Null
+        $FakeWin.Acl[(Get-FakeFullPath $Inetpub)] = @{ Protected = $true; Grants = [ordered]@{
+                '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
         $script:Site = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'inetpub\aegis-console'))
         Add-FakeCertificate -Thumbprint $Thumb -DnsNames @('aegis-console.corp.example')
         $script:Base = @{ DistDir = $Dist; HostName = 'aegis-console.corp.example'; CertificateThumbprint = $Thumb }
@@ -165,6 +170,102 @@ Describe 'Install-AegisConsole-IIS.ps1' {
             $err = { & $Installer @Params } | Should -Throw '*Non-administrators can change installation sources*' -PassThru
             "$err" | Should -Match ([regex]::Escape("$weak ($Expect)"))
             (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+        }
+    }
+
+    Context 'directories above the site directory' {
+        BeforeEach {
+            # C:\Sites, created in the volume root of a client edition: it inherits Modify for authenticated users, who may
+            # therefore rename it and put another site directory (scripts for every administrator's browser) in its place.
+            $script:Sites = Join-Path $env:SystemDrive 'Sites'
+            $script:CustomSite = [System.IO.Path]::GetFullPath((Join-Path $Sites 'aegis'))
+            $script:Params = Join-Parameters $Base @{ PhysicalPath = $CustomSite }
+        }
+
+        It 'refuses a -PhysicalPath below a directory that non-administrators may rename, before it changes anything' {
+            New-Item -ItemType Directory -Path $Sites | Out-Null
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can rename or replace directories above the directories this script installs into*-AllowWritableParent*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $Sites) (Authenticated Users)"))
+            "$err" | Should -Match ([regex]::Escape("icacls `"$(Get-FakeFullPath $Sites)`" /inheritance:r /grant:r"))
+            @($FakeWin.Iis.Features).Count | Should -Be 0
+            $FakeWin.Iis.AppPools.Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            Test-Path -LiteralPath $CustomSite | Should -BeFalse
+        }
+
+        It 'deploys there once the directory has an ACL that only administrators control (the commands of the message)' {
+            New-Item -ItemType Directory -Path $Sites | Out-Null
+            icacls.exe $Sites /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            icacls.exe $Sites /setowner '*S-1-5-32-544' /L | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters $Params
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'rename or replace directories above'
+            Test-Path -LiteralPath (Join-Path $CustomSite 'index.html') | Should -BeTrue
+        }
+
+        It 'continues with -AllowWritableParent and repeats the warning' {
+            New-Item -ItemType Directory -Path $Sites | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Params @{ AllowWritableParent = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Continuing because of -AllowWritableParent'
+        }
+
+        It 'refuses the default site directory when <Case>' -TestCases @(
+            @{ Case = 'users may rename C:\inetpub'; Grantee = 'BUILTIN\Users'; Ace = '(D)'; Expect = 'Users' },
+            @{ Case = 'a non-administrator owns C:\inetpub'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' }
+        ) {
+            $key = Get-FakeFullPath $Inetpub
+            if ($Owner) { $FakeWin.Owner[$key] = $Owner } else { $FakeWin.Acl[$key].Grants[$Grantee] = $Ace }
+            $err = { & $Installer @Base } | Should -Throw '*Non-administrators can rename or replace directories above*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$key ($Expect)"))
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+        }
+
+        It 'creates missing directories above the site directory with an ACL of their own, top-down' {
+            $site = [System.IO.Path]::GetFullPath((Join-Path $Sites 'deep\aegis'))
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PhysicalPath = $site })).ExitCode | Should -Be 0
+            $created = @($Sites, (Join-Path $Sites 'deep'))
+            foreach ($dir in $created) {
+                (Get-Acl -LiteralPath $dir).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $dir
+                Get-PrincipalList $dir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545') -Because $dir
+            }
+            $order = @(Get-FakeCall 'icacls.exe' | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $order.IndexOf((Get-FakeFullPath $created[0])) | Should -BeLessThan $order.IndexOf((Get-FakeFullPath $created[1]))
+            $order.IndexOf((Get-FakeFullPath $created[1])) | Should -BeLessThan $order.IndexOf((Get-FakeFullPath $site))
+        }
+
+        It 'checks again before it creates the site directory: refuses a directory above that a non-administrator created while IIS setup ran' {
+            function global:Install-WindowsFeature {
+                param([string[]]$Name)
+                $sites = Join-Path $env:SystemDrive 'Sites'
+                New-Item -ItemType Directory -Path $sites | Out-Null
+                $global:FakeWin.Owner[(Get-FakeFullPath $sites)] = 'S-1-5-21-111-222-333-1007'
+                $global:FakeWin.Acl[(Get-FakeFullPath $sites)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-21-111-222-333-1007' = '(OI)(CI)F' } }
+                $global:FakeWin.Iis.Features = @($Name)
+                [pscustomobject]@{ Success = $true; RestartNeeded = 'No' }
+            }
+            $err = { & $Installer @Params } | Should -Throw '*Non-administrators can rename or replace directories above*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $Sites) (owner S-1-5-21-111-222-333-1007, S-1-5-21-111-222-333-1007)"))
+            @($FakeWin.Iis.Features).Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath $CustomSite | Should -BeFalse
+            (Get-FakeCall 'robocopy.exe').Count | Should -Be 0
+        }
+
+        It 'leaves C:\inetpub alone when IIS setup creates it during the run' {
+            Remove-Item -LiteralPath $Inetpub
+            $FakeWin.Acl.Remove((Get-FakeFullPath $Inetpub))
+            function global:Install-WindowsFeature {
+                param([string[]]$Name)
+                $inetpub = Join-Path $env:SystemDrive 'inetpub'
+                New-Item -ItemType Directory -Path $inetpub | Out-Null
+                $global:FakeWin.Acl[(Get-FakeFullPath $inetpub)] = @{ Protected = $true; Grants = [ordered]@{
+                        '*S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' = '(OI)(CI)F'; '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; '*S-1-5-32-545' = '(OI)(CI)RX' } }
+                $global:FakeWin.Iis.Features = @($Name)
+                [pscustomobject]@{ Success = $true; RestartNeeded = 'No' }
+            }
+            (Invoke-Installer -Path $Installer -Parameters $Base).ExitCode | Should -Be 0
+            @(Get-FakeCall 'icacls.exe' | Where-Object { (Get-FakeFullPath $_.Args[0]) -eq (Get-FakeFullPath $Inetpub) }).Count | Should -Be 0
+            Get-PrincipalList $Inetpub | Should -Match 'S-1-5-80-956008885'
         }
     }
 

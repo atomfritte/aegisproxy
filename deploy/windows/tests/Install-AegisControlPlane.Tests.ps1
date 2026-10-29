@@ -177,6 +177,137 @@ Describe 'Install-AegisControlPlane.ps1' {
         }
     }
 
+    Context 'directories above the program and data directories' {
+        BeforeEach {
+            # C:\Tools, created in the volume root of a client edition: it inherits Modify for authenticated users, who may
+            # therefore rename it and put another C:\Tools\AegisProxy in its place.
+            $script:Tools = Join-Path $env:SystemDrive 'Tools'
+            New-Item -ItemType Directory -Path $Tools | Out-Null
+            $script:CustomInstall = [System.IO.Path]::GetFullPath((Join-Path $Tools 'AegisProxy\control-plane'))
+            $script:CustomData = [System.IO.Path]::GetFullPath((Join-Path $Tools 'AegisData'))
+            Register-FakeExecutable -Path (Join-Path $CustomInstall 'aegis-control-plane.exe') -Function FakeControlPlaneExe
+            $script:Custom = @{ InstallDir = @{ InstallDir = $CustomInstall }; DataRoot = @{ DataRoot = $CustomData } }
+        }
+
+        It 'refuses a -<Parameter> below a directory that non-administrators may rename, before it changes or runs anything' -TestCases @(
+            @{ Parameter = 'InstallDir' }, @{ Parameter = 'DataRoot' }
+        ) {
+            $p = Join-Parameters $Base $Custom[$Parameter]
+            $err = { & $Installer @p } | Should -Throw '*Non-administrators can rename or replace directories above the directories this script installs into*-AllowWritableParent*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $Tools) (Authenticated Users)"))
+            "$err" | Should -Not -Match ([regex]::Escape("$(Get-FakeFullPath $env:SystemDrive) (")) -Because 'users may create folders in the volume root, not rename those of others'
+            "$err" | Should -Match ([regex]::Escape("icacls `"$(Get-FakeFullPath $Tools)`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`""))
+            (Get-FakeCall 'Start-Process').Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $Tools 'AegisProxy') | Should -BeFalse
+            Test-Path -LiteralPath $CustomData | Should -BeFalse
+        }
+
+        It 'installs into -<Parameter> once that directory has an ACL that only administrators control (the commands of the message)' -TestCases @(
+            @{ Parameter = 'InstallDir' }, @{ Parameter = 'DataRoot' }
+        ) {
+            icacls.exe $Tools /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            icacls.exe $Tools /setowner '*S-1-5-32-544' /L | Out-Null
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters (Join-Parameters $Base $Custom[$Parameter]) @{ SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Not -Match 'rename or replace directories above'
+        }
+
+        It 'continues with -AllowWritableParent and repeats the warning' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $CustomInstall; AllowWritableParent = $true; SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'Non-administrators can rename or replace directories above'
+            $run.Output | Should -Match 'Continuing because of -AllowWritableParent'
+        }
+
+        It 'refuses -InstallDir below a protected directory when <Case>' -TestCases @(
+            @{ Case = 'a non-administrator owns a directory above'; Relative = 'AegisProxy'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Case = 'users may rename the directory above'; Relative = 'AegisProxy'; Grantee = '*S-1-5-32-545'; Ace = '(D)'; Expect = 'Users' },
+            @{ Case = 'users may delete entries of a directory above'; Relative = ''; Grantee = '*S-1-5-32-545'; Ace = '(DC)'; Expect = 'Users' },
+            @{ Case = 'everyone may change the permissions of a directory above'; Relative = 'AegisProxy'; Grantee = '*S-1-1-0'; Ace = '(WDAC)'; Expect = 'Everyone' },
+            @{ Case = 'a group may take ownership of a directory above'; Relative = ''; Grantee = '*S-1-5-21-111-222-333-1105'; Ace = '(WO)'; Expect = 'S-1-5-21-111-222-333-1105' },
+            @{ Case = 'a directory above passes Modify on to the existing one below it'; Relative = ''; Grantee = '*S-1-5-11'; Ace = '(CI)(IO)M'; Expect = 'Authenticated Users'; At = 'AegisProxy' }
+        ) {
+            icacls.exe $Tools /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $Tools 'AegisProxy') | Out-Null
+            $weak = Get-FakeFullPath $(if ($Relative) { Join-Path $Tools $Relative } else { $Tools })
+            if ($Owner) { $FakeWin.Owner[$weak] = $Owner }
+            else {
+                if (-not $FakeWin.Acl.ContainsKey($weak)) { $FakeWin.Acl[$weak] = @{ Protected = $false; Grants = [ordered]@{} } }
+                $FakeWin.Acl[$weak].Grants[$Grantee] = $Ace
+            }
+            $reported = if ($At) { Get-FakeFullPath (Join-Path $Tools $At) } else { $weak }
+            $err = { & $Installer @Base -InstallDir $CustomInstall } | Should -Throw '*Non-administrators can rename or replace directories above*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$reported ($Expect)"))
+            if ($At) { "$err" | Should -Not -Match ([regex]::Escape("$weak (")) -Because 'an inherit-only ACE does not apply to the directory itself' }
+            (Get-FakeCall 'Start-Process').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'refuses a junction above -InstallDir (its target is not checked)' {
+            icacls.exe $Tools /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            $elsewhere = Join-Path $FakeWin.Root 'elsewhere'
+            New-Item -ItemType Directory -Path $elsewhere | Out-Null
+            New-Item -ItemType SymbolicLink -Path (Join-Path $Tools 'AegisProxy') -Target $elsewhere | Out-Null
+            $err = { & $Installer @Base -InstallDir $CustomInstall } | Should -Throw '*Non-administrators can rename or replace directories above*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath (Join-Path $Tools 'AegisProxy')) (junction/symbolic link, its target is not checked)"))
+            @(Get-ChildItem -LiteralPath $elsewhere -Force).Count | Should -Be 0
+        }
+
+        It 'accepts a directory above that lets users create folders in it (Windows Server volume root)' {
+            icacls.exe $Tools /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 'BUILTIN\Users:(CI)(AD)' | Out-Null
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $CustomInstall; SkipFirewall = $true })).ExitCode | Should -Be 0
+        }
+
+        It 'creates missing directories above -InstallDir and -DataRoot with an ACL of their own, top-down' {
+            $install = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'New\Deep\control-plane'))
+            $data = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'NewData\aegis'))
+            Register-FakeExecutable -Path (Join-Path $install 'aegis-control-plane.exe') -Function FakeControlPlaneExe
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $install; DataRoot = $data; SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $created = @((Join-Path $env:SystemDrive 'New'), (Join-Path $env:SystemDrive 'New\Deep'), (Join-Path $env:SystemDrive 'NewData'))
+            foreach ($dir in $created) {
+                (Get-Acl -LiteralPath $dir).GetOwner($null).Value | Should -Be 'S-1-5-32-544' -Because $dir
+                Get-PrincipalList $dir | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545') -Because $dir
+                Test-FakeWritable $dir | Should -BeFalse -Because "$dir would inherit Modify for authenticated users from the volume root"
+            }
+            $order = @(Get-FakeCall 'icacls.exe' | ForEach-Object { Get-FakeFullPath $_.Args[0] })
+            $order.IndexOf((Get-FakeFullPath $created[0])) | Should -BeLessThan $order.IndexOf((Get-FakeFullPath $created[1]))
+            $order.IndexOf((Get-FakeFullPath $created[1])) | Should -BeLessThan $order.IndexOf((Get-FakeFullPath $install))
+            # A re-run finds them protected.
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $install; DataRoot = $data; SkipFirewall = $true })).ExitCode | Should -Be 0
+        }
+
+        It 'gives %ProgramFiles%\AegisProxy, created by the first installation, an ACL of its own' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })).ExitCode | Should -Be 0
+            $parent = Split-Path -Parent $InstallDir
+            (Get-Acl -LiteralPath $parent).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+            Get-PrincipalList $parent | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545')
+        }
+
+        It 'takes over a directory above that a non-administrator creates after the check' {
+            $install = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'Race\control-plane'))
+            Register-FakeExecutable -Path (Join-Path $install 'aegis-control-plane.exe') -Function FakeControlPlaneExe
+            $global:RaceDir = Join-Path $env:SystemDrive 'Race'
+            # The binary's version probe runs after the check: a local user creates C:\Race meanwhile and owns it.
+            Mock Start-Process -ParameterFilter { @($ArgumentList) -contains 'version' } {
+                New-Item -ItemType Directory -Path $global:RaceDir | Out-Null
+                $global:FakeWin.Owner[(Get-FakeFullPath $global:RaceDir)] = 'S-1-5-21-111-222-333-1007'
+                $global:FakeWin.Acl[(Get-FakeFullPath $global:RaceDir)] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-21-111-222-333-1007' = '(OI)(CI)F' } }
+                [System.IO.File]::WriteAllText($RedirectStandardOutput, "2.1.0-test`n")
+                $proc = [pscustomobject]@{ ExitCode = 0 }
+                Add-Member -InputObject $proc -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true }
+                $proc
+            }
+            try { (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ InstallDir = $install; SkipFirewall = $true })).ExitCode | Should -Be 0 }
+            finally { Remove-Variable -Name RaceDir -Scope Global }
+            (Get-Acl -LiteralPath (Join-Path $env:SystemDrive 'Race')).GetOwner($null).Value | Should -Be 'S-1-5-32-544'
+            Get-PrincipalList (Join-Path $env:SystemDrive 'Race') | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', '*S-1-5-32-545')
+            @(Get-FakeCall 'icacls.exe' | Where-Object { $_.Args[1] -eq '/remove' -and $_.Args[2] -eq '*S-1-5-21-111-222-333-1007' }).Count | Should -Be 1 -Because "the local user's ACE is removed"
+        }
+    }
+
     Context 'fresh installation' {
         BeforeEach {
             $script:Password = 'Correct-Horse-Battery-2026'
