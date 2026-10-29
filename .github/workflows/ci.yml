@@ -227,10 +227,9 @@ jobs:
       - name: install the data-plane service
         run: |
           $root = Join-Path $env:ProgramData 'AegisProxy'
-          # The documented hash-pinned installation (lock file instead of the default mitmproxy==12.3.0 from PyPI).
+          # The default installation: the shipped hash lock (data-plane\requirements-lock.txt), wheels only, no resolver.
           ./deploy/windows/Install-AegisDataPlane.ps1 -ControlPlaneUrl http://127.0.0.1:8081 -DataPlaneKeyFile "$root\secrets\dataplane.key" `
-            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe 'C:\Program Files\Python312\python.exe' -SkipFirewall `
-            -RequirementsFile data-plane/requirements-lock.txt -PipArgs '--only-binary=:all:'
+            -CaFile "$root\certs\mitmproxy-ca.pem" -WinSWExe "$env:RUNNER_TEMP\WinSW-x64.exe" -PythonExe 'C:\Program Files\Python312\python.exe' -SkipFirewall
           Get-Service AegisDataPlane | Format-List Name, Status, StartType
       - name: end to end through the Windows services
         run: |
