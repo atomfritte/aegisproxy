@@ -60,7 +60,7 @@ Describe '<Name>' -ForEach $Installers {
 Describe 'installation source check' {
     It 'is the same code in every installer (<Name>)' -TestCases @(
         @{ Name = 'ConvertTo-FileRight' }, @{ Name = 'Get-WritableSource' }, @{ Name = 'Assert-TrustedSource' },
-        @{ Name = 'Assert-TrustedLocation' }, @{ Name = 'Get-NewParent' }
+        @{ Name = 'Assert-TrustedLocation' }, @{ Name = 'Get-NewParent' }, @{ Name = 'Assert-ProtectedSecret' }
     ) {
         $scripts = @(Get-ChildItem -LiteralPath $Root -Filter 'Install-Aegis*.ps1' -File)
         $scripts.Count | Should -Be 3
@@ -107,6 +107,47 @@ Describe 'installation directory check' {
         $check = $text.IndexOf('Get-WritableSource -Location @($pyHome)')
         $check | Should -BeGreaterThan 0
         $check | Should -BeLessThan $text.IndexOf('Invoke-Native -FilePath $pythonBase')
+    }
+}
+
+Describe 'secret file check' {
+    It 'runs <Check> before <Read> (<Script>)' -TestCases @(
+        @{ Script = 'Install-AegisConsole-IIS.ps1'; Check = 'Assert-ProtectedSecret -Path @($ProxySecretFile)'; Read = '[System.IO.File]::ReadAllText($ProxySecretFile)' },
+        @{ Script = 'Install-AegisDataPlane.ps1'; Check = 'Assert-ProtectedSecret -Path @($DataPlaneKeyFile)'; Read = 'Read-SecretFile $DataPlaneKeyFile' },
+        @{ Script = 'Install-AegisDataPlane.ps1'; Check = 'Assert-ProtectedSecret -Path @($CaFile)'; Read = '[System.IO.File]::ReadAllText($CaFile)' },
+        @{ Script = 'Install-AegisControlPlane.ps1'; Check = 'Assert-ProtectedSecret -Path $secretInputs'; Read = 'Resolve-Path -LiteralPath $TlsKeyFile' },
+        @{ Script = 'Install-AegisControlPlane.ps1'; Check = 'Assert-ProtectedSecret -Path $secretInputs'; Read = '$value = Read-SecretFile $src' },
+        @{ Script = 'Install-AegisControlPlane.ps1'; Check = 'Assert-ProtectedSecret -Path $secretInputs'; Read = 'Get-CaInfo $CaSourceDir' }
+    ) {
+        $text = [System.IO.File]::ReadAllText((Join-Path $Root $Script))
+        $checkAt = $text.IndexOf($Check)
+        $checkAt | Should -BeGreaterThan 0
+        $readAt = $text.IndexOf($Read)
+        $readAt | Should -BeGreaterThan 0
+        $checkAt | Should -BeLessThan $readAt
+        $text.IndexOf($Read, $readAt + 1) | Should -Be -1 -Because 'the secret is read in one place only'
+    }
+
+    It 'lets the control-plane installer check every secret it imports' {
+        $text = [System.IO.File]::ReadAllText((Join-Path $Root 'Install-AegisControlPlane.ps1'))
+        $text | Should -Match ([regex]::Escape('foreach ($name in $ImportedSecrets)'))
+        $text | Should -Match ([regex]::Escape("Join-Path `$CaSourceDir 'mitmproxy-ca.pem'"))
+    }
+}
+
+Describe 'pip without configuration' {
+    It 'runs pip in the data-plane installer only through Invoke-Pip, which sets PIP_CONFIG_FILE to nul' {
+        $ast = (Get-Ast (Join-Path $Root 'Install-AegisDataPlane.ps1')).Ast
+        $helper = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Pip' }, $false)
+        $helper | Should -Not -BeNullOrEmpty
+        $pip = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'pip' }, $true))
+        $pip.Count | Should -BeGreaterThan 0
+        foreach ($s in $pip) {
+            ($s.Extent.StartOffset -ge $helper.Extent.StartOffset -and $s.Extent.EndOffset -le $helper.Extent.EndOffset) | Should -BeTrue -Because "line $($s.Extent.StartLineNumber)"
+        }
+        $helper.Extent.Text | Should -Match ([regex]::Escape("`$env:PIP_CONFIG_FILE = 'nul'"))
+        $helper.Extent.Text | Should -Match ([regex]::Escape('Remove-Item -LiteralPath "Env:$($item.Name)"'))
+        @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-Pip' }, $true)).Count | Should -Be 3
     }
 }
 

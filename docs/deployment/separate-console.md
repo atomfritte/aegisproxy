@@ -23,8 +23,10 @@ The console host proxies `/api/` to the control-plane. No CORS, the session cook
 - nginx: see `frontend/docker/nginx.conf` and `deploy/nginx/aegis-console.conf` (disable response buffering for
   `/api/flows/stream`; on the control-plane host send the proxy secret).
 - IIS: `Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081` adds the ARR rule, disables response
-  buffering and sends the proxy secret that the control-plane installer creates for a loopback
-  `-TrustedProxies` ([Windows guide](windows.md#7-web-console-hosting)).
+  buffering, replaces a client's `X-Forwarded-For` with the address it connected from and sends the proxy secret
+  that the control-plane installer creates for a loopback `-TrustedProxies`. On a console host of its own, copy that
+  secret into a folder that only administrators can read and change and pass `-ProxySecretFile`: the script refuses
+  a secret file that others own, read or change ([Windows guide](windows.md#7-web-console-hosting)).
 
 ## Option B — API on its own origin
 

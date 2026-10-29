@@ -416,7 +416,7 @@ Describe 'Install-AegisDataPlane.ps1' {
             Test-Path -LiteralPath $InstallDir | Should -BeFalse
         }
 
-        It 'checks -RequirementsFile, -CaFile and -ControlPlaneCaFile, not the data-plane key' {
+        It 'checks -RequirementsFile and -ControlPlaneCaFile as sources, the data-plane key and -CaFile as secrets (no override)' {
             icacls.exe $InstallFolder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
             $shared = Join-Path $env:SystemDrive 'Shared'
             New-Item -ItemType Directory -Path $shared | Out-Null
@@ -430,8 +430,120 @@ Describe 'Install-AegisDataPlane.ps1' {
             Copy-Item -LiteralPath $KeyFile -Destination $key
             $p = Join-Parameters $Params @{ RequirementsFile = $req; CaFile = $ca; ControlPlaneCaFile = $cpCa; DataPlaneKeyFile = $key }
             $err = { & $Installer @p } | Should -Throw '*Non-administrators can change installation sources*' -PassThru
-            foreach ($path in @($req, $ca, $cpCa)) { "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $path) (Authenticated Users)")) }
-            "$err" | Should -Not -Match ([regex]::Escape((Get-FakeFullPath $key)))
+            foreach ($path in @($req, $cpCa)) { "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $path) (Authenticated Users)")) }
+            foreach ($path in @($ca, $key)) { "$err" | Should -Not -Match ([regex]::Escape((Get-FakeFullPath $path))) }
+            $err = { & $Installer @p -AllowWritableSource } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $key) (Authenticated Users, Users: read)"))
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $shared) (Authenticated Users)"))
+            (Get-FakeCall 'python').Count | Should -Be 0
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+    }
+
+    Context 'secret files (data-plane key, CA)' {
+        It 'refuses -<Parameter> when <Case>, also with -AllowWritableSource, before changing anything' -TestCases @(
+            @{ Parameter = 'DataPlaneKeyFile'; Case = 'users can read it'; Grantee = '*S-1-5-32-545'; Ace = 'R'; Expect = 'Users: read' },
+            @{ Parameter = 'CaFile'; Case = 'users can read it'; Grantee = '*S-1-5-32-545'; Ace = 'RX'; Expect = 'Users: read' },
+            @{ Parameter = 'DataPlaneKeyFile'; Case = 'another account owns it'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' },
+            @{ Parameter = 'CaFile'; Case = 'a service may change it'; Grantee = 'NT SERVICE\AegisControlPlane'; Ace = 'M' },
+            @{ Parameter = 'DataPlaneKeyFile'; Case = 'everyone may rename the folder above it'; Above = $true; Grantee = '*S-1-1-0'; Ace = '(D)'; Expect = 'Everyone' }
+        ) {
+            $file = Get-FakeFullPath $Base[$Parameter]
+            $weak = if ($Above) { Split-Path -Parent $file } else { $file }
+            if ($Owner) { $FakeWin.Owner[$weak] = $Owner }
+            else { $FakeWin.Acl[$weak] = @{ Protected = $false; Grants = [ordered]@{ $Grantee = $Ace } } }
+            $who = if ($Expect) { $Expect } else { Get-FakeSid $Grantee }
+            $err = { & $Installer @Base -AllowWritableSource } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($who)"))
+            "$err" | Should -Match 'treat the secret as known and replace it'
+            (Get-FakeCall 'python').Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $InstallDir | Should -BeFalse
+        }
+
+        It 'accepts the key and CA of a control-plane on this host, which its service may read' {
+            $aegis = Join-Path $env:ProgramData 'AegisProxy'
+            $secrets = Join-Path $aegis 'secrets'
+            New-Item -ItemType Directory -Path $secrets -Force | Out-Null
+            New-TestCa -Dir (Join-Path $aegis 'certs') | Out-Null
+            $FakeWin.Acl[(Get-FakeFullPath $aegis)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F' } }
+            $FakeWin.Acl[(Get-FakeFullPath $secrets)] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; 'NT SERVICE\AegisControlPlane' = '(OI)(CI)R' } }
+            $FakeWin.Acl[(Get-FakeFullPath (Join-Path $aegis 'certs'))] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; 'NT SERVICE\AegisControlPlane' = '(OI)(CI)RX' } }
+            $FakeWin.Acl[(Get-FakeFullPath (Join-Path $aegis 'certs\mitmproxy-ca.pem'))] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = 'F'; '*S-1-5-32-544' = 'F' } }
+            Copy-Item -LiteralPath $KeyFile -Destination (Join-Path $secrets 'dataplane.key')
+            $FakeWin.Services['AegisControlPlane'] = @{ Status = 'Running'; StartType = 'Automatic' }
+            $p = Join-Parameters $Base @{ DataPlaneKeyFile = (Join-Path $secrets 'dataplane.key'); CaFile = (Join-Path $aegis 'certs\mitmproxy-ca.pem') }
+            (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
+            ([System.IO.File]::ReadAllText($StagedKey)).Trim() | Should -Be $KeyValue
+        }
+
+        It 'accepts the staged key and CA of this installation on a re-run, which LocalService may read' {
+            $p = Join-Parameters $Base @{ ServiceAccount = 'LocalService' }
+            (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
+            (Get-FakeAccess $StagedKey)['*S-1-5-19'] | Should -Be 'R' -Because 'only the exception for the staged copies lets this pass'
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $p @{ DataPlaneKeyFile = $StagedKey; CaFile = $StagedCa })).ExitCode | Should -Be 0
+            ([System.IO.File]::ReadAllText($StagedKey)).Trim() | Should -Be $KeyValue
+        }
+    }
+
+    Context 'pip configuration' {
+        BeforeEach {
+            # A local user created %ProgramData%\pip\pip.ini (ProgramData lets users create folders) that adds their
+            # own requirements file - with hashes, so --require-hashes is satisfied.
+            $script:Planted = Join-Path $env:ProgramData 'pip\extra.txt'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $Planted) -Force | Out-Null
+            Set-Content -LiteralPath $Planted -Value 'aegis-review-marker==9.9 --hash=sha256:00'
+            $script:PipIni = Join-Path $env:ProgramData 'pip\pip.ini'
+            Set-Content -LiteralPath $PipIni -Value @('[install]', "requirement = $Planted")
+            Set-FakeOwner -Path (Split-Path -Parent $Planted) -Sid 'S-1-5-21-111-222-333-1007'
+            $script:SavedPipEnv = @{}
+            foreach ($item in @(Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'PIP_*' })) { $SavedPipEnv[$item.Name] = $item.Value }
+        }
+        AfterEach {
+            foreach ($item in @(Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'PIP_*' })) { Remove-Item -LiteralPath "Env:$($item.Name)" }
+            foreach ($name in $SavedPipEnv.Keys) { Set-Item -LiteralPath "Env:$name" -Value $SavedPipEnv[$name] }
+        }
+
+        It 'honours a global pip.ini like pip does unless PIP_CONFIG_FILE is nul (the fake pip)' {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $VenvPython) -Force | Out-Null
+            & $VenvPython -I -m pip install --isolated --require-hashes -r $LockFile | Out-Null
+            $FakeWin.Python.Packages.ContainsKey('aegis-review-marker') | Should -BeTrue
+            $FakeWin.Python.Packages.Clear()
+            $env:PIP_CONFIG_FILE = 'nul'
+            & $VenvPython -I -m pip install --isolated --require-hashes -r $LockFile | Out-Null
+            $FakeWin.Python.Packages.ContainsKey('aegis-review-marker') | Should -BeFalse
+        }
+
+        It 'installs only what the requirements decide (<Case>), whatever pip.ini files and PIP_* variables say' -TestCases @(
+            @{ Case = 'hash-locked'; Extra = @{} }, @{ Case = 'unpinned'; Extra = @{ AllowUnpinnedPackages = $true } }
+        ) {
+            $env:PIP_CONFIG_FILE = $PipIni
+            $env:PIP_REQUIREMENT = $Planted
+            $env:PIP_INDEX_URL = 'https://pypi.attacker.example/simple'
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base $Extra)
+            $run.ExitCode | Should -Be 0
+            $FakeWin.Python.Packages.ContainsKey('aegis-review-marker') | Should -BeFalse
+            $FakeWin.Python.Packages['mitmproxy'] | Should -Be '12.3.0'
+            $pip = @(Get-FakeCall 'python' | Where-Object { $_.Args[0] -eq '-m' -and $_.Args[1] -eq 'pip' })
+            $pip.Count | Should -Be 2 -Because 'install and check (hash-locked), install and the security overrides (unpinned)'
+            foreach ($call in $pip) {
+                @($call.PipEnv.Keys) | Should -Be @('PIP_CONFIG_FILE') -Because ($call.Args -join ' ')
+                $call.PipEnv['PIP_CONFIG_FILE'] | Should -BeExactly 'nul'
+                $call.Options | Should -Be @('-I')
+            }
+            $env:PIP_CONFIG_FILE | Should -Be $PipIni -Because 'the variables of the session are restored'
+            $env:PIP_INDEX_URL | Should -Be 'https://pypi.attacker.example/simple'
+        }
+
+        It 'passes -PipArgs, the only way to name a package source' {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ PipArgs = @('--index-url', 'https://nexus.corp.example/simple') })
+            $run.ExitCode | Should -Be 0
+            $install = @(Get-PipCall 'install')
+            $install[0].Args | Should -Contain 'https://nexus.corp.example/simple'
+            $install[0].PipEnv['PIP_CONFIG_FILE'] | Should -BeExactly 'nul'
         }
     }
 

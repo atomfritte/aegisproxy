@@ -14,7 +14,10 @@
 
     Steps (idempotent; a re-run upgrades addon/venv/WinSW configuration and keeps the staged secrets):
       * refuses installation sources that non-administrators can change (this script, the WinSW template, WinSW,
-        data-plane\, the lock file, the CA files, and every folder above them), before it runs or copies any of them
+        data-plane\, the lock file, the control-plane CA bundle, and every folder above them), before it runs or
+        copies any of them
+      * refuses a data-plane key or CA (key + certificate) that non-administrators can read or change, or that sits
+        below a directory they may rename (no override)
       * refuses -InstallDir / -DataRoot below a directory that non-administrators may rename or replace (every
         directory up to the volume root)
       * resolves Python (-PythonExe or the all-users installation of 3.12 / 3.13 / 3.14 registered in HKLM) and
@@ -25,7 +28,8 @@
         upgrade of an intact installation or with -AdoptExistingSecrets. Directories it creates above -InstallDir /
         -DataRoot get an ACL of their own
       * creates <InstallDir>\venv and installs the hash-locked data-plane\requirements-lock.txt (mitmproxy 12.3.0,
-        YARA-X and every dependency, binary wheels only) with pip --require-hashes
+        YARA-X and every dependency, binary wheels only) with pip --require-hashes; pip runs without any pip
+        configuration (PIP_CONFIG_FILE=nul, no PIP_* variables): package sources come from -PipArgs only
       * copies data-plane\aegis_addon.py + aegis_dp\ to <InstallDir>\app (byte-compiled)
       * stages the data-plane key and the CA (mitmproxy-ca.pem = key + cert) into <DataRoot> with ACLs that
         only SYSTEM, Administrators and the service account can read (verified after the installation)
@@ -61,12 +65,14 @@
 
 .PARAMETER AllowWritableSource
     Accept installation sources that non-administrators can change: this script, the WinSW template next to it,
-    -WinSWExe, -SourceDir (everything below it), -RequirementsFile, -CaFile, -ControlPlaneCaFile and every folder above
-    them up to the volume root. Allowed are only SYSTEM, Administrators and TrustedInstaller as owners and as
-    principals that may write, create, delete, rename, change the permissions or take ownership (above the sources:
-    rename, delete entries, change the permissions, take ownership). The script runs and copies these files with
-    administrator rights, and the addon and the lock file decide which code runs in the service. Not recommended:
-    keep the release in a folder that only administrators control (docs/deployment/windows.md, section 2).
+    -WinSWExe, -SourceDir (everything below it), -RequirementsFile, -ControlPlaneCaFile and every folder above them up
+    to the volume root. Allowed are only SYSTEM, Administrators and TrustedInstaller as owners and as principals that
+    may write, create, delete, rename, change the permissions or take ownership (above the sources: rename, delete
+    entries, change the permissions, take ownership). The script runs and copies these files with administrator
+    rights, and the addon and the lock file decide which code runs in the service. Not recommended: keep the release
+    in a folder that only administrators control (docs/deployment/windows.md, section 2). -DataPlaneKeyFile and
+    -CaFile are checked the same way and must not be readable by non-administrators either (services may read them);
+    for these secrets there is no override.
 
 .PARAMETER AllowWritableParent
     Accept -InstallDir or -DataRoot below a directory that non-administrators own or may rename, delete entries in,
@@ -92,13 +98,15 @@
 
 .PARAMETER DataPlaneKeyFile
     File containing the data-plane key (control-plane: <DataRoot>\secrets\dataplane.key). Copied, never referenced.
-    An SMB path (UNC or mapped drive) must use an encrypted connection, see -AllowUnencryptedImport.
+    An SMB path (UNC or mapped drive) must use an encrypted connection, see -AllowUnencryptedImport. Only
+    administrators may read and change it (services may read it) and rename the directories above it: copy it into a
+    folder with an ACL of its own (docs/deployment/windows.md, section 6), not into a profile or download folder.
 
 .PARAMETER CaFile
     mitmproxy-ca.pem (CA private key + certificate) from the control-plane certs directory. Default when the
     control-plane service is installed on the same host: %ProgramData%\AegisProxy\certs\mitmproxy-ca.pem (only
     if that file is restricted to SYSTEM/Administrators). On a re-run without -CaFile the already staged CA is
-    kept. Same SMB encryption requirement as -DataPlaneKeyFile.
+    kept. Same SMB encryption and ACL requirements as -DataPlaneKeyFile.
 
 .PARAMETER AllowUnencryptedImport
     Accept -DataPlaneKeyFile / -CaFile on an SMB connection that is not encrypted (the key and the CA private key
@@ -272,6 +280,7 @@ param(
     [string]$MitmLogLevel = 'info',
 
     # Additional pip arguments, e.g. '--no-index','--find-links','\\fs\wheels' or '--index-url','https://nexus/...'.
+    # pip.ini files and PIP_* variables are ignored: an internal index, proxy or CA bundle goes here.
     [Parameter(ParameterSetName = 'Install')]
     [string[]]$PipArgs,
 
@@ -377,9 +386,40 @@ function Invoke-NativeLive {
     if ($LASTEXITCODE -ne 0) { throw "'$FilePath $($ArgumentList -join ' ')' failed with exit code $LASTEXITCODE." }
 }
 
+function Invoke-Pip {
+    # Runs "<venv>\python -I -m pip ..." without any pip configuration. pip reads its configuration files - the global
+    # %ProgramData%\pip\pip.ini, which any local user may create, the account's and the venv's - and PIP_* variables
+    # even with -I and --isolated; they add requirements files, package sources or a log file to the hash-pinned
+    # install. PIP_CONFIG_FILE=os.devnull ('nul', compared literally) skips every configuration file; the other PIP_*
+    # variables are removed for the child process and restored afterwards (ensurepip, which venv runs, does the same).
+    # Package sources therefore come from -PipArgs only.
+    param([Parameter(Mandatory = $true)][string[]]$ArgumentList, [int[]]$SuccessCodes = @(0), [switch]$Live)
+    $saved = @{}
+    foreach ($item in @(Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'PIP_*' })) {
+        $saved[$item.Name] = $item.Value
+        Remove-Item -LiteralPath "Env:$($item.Name)"
+    }
+    $env:PIP_CONFIG_FILE = 'nul'
+    try {
+        $command = @('-I', '-m', 'pip') + $ArgumentList
+        if ($Live) { Invoke-NativeLive -FilePath $VenvPython -ArgumentList $command }
+        else { Invoke-Native -FilePath $VenvPython -ArgumentList $command -SuccessCodes $SuccessCodes }
+    }
+    finally {
+        Remove-Item -LiteralPath Env:PIP_CONFIG_FILE -ErrorAction SilentlyContinue
+        foreach ($name in $saved.Keys) { Set-Item -LiteralPath "Env:$name" -Value $saved[$name] }
+    }
+}
+
 function Read-SecretFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
     return ([System.IO.File]::ReadAllText($Path)).Trim([char[]]@([char]0xFEFF, ' ', "`t", "`r", "`n"))
+}
+
+function Test-StagedFile([string]$Path, [string]$Staged) {
+    # True if Path names the staged copy itself (a re-run that passes it again).
+    return [bool]($Path -and (Test-Path -LiteralPath $Path -PathType Leaf) -and
+        [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).ProviderPath) -eq [System.IO.Path]::GetFullPath($Staged))
 }
 
 function Write-TextNoBom([string]$Path, [string]$Value) {
@@ -498,7 +538,10 @@ function Get-WritableSource {
     # -Location takes directories that the installers take over themselves (program, data and site directories) or
     # check otherwise (the Python directory): only the directories above them count, like those above a source.
     # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
-    param([string[]]$Path = @(), [string[]]$Location = @())
+    # -Secret takes files whose content is secret (keys, the proxy secret, the CA private key): checked like a source,
+    # and reading them (ReadData) counts as well - except for services (NT SERVICE\..., S-1-5-80-...: only an
+    # administrator can install one; the control-plane service reads its secrets), which may read but not change them.
+    param([string[]]$Path = @(), [string[]]$Location = @(), [string[]]$Secret = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
@@ -506,11 +549,14 @@ function Get-WritableSource {
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
     $starts = New-Object System.Collections.Generic.List[object]
     foreach ($p in @($Path | Where-Object { $_ })) {
-        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $false }) }
+    }
+    foreach ($p in @($Secret | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $true }) }
     }
     foreach ($p in @($Location | Where-Object { $_ })) {
         $full = [System.IO.Path]::GetFullPath($p)
-        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true; Secret = $false }) }
     }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
@@ -518,11 +564,13 @@ function Get-WritableSource {
         $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
         $above = $start.Above
-        while ($current -and -not $seen.ContainsKey("$above|$current")) {
-            $seen["$above|$current"] = $true
-            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
+        $isSecret = $start.Secret
+        while ($current -and -not $seen.ContainsKey("$above|$isSecret|$current")) {
+            $seen["$above|$isSecret|$current"] = $true
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above; Secret = $isSecret }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
+            $isSecret = $false
         }
     }
     $found = [ordered]@{}
@@ -547,8 +595,10 @@ function Get-WritableSource {
                         $sid = "$($rule.IdentityReference.Value)"
                         if ("$($rule.AccessControlType)" -ne 'Allow' -or $trusted -contains $sid -or $ownerOnly -contains $sid) { continue }
                         if ($check.Above -and "$($rule.PropagationFlags)" -match 'InheritOnly') { continue }
-                        if (-not ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band $mask)) { continue }
-                        $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid })
+                        $rights = ConvertTo-FileRight ([int]$rule.FileSystemRights)
+                        $name = if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid }
+                        if ($rights -band $mask) { $who += $name }
+                        elseif ($check.Secret -and ($rights -band 1) -and $sid -notlike 'S-1-5-80-*') { $who += "${name}: read" }
                     }
                 }
                 if (-not $check.Above -and $item.PSIsContainer) {
@@ -600,6 +650,26 @@ function Assert-TrustedLocation {
         ($list -join "`n"), $folder[0]
     if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
     Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Assert-ProtectedSecret {
+    # Stops before a secret file is read when Get-WritableSource -Secret reports it or a directory above it: whoever
+    # can read it knows the secret, whoever can replace it chooses the secret. There is no override.
+    param([string[]]$Path = @())
+    $exposed = @(Get-WritableSource -Secret $Path | Sort-Object -Property Path)
+    if (-not $exposed.Count) { return }
+    $list = @($exposed | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($exposed.Count -gt 15) { $list += "  ... and $($exposed.Count - 15) more" }
+    $folder = Join-Path $env:SystemDrive 'AegisSecrets'
+    throw (("Non-administrators can read or replace secret files that this script reads, or rename a directory above them:`n{0}`n" +
+        'Whoever can read a secret knows it, whoever can replace it chooses it. Copy the secret over a protected channel ' +
+        "into a folder that only administrators can read and change, and pass that copy:`n" +
+        "  New-Item -ItemType Directory -Force `"{1}`"`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`"`n" +
+        "  (copy the secret into it)`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /T /L /C /Q`n" +
+        'If others could read it, treat the secret as known and replace it (docs/deployment/windows.md, troubleshooting).') -f
+        ($list -join "`n"), $folder)
 }
 
 function Get-NewParent([string[]]$Path) {
@@ -896,14 +966,10 @@ if ($ControlPlaneUrl -notmatch '^https://') {
 }
 
 # Everything this script runs or copies as Administrator, or that decides which code runs in the service (addon, lock
-# file, WinSW, CAs), must be out of reach of other accounts, including the folders above it (whoever may rename one can
-# replace the files). The CA of a control-plane on this host (used without -CaFile) must be restricted to
-# SYSTEM/Administrators, see below; a -CaFile that names the staged copy itself (a re-run that keeps the CA) belongs to
-# this installation, whose ACLs are verified like the other staged files.
-$caSource = $CaFile
-if ($CaFile -and (Test-Path -LiteralPath $CaFile -PathType Leaf) -and
-    [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $CaFile).ProviderPath) -eq [System.IO.Path]::GetFullPath($StagedCa)) { $caSource = $null }
-Assert-TrustedSource -Path @($PSCommandPath, $Template, $WinSWExe, $SourceDir, $RequirementsFile, $caSource, $ControlPlaneCaFile) -Allow:$AllowWritableSource
+# file, WinSW, the control-plane CA bundle), must be out of reach of other accounts, including the folders above it
+# (whoever may rename one can replace the files). The data-plane key and the CA (key + certificate) are secrets,
+# checked below.
+Assert-TrustedSource -Path @($PSCommandPath, $Template, $WinSWExe, $SourceDir, $RequirementsFile, $ControlPlaneCaFile) -Allow:$AllowWritableSource
 
 # The program and data directories (venv, addon, WinSW, key, CA, confdir) are taken over below; whoever may rename a
 # directory above them could put other ones in their place. %ProgramData%\AegisProxy above the default data root is
@@ -941,8 +1007,11 @@ foreach ($required in @('aegis_addon.py', 'aegis_dp\addon.py', 'aegis_dp\__init_
     if (-not (Test-Path -LiteralPath (Join-Path $SourceDir $required))) { throw "$SourceDir is not the data-plane folder ($required missing). Use -SourceDir." }
 }
 
-# Data-plane key
+# Data-plane key. Whoever can read it knows it, whoever can replace it chooses it: only administrators may read and
+# change it, up to the volume root (no override). The staged copy (a re-run that passes it) belongs to this
+# installation, whose ACLs are verified like the other staged files.
 Assert-EncryptedSmbSource -Name '-DataPlaneKeyFile' -Path $DataPlaneKeyFile -AllowUnencrypted:$AllowUnencryptedImport
+if (-not (Test-StagedFile $DataPlaneKeyFile $StagedKey)) { Assert-ProtectedSecret -Path @($DataPlaneKeyFile) }
 $keyValue = Read-SecretFile $DataPlaneKeyFile
 if (-not $keyValue) { throw "Data-plane key file '$DataPlaneKeyFile' not found or empty." }
 if ($keyValue.Length -lt 32 -or $keyValue -match '\s') { throw "The data-plane key in '$DataPlaneKeyFile' must be a single token of at least 32 characters." }
@@ -961,7 +1030,9 @@ if (-not $CaFile -and -not (Test-Path -LiteralPath $StagedCa)) {
     else { throw '-CaFile is required: path to mitmproxy-ca.pem (CA private key + certificate) from the control-plane certs directory.' }
 }
 if ($CaFile) {
+    # The CA private key, checked like the data-plane key (the staged copy of a re-run that keeps the CA excepted).
     Assert-EncryptedSmbSource -Name '-CaFile' -Path $CaFile -AllowUnencrypted:$AllowUnencryptedImport
+    if (-not (Test-StagedFile $CaFile $StagedCa)) { Assert-ProtectedSecret -Path @($CaFile) }
     $CaFile = (Resolve-Path -LiteralPath $CaFile).ProviderPath
     $caText = [System.IO.File]::ReadAllText($CaFile)
     if ($caText -notmatch '-----BEGIN (RSA |EC )?PRIVATE KEY-----' -or $caText -notmatch '-----BEGIN CERTIFICATE-----') {
@@ -1180,14 +1251,14 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
     }
     if ($PipArgs) { $pipArgList += $PipArgs }
     Write-Step "pip $($pipArgList -join ' ')"
-    try { Invoke-NativeLive -FilePath $VenvPython -ArgumentList (@('-I', '-m', 'pip') + $pipArgList) }
+    try { Invoke-Pip -ArgumentList $pipArgList -Live }
     finally { if ($pipReq -ne $lockFile) { Remove-Item -LiteralPath $pipReq -Force -ErrorAction SilentlyContinue } }
     # Security overrides for mitmproxy dependencies (mitmproxy's upper bound excludes the fixed release).
     $securityReq = Join-Path $SourceDir 'requirements-security.txt'
     if ((Test-Path -LiteralPath $securityReq) -and -not $lockFile) {
-        $secArgs = @('-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--require-virtualenv', '--no-deps', '--only-binary=:all:', '-r', $securityReq)
+        $secArgs = @('install', '--disable-pip-version-check', '--no-input', '--require-virtualenv', '--no-deps', '--only-binary=:all:', '-r', $securityReq)
         if ($PipArgs) { $secArgs += $PipArgs }
-        Invoke-NativeLive -FilePath $VenvPython -ArgumentList $secArgs
+        Invoke-Pip -ArgumentList $secArgs -Live
     }
     elseif (Test-Path -LiteralPath $securityReq) {
         # Hash-pinned mode: an unhashed install on top would bypass --require-hashes, so only verify the pins. The
@@ -1202,7 +1273,7 @@ if ($PSCmdlet.ShouldProcess($VenvDir, "Create venv and install mitmproxy==$Mitmp
         $overrides = @(foreach ($line in (Get-Content -LiteralPath $securityReq)) {
                 if ($line -match '^\s*(?<name>[A-Za-z0-9._-]+)==') { ($Matches['name'] -replace '[-_.]+', '-').ToLowerInvariant() }
             })
-        $pipCheck = Invoke-Native -FilePath $VenvPython -ArgumentList @('-I', '-m', 'pip', 'check') -SuccessCodes @(0, 1)
+        $pipCheck = Invoke-Pip -ArgumentList @('check') -SuccessCodes @(0, 1)
         $broken = @($pipCheck.Output | Where-Object {
                 $_.Trim() -and $_ -notmatch '^No broken' -and
                 -not ($_ -match 'but you have (?<pkg>\S+) ' -and $overrides -contains ($Matches['pkg'] -replace '[-_.]+', '-').ToLowerInvariant())
