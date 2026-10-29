@@ -21,6 +21,18 @@ fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/aegis-images.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 git -C "$root" archive --format=tar "$commit" -- "${contexts[@]}" | tar -x -C "$work"
+# git archive also applies export-ignore and export-subst from $GIT_DIR/info/attributes, which `git status` does not
+# show: the exported tree must be exactly the committed one (every file with its committed content, nothing else).
+want=$(git -C "$root" ls-tree -r --format='%(path) %(objectname)' "$commit" -- "${contexts[@]}" | LC_ALL=C sort)
+mapfile -t files < <(find "$work" -type f -printf '%P\n' | LC_ALL=C sort)
+got=$(paste -d' ' <(printf '%s\n' "${files[@]}") \
+    <(for f in "${files[@]}"; do printf '%s/%s\n' "$work" "$f"; done | git -C "$root" hash-object --no-filters --stdin-paths) |
+    LC_ALL=C sort)
+if [ "$got" != "$want" ]; then
+    echo "build-images: the exported tree differs from $commit (export-ignore / export-subst in .git/info/attributes?):" >&2
+    diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | head -20 >&2 || true
+    exit 1
+fi
 echo "build-images: building $commit from $work"
 
 docker build -t "$registry/aegisproxy-control-plane:$tag" --build-arg VERSION="$version" "$work"

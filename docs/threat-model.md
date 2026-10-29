@@ -97,7 +97,7 @@ topology or add integrations.
 | Slow or failing scan engines | Timeouts per engine, `icap_fail_mode` / `av_fail_mode` per policy, health status in heartbeats |
 | SIEM outage blocks the control-plane | Durable spool per export destination, bounded queues, drops counted in metrics |
 | Forged or altered records injected into the export spool | Spool records carry an HMAC-SHA256 keyed from the audit chain key and bound to the destination; records without or with a wrong MAC are dead-lettered with an alert, not sent |
-| Export to the SIEM silently stops | Delivery state per destination; a destination that cannot start drops records with a critical alert; responses that do not confirm every record (Elasticsearch bulk) are retried; posture check *Audit trail forwarded to a SIEM* requires a destination that delivers the audit stream itself (its own last outcome: a mixed destination that accepts the traffic records but rejects the audit records does not count) |
+| Export to the SIEM silently stops | Delivery state per destination; a destination that cannot start drops records with a critical alert; responses that do not confirm every record (Elasticsearch bulk) are retried; posture check *Audit trail forwarded to a SIEM* requires a destination that delivers the audit stream itself (its own last outcome: a mixed destination that accepts the traffic records but rejects the audit records does not count; after a restart, until its first audit record, it is shown as not confirmed) |
 
 ### Elevation of privilege
 

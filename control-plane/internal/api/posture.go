@@ -342,6 +342,15 @@ func auditSinkDelivering(st models.ExportSinkStatus, running bool) bool {
 	}
 }
 
+// auditSinkUnconfirmed reports a running sink that sent records of other streams but no audit record since the
+// control-plane started: per-stream outcomes are not kept across restarts, so its sink-wide state says nothing
+// about the audit stream (a destination that rejects only audit records would look healthy). The first audit
+// record decides.
+func auditSinkUnconfirmed(st models.ExportSinkStatus, running bool) bool {
+	_, seen := st.Streams[models.StreamAudit]
+	return running && !seen && len(st.Streams) > 0
+}
+
 // auditPostureChecks: the audit trail is forwarded, intact (verified completely), trusted end to end
 // and writable.
 func (s *Server) auditPostureChecks(add postureAdd) {
@@ -353,13 +362,17 @@ func (s *Server) auditPostureChecks(add postureAdd) {
 		status[st.ID] = st
 	}
 	configured, delivering := 0, 0
-	var failing []string
+	var failing, unconfirmed []string
 	for _, sink := range s.store.ExportSinks() {
 		if !sink.Enabled || !slices.Contains(sink.Streams, models.StreamAudit) {
 			continue
 		}
 		configured++
 		st, running := status[sink.ID]
+		if auditSinkUnconfirmed(st, running) {
+			unconfirmed = append(unconfirmed, sink.Name)
+			continue
+		}
 		if auditSinkDelivering(st, running) {
 			delivering++
 			continue
@@ -398,6 +411,15 @@ func (s *Server) auditPostureChecks(add postureAdd) {
 	switch {
 	case delivering > 0:
 		exportStatus, exportDetail = "pass", itoa(delivering)+" destination(s) receive the audit stream"
+		if len(failing) > 0 {
+			exportDetail += "; failing: " + strings.Join(failing, "; ")
+		}
+		if len(unconfirmed) > 0 {
+			exportDetail += "; no audit record sent since the start yet: " + strings.Join(unconfirmed, ", ")
+		}
+	case len(unconfirmed) > 0:
+		exportStatus, exportDetail = "warn", "no audit record has been sent to "+strings.Join(unconfirmed, ", ")+
+			" since the control-plane started (other streams are delivered); the check passes once the destination accepts one"
 		if len(failing) > 0 {
 			exportDetail += "; failing: " + strings.Join(failing, "; ")
 		}

@@ -272,3 +272,26 @@ func TestAuditSinkDelivering(t *testing.T) {
 		}
 	}
 }
+
+// RV5-L-2: after a restart the per-stream outcomes are gone; a mixed sink that delivered only traffic since then
+// is not taken as forwarding the trail on its sink-wide state.
+func TestAuditSinkUnconfirmedAfterRestart(t *testing.T) {
+	now := time.Now()
+	traffic := map[string]models.ExportStreamStatus{models.StreamTraffic: {LastSuccessAt: &now}}
+	for _, c := range []struct {
+		name    string
+		st      models.ExportSinkStatus
+		running bool
+		want    bool
+	}{
+		{"traffic delivered, no audit record since the start", models.ExportSinkStatus{State: "ok", LastSuccessAt: &now, Streams: traffic}, true, true},
+		{"nothing sent since the start", models.ExportSinkStatus{State: "idle"}, true, false},
+		{"audit delivered", models.ExportSinkStatus{State: "ok", LastSuccessAt: &now,
+			Streams: map[string]models.ExportStreamStatus{models.StreamAudit: {LastSuccessAt: &now}}}, true, false},
+		{"not running yet", models.ExportSinkStatus{Streams: traffic}, false, false},
+	} {
+		if got := auditSinkUnconfirmed(c.st, c.running); got != c.want {
+			t.Errorf("%s: unconfirmed=%t, want %t", c.name, got, c.want)
+		}
+	}
+}
