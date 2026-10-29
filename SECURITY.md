@@ -58,7 +58,8 @@ it with `--require-hashes` by default, and the CI audit runs pip-audit (itself i
 installed environment and against every pin of the lock, including the Windows, macOS and CPython 3.12/3.13-only
 entries, and of the console regression suite's lock (`frontend/e2e/requirements.txt`).
 Where mitmproxy's version bounds exclude a security fix of a dependency, `data-plane/requirements-security.txt`
-installs the fixed release (currently Brotli 1.2.1, CVE-2026-111497) in the image, in both installers and in the
+installs the fixed release (currently Brotli 1.2.1 for CVE-2026-111497 and tornado 6.6 for CVE-2026-116577, CVE-2026-115927 and
+CVE-2026-116578; tornado serves only mitmweb, which the worker does not run) in the image, in both installers and in the
 lock.
 
 ### Repository settings required for release integrity

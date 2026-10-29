@@ -2,3 +2,4 @@
 # mitmproxy's package metadata. Installed with --no-deps after mitmproxy (image, installers, CI).
 # Remove an entry once mitmproxy allows the fixed version.
 Brotli==1.2.1  # CVE-2026-111497 (PYSEC-2026-4322): out-of-bounds write in the Brotli decoder (crafted streams)
+tornado==6.6  # CVE-2026-116577, CVE-2026-115927, CVE-2026-116578: header-folding CPU, chunked-body event-loop blocking, RedirectHandler open redirect (mitmweb only; the worker runs mitmdump)

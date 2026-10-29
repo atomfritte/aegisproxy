@@ -18,6 +18,7 @@ COPY aegis_addon.py healthcheck.py entrypoint.sh /opt/aegis/
 COPY aegis_dp/ /opt/aegis/aegis_dp/
 # /var/lib/aegis/flow-spool: mount point of the optional traffic-record spool (AEGIS_FLOW_SPOOL_DIR). Owned by the
 # runtime user so a new named volume mounted there inherits a writable, private directory.
+# pip check may only report mitmproxy's upper bounds that the security overrides exceed.
 # Bytecode comes only from the copied sources: any .pyc that slipped through the build context is deleted first
 # (compileall keeps, and Python then runs, a .pyc whose header matches the source's mtime and size).
 RUN chmod 0755 /opt/aegis/entrypoint.sh /opt/aegis/healthcheck.py \
@@ -25,7 +26,9 @@ RUN chmod 0755 /opt/aegis/entrypoint.sh /opt/aegis/healthcheck.py \
  && find /opt/aegis \( -name '*.pyc' -o -name '*.pyo' \) -delete \
  && python3 -m compileall -q /opt/aegis \
  && chmod -R a+rX /opt/aegis \
- && { pip check | grep -vi -e "^mitmproxy .* has requirement brotli" -e "no broken requirements" | (! grep .); } \
+ && sed -nE 's/^([A-Za-z0-9_.-]+)==.*/^mitmproxy .* has requirement \1[<>=!~,]/p' /opt/aegis/requirements-security.txt > /tmp/pip-tolerated \
+ && echo "no broken requirements" >> /tmp/pip-tolerated \
+ && { pip check | grep -vi -f /tmp/pip-tolerated | (! grep .); } && rm -f /tmp/pip-tolerated \
  && { pip uninstall -y -q setuptools wheel 2>/dev/null || true; } \
  && python3 -m pip uninstall -y -q pip \
  && rm -rf /usr/local/lib/python3*/ensurepip /root/.cache \
