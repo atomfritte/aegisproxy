@@ -10,7 +10,7 @@ Windows Server 2022/2025, which stays the authoritative test.
 | Script | What it does |
 |---|---|
 | `run-go-tests.sh <work-dir> [--cluster]` | builds the Wine image, compiles every control-plane test package for Windows and runs it in its package directory; `--cluster` adds the PostgreSQL cluster tests against `postgres:17-alpine` |
-| `prepare-windows-python.sh <work-dir>` | downloads the Python 3.12.10 embeddable distribution (SHA-256 pinned) and installs mitmproxy 12.3.0, Brotli 1.2.1 and YARA-X 1.22.0 for `win_amd64` with `uv` into `<work-dir>/python` |
+| `prepare-windows-python.sh <work-dir>` | downloads the Python 3.12.10 embeddable distribution (SHA-256 pinned) and installs the `win_amd64` wheels of the hash lock `data-plane/requirements-lock.txt` (mitmproxy 12.3.0, YARA-X 1.22.0, security overrides) with `uv` into `<work-dir>/python` |
 | `exe_e2e.py <dir with aegis-control-plane.exe>` | console process: bootstrap, policies, data-plane bundle, CA, built-in audit rotation at 1 MB with compression, complete chain verification and export, restart durability; service: `sc create` with the `service` argument, `net start`/`net stop`, graceful stop with state flush, exit codes, configuration error → `STOPPED` with exit code 1 |
 | `dp_e2e.py <exe dir> <work-dir>/python <repo>/data-plane` | control-plane `.exe` + data-plane on Windows CPython with the arguments of `deploy/windows/aegis-dataplane.xml`; HTTPS through the proxy with TLS interception by the enterprise CA, default deny with block page, method restriction, access log on a Windows path, heartbeat with YARA-X, flows at the control-plane |
 
