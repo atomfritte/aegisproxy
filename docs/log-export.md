@@ -66,9 +66,14 @@ high → 3, critical → 2; OTLP severity numbers 9 / 10 / 13 / 17 / 21.
   order** with exponential backoff (1 s … 5 min). Spool writes that contain audit or security records are flushed
   to stable storage (fsync) before they count as handled. The spool keeps the records themselves, not the
   encoded payload: they are encoded when sent, so changing the endpoint, format, index or source type keeps
-  them (they arrive in the new format at the new destination). Spools written by release 2.0 hold encoded
-  payloads; they are resent unchanged while format, index and source type stay the same (a changed endpoint is
-  fine) and moved to the dead-letter file otherwise.
+  them (they arrive in the new format at the new destination). Every spooled record carries an HMAC-SHA256 (key
+  derived from the audit chain key, bound to the destination's id): a record changed or added by somebody with
+  write access to the spool directory, or spooled with another installation's key, is not sent but moved to the
+  dead-letter file (error `spool integrity: …`) and raises an `EXPORT_DELIVERY` security event. Records without
+  MAC — spooled by an earlier release (2.0 payloads, or 2.1 builds before this check) — are treated the same
+  way: after an upgrade with a non-empty spool, review the dead-letter file and replay what is genuine (audit
+  records are also replayed from the audit trail through the cursor, below). Replaying a genuine record twice
+  only duplicates it (at-least-once delivery).
 - **Audit records are delivered at least once, also across crashes.** Every destination carrying the audit stream
   keeps a cursor (`audit-cursor.json` in its spool directory): the newest audit event up to which every event was
   delivered, written to the spool (fsynced) or dead-lettered. At start it replays the local audit trail after the
@@ -91,7 +96,15 @@ high → 3, critical → 2; OTLP severity numbers 9 / 10 / 13 / 17 / 21.
 - Permanent rejections (HTTP 4xx such as invalid credentials or a mapping error) are counted as `failed` (records)
   and `discarded_batches` and not retried; the error is shown in the console. Elasticsearch/OpenSearch reject
   documents one by one: only the rejected documents count as `failed` and are dead-lettered (with the error of
-  each document), the others count as delivered.
+  each document), the others count as delivered. A batch counts as delivered only when the response is a
+  complete bulk result (read up to 32 MB, reduced with `filter_path` to the status and error of each item) that
+  answers every document with a status: a 200 response that is not a bulk result (a proxy or another service at
+  the endpoint), a truncated body or missing items is retried like an unavailable destination (documents carry
+  their ID, so ones already created come back as 409 and count as delivered).
+- A destination that cannot be started (for example an unreadable client certificate) is shown with state
+  `error`; records published to it count as `dropped`. The first audit or security record it misses raises a
+  critical `EXPORT_DELIVERY` security event and an error log line. After the configuration is fixed, audit
+  records are replayed from its cursor if it kept one.
 - **Dead-letter file:** destinations that carry audit or security records keep records they cannot deliver in
   `AEGIS_EXPORT_SPOOL_DIR/<sink id>/dead-letter.jsonl` — one JSON object per batch: time, sink, error, the
   records as text and, when the destination named them, `record_errors` per record. Each write is fsynced; the

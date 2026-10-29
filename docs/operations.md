@@ -128,8 +128,9 @@ Suggested alerts (shipped as a `PrometheusRule` in the Helm chart: `metrics.prom
   storage configuration changes are refused until it recovers ([audit trail](#audit-trail); not yet part of the
   shipped `PrometheusRule`)
 - `aegis_audit_trail_intact == 0` — an audit trail integrity violation was detected; `aegis_audit_legacy_pending
-  == 1` — unkeyed pre-2.1 events await acceptance ([audit trail](#audit-trail); not yet part of the shipped
-  `PrometheusRule`)
+  == 1` — unkeyed pre-2.1 events await acceptance; `aegis_audit_full_verify_ok == 0` or `time() -
+  aegis_audit_full_verify_timestamp_seconds > 2 × AEGIS_AUDIT_VERIFY_INTERVAL` — the complete verification of
+  the trail failed or stopped running ([audit trail](#audit-trail); not yet part of the shipped `PrometheusRule`)
 
 Logs are structured JSON (`AEGIS_LOG_FORMAT=json`). Audit events are written as `msg="audit"` log lines and to
 `audit.jsonl`. To forward audit, traffic ("browsing") and security records to a SIEM or observability platform
@@ -215,17 +216,39 @@ configuration row, in the transaction that inserts the audit rows). The verifica
 with it, so deleting the newest events — lines of `audit.jsonl`, the newest generation, `aegis_audit` rows — is
 detected although the remaining chain still links correctly, and so is a checkpoint copied from an older state.
 
-**Integrity violations.** At start-up, and on every cluster reload, the control-plane checks anchor and
-checkpoint against the trail. A missing anchor or checkpoint in a trail written by 2.1 or later (keyed events, an
-audit chain key or a checkpoint exist), an invalid seal, a cut start or a cut end is an *integrity violation*: it is
-logged, recorded as an `AUDIT_INTEGRITY_VIOLATION` audit event and raised as a high-severity security event (sent to
-Teams/Slack/webhooks when *notify on security events* is on); `aegis_audit_trail_intact` drops to 0, the posture
-check *Audit hash chain intact* fails and `GET /api/audit/verify` reports it. The control-plane keeps running. The
-violation is sealed into the checkpoint and **stays** — across restarts, on every replica and also when the
-evidence is put back afterwards — until the data is restored from a backup taken before it: compare the trail with
-your SIEM copy, preserve the affected `DATA_DIR` or database for the investigation, then restore. The same alert
-(without a violation) is raised for every retention point (`AUDIT_RETENTION_APPLIED`), every anchor sealed for an
-existing installation (`AUDIT_LEGACY_PENDING`) and every acceptance of legacy events (`AUDIT_LEGACY_ACCEPTED`).
+**Integrity violations.** Two kinds of checks run:
+
+* *Seal checks* — at start-up, and on every cluster reload, before anything is appended: anchor and checkpoint
+  against the in-memory window (the newest 2,000 events). They detect a missing anchor or checkpoint in a trail
+  written by 2.1 or later (keyed events, an audit chain key or a checkpoint exist), an invalid seal, newest events
+  cut off the end, a configuration replaced by an older copy, and an audit log that diverged from the state.
+* *Complete verification* — reads the whole trail (`audit.jsonl` and every generation, or all `aegis_audit` rows)
+  in the background: at start-up (right after the control-plane is up, so a large trail does not delay it), every
+  `AEGIS_AUDIT_VERIFY_INTERVAL` (default 6 h), after the audit log was rotated or truncated by another program (at
+  most every 15 minutes), and with every `GET /api/audit/verify`. It detects events changed, inserted, deleted or
+  reordered anywhere in the trail, a hash-version downgrade, a start that does not link to the anchor and an event
+  count that differs from the checkpoint. Changes made between two runs are found by the next one.
+
+A failed seal check, and a failed complete verification (confirmed by a second run a moment later, so a trail
+changing under it is not mistaken for tampering), is an *integrity violation*: it is logged, recorded as an
+`AUDIT_INTEGRITY_VIOLATION` audit event and raised as a high-severity security event (exported with the security
+stream and sent to Teams/Slack/webhooks when *notify on security events* is on — also when it is found at start-up,
+before the export destinations are running: such alerts are held back until they are); `aegis_audit_trail_intact`
+drops to 0, the posture check *Audit hash chain intact* fails and `GET /api/audit/verify` reports it. The
+control-plane keeps running. The violation is sealed into the checkpoint and **stays** — across restarts (each start
+raises the alert again), on every replica and also when the evidence is put back afterwards — until the data is
+restored from a backup taken before it: compare the trail with your SIEM copy, preserve the affected `DATA_DIR` or
+database for the investigation, then restore.
+
+Not recorded as violations, but alerted as `AUDIT_VERIFICATION_FAILED` (high) with the posture check failing and
+`aegis_audit_full_verify_ok` 0 until the next successful run: a trail that does not start at its sealed origin —
+also the state between removing old generations for retention and applying the retention point; otherwise the
+oldest events were deleted — and a complete verification that could not finish twice in a row (unreadable file,
+database error; retried every 10 minutes). Missing newest events while the audit log is not writable are reported
+by the posture check *Audit log writable* instead. The same alert as for a violation (without a violation) is raised
+for every retention point (`AUDIT_RETENTION_APPLIED`), every anchor sealed for an existing installation
+(`AUDIT_LEGACY_PENDING`, repeated at every start while pending) and every acceptance of legacy events
+(`AUDIT_LEGACY_ACCEPTED`).
 
 **What only an independent copy reveals.** A complete rollback — state (or configuration row) and trail replaced
 together by an older, consistent copy such as a backup — is internally intact and cannot be detected by the
@@ -336,9 +359,11 @@ outside `DATA_DIR`):
 
 | They can | They cannot (detected locally) |
 |---|---|
-| Delete or corrupt the data — detected as a violation (or, without a state file, a new installation without its configuration); recoverable from backups | Change, insert, reorder or delete individual events, also not at the start or the end (keyed chain, anchor, checkpoint) |
+| Delete or corrupt the data — detected as a violation (or, without a state file, a new installation without its configuration); recoverable from backups | Change, insert, reorder or delete individual events, also not at the end, without an integrity violation (keyed chain, anchor, checkpoint, complete verification) |
 | Replace state and trail together with an older complete copy (rollback) — **only the SIEM copy reveals it** | Remove the anchor, checkpoint or audit chain key without an integrity violation or a pending legacy prefix plus alert |
 | Discard key, seals and trail and present a re-hashed unkeyed trail — it stays untrusted (`legacy_pending`, posture fail, alert) unless a Super Admin accepts it | Forge a seal, hide a recorded violation, or make an unkeyed trail verify without a Super Admin's audited acceptance |
+| Delete the oldest events — alerted (`AUDIT_VERIFICATION_FAILED`, posture fail) like a retention in progress until a Super Admin applies a retention point | Add or change records in the export spool (MAC per record: dead-lettered with an alert) |
+| Change the trail and put it back before the next complete verification (`AEGIS_AUDIT_VERIFY_INTERVAL`, or the next rotation) | |
 
 Whoever also holds the encryption key (key in `DATA_DIR`, root on the host, database plus secret store) can
 recompute chain and seals: only the real-time SIEM copy protects against that. Super Admins can accept legacy
@@ -362,7 +387,7 @@ Score: every `pass` counts 2 points, `warn` 1 and `fail` 0 out of 2; `info` chec
 | platform | HTTPS for console and API · demo mode off · `/metrics` protected · interception CA validity (warn < 90 days, fail < 30 days) · data-plane workers reporting |
 | data | secrets encrypted at rest (warn when the key is stored in `DATA_DIR`) |
 | identity | bootstrap password file removed · SSO enabled · password login limited to break-glass accounts · 2–5 Super Admins · 1–2 break-glass accounts · no accounts unused for 90 days · no service-account key expiring within 14 days · service accounts restricted to source networks |
-| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM (fail in production, warn in demo mode) · audit hash chain intact (fail after an integrity violation and while legacy events await acceptance, warn while accepted pre-2.1 events exist) · audit log writable (shown when it is not) |
+| governance | four-eyes review · policy sets recertified on time · no catch-all (`*`) ALLOW rules · audit trail forwarded to a SIEM (fail in production, warn in demo mode, unless at least one destination with the audit stream delivers: state ok/idle or a delivery within 15 minutes) · audit hash chain intact (fail after an integrity violation, a failed complete verification and while legacy events await acceptance; warn while the complete verification has not finished or is overdue, and while accepted pre-2.1 events exist) · audit log writable (shown when it is not) |
 | detection | threat intelligence in `block` mode · downloads scanned (ClamAV, ICAP or YARA) · DLP active · threat-intel sources up to date |
 
 ## Backup and restore
@@ -441,7 +466,13 @@ on the local network, threat intelligence on, YARA/ICAP/ClamAV off:
 - **Audit trail**: archive the complete trail before upgrading; after the first start a Super Admin compares and
   accepts the pre-2.1 events ([legacy trail](#legacy-trail-after-an-upgrade-from-20)) — until then the posture
   check *Audit hash chain intact* fails. Configure a log export destination with the audit stream: production
-  installations without one fail the posture check *Audit trail forwarded to a SIEM*.
+  installations without one (or whose destinations do not deliver) fail the posture check *Audit trail
+  forwarded to a SIEM*. The complete trail is verified in the background at every start and every
+  `AEGIS_AUDIT_VERIFY_INTERVAL` (default 6 h): on large trails this reads the whole `audit.jsonl` history once per
+  run.
+- **Log export spool**: spool records now carry a MAC. Records spooled by 2.0 are not resent automatically; they
+  are moved to the destination's `dead-letter.jsonl` with an `EXPORT_DELIVERY` alert — let the spools drain before
+  the upgrade, or review and replay the dead-letter file afterwards ([log-export.md](log-export.md#delivery-guarantees)).
 - Identity: existing local Super Admins are marked as break-glass accounts; review the flag
   ([identity.md](identity.md#break-glass-accounts)). SSO settings can now only be changed by Super Admins.
 - Learning sessions: publishing rules of a session that is still recording is rejected with HTTP 409 — stop the

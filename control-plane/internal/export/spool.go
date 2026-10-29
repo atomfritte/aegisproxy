@@ -20,7 +20,9 @@ import (
 // aside (evicted) for the runtime, which dead-letters their audit and security records.
 //
 // Records are destination independent: the event as JSON behind a marker byte, encoded for the
-// destination when it is sent, so a changed endpoint, format, index or source type keeps them.
+// destination when it is sent, so a changed endpoint, format, index or source type keeps them. With a
+// spool key (Manager.SetSpoolKey) the marker is followed by an HMAC-SHA256 of the sink id and the
+// event, so records changed or added by somebody with write access to the spool are not sent.
 // Spools of earlier releases (signature "v1|…") hold records already encoded for the destination;
 // they stay as legacy records together with the encoding they were written in (legacyKey).
 type spool struct {
@@ -58,7 +60,8 @@ var (
 
 const (
 	spoolVersion = "v2"
-	eventMarker  = 0x00 // first byte of a destination independent record
+	eventMarker  = 0x00 // first byte of a destination independent record without MAC
+	macMarker    = 0x01 // first byte of a destination independent record with MAC
 	legacyFile   = "legacy-encoding"
 )
 

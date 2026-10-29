@@ -121,8 +121,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s %g\n", seriesKey("aegis_trusted_proxy_host_lookup_age_seconds", "host", st.host), st.age)
 	}
 	gauge("aegis_audit_log_writable", "1 while the audit log can be written (file storage refuses changes otherwise).", writable)
-	gauge("aegis_audit_trail_intact", "0 after an audit trail integrity violation (missing or invalid anchor or checkpoint, diverged trail).", intact)
+	gauge("aegis_audit_trail_intact", "0 after an audit trail integrity violation (missing or invalid anchor or checkpoint, diverged or modified trail).", intact)
 	gauge("aegis_audit_legacy_pending", "1 while unkeyed pre-2.1 audit events await acceptance by a Super Admin.", pendingLegacy)
+	if full := s.store.AuditFullCheck(); full.At != nil {
+		ok := 0.0
+		if full.OK {
+			ok = 1
+		}
+		gauge("aegis_audit_full_verify_ok", "1 when the last complete verification of the audit trail succeeded.", ok)
+		gauge("aegis_audit_full_verify_timestamp_seconds", "End of the last complete verification of the audit trail (Unix time).", float64(full.At.Unix()))
+	}
 	if ti := s.store.ThreatIntel(); ti != nil {
 		st := ti.Snapshot().Status()
 		gauge("aegis_threatintel_indicators", "Compiled threat-intel indicators.", float64(st.Domains+st.URLs+st.IPs+st.CIDRs+st.Hashes))

@@ -169,6 +169,26 @@ type AuditSink struct {
 	log      *slog.Logger
 	// writeAt is the file write (replaced in tests to simulate a full disk).
 	writeAt func(f *os.File, b []byte, off int64) (int, error)
+	// changed is told (under mu, must not block) when the file left the path or was truncated.
+	changed func(reason string)
+}
+
+// OnChange sets the function told when the log was rotated (by the sink or logrotate) or truncated
+// by another program; the store verifies the complete trail then. It is called with the sink's lock
+// held and must not block.
+func (a *AuditSink) OnChange(fn func(reason string)) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.changed = fn
+	a.mu.Unlock()
+}
+
+func (a *AuditSink) changedLocked(reason string) {
+	if a.changed != nil {
+		a.changed(reason)
+	}
 }
 
 func NewAuditSink(path string, logger *slog.Logger) (*AuditSink, error) {
@@ -265,9 +285,11 @@ func (a *AuditSink) reopenIfRotatedLocked() error {
 			if fi, err := a.f.Stat(); err == nil && fi.Size() < a.size {
 				a.log.Warn("audit log was truncated by another program", "size", fi.Size(), "expected", a.size)
 				a.size = fi.Size()
+				a.changedLocked("truncation")
 			}
 			return nil
 		}
+		a.changedLocked("rotation")
 	}
 	if err := a.open(); err != nil {
 		if a.f != nil {
@@ -371,6 +393,7 @@ func (a *AuditSink) rotateLocked() {
 		a.log.Error("audit log rotation failed", "error", err)
 	} else {
 		a.log.Info("audit log rotated", "generation", filepath.Base(target))
+		a.changedLocked("rotation")
 		var older []string
 		for _, p := range auditGenerationNames(a.path) {
 			if p != target && sinkGeneration(a.path, p) {
@@ -835,9 +858,10 @@ type AuditVerification struct {
 // generations, oldest first) and checks every hash and link, that the trail starts at its sealed
 // origin, that unkeyed (pre-2.1) events occur only in the accepted prefix before the keyed cutover,
 // that it reaches the newest event of the store, and that this newest event is exactly where the
-// sealed checkpoint saved with the configuration says (no events cut off the end).
+// sealed checkpoint saved with the configuration says (no events cut off the end). The result counts
+// as a complete verification (AuditFullCheck): a modified trail is recorded as an integrity violation.
 func (s *Store) VerifyCompleteAudit(ctx context.Context, auditLogPath string) AuditVerification {
-	res, err := s.verifyCompleteTrail(ctx, auditLogPath, false)
+	res, err := s.checkCompleteTrail(ctx, auditLogPath, false, "api")
 	if err != nil {
 		res.OK, res.Error = false, err.Error()
 	} else {
@@ -863,7 +887,7 @@ func (s *Store) verifyCompleteTrail(ctx context.Context, auditLogPath string, al
 	s.mu.RUnlock()
 	switch {
 	case trust != "":
-		return AuditVerification{}, errors.New(trust)
+		return AuditVerification{}, &auditIntegrityError{msg: trust, kind: integrityRecorded}
 	case anchorErr != nil:
 		return AuditVerification{}, anchorErr
 	}
@@ -882,10 +906,38 @@ func (s *Store) verifyCompleteTrail(ctx context.Context, auditLogPath string, al
 	go func() { pw.CloseWithError(s.ExportAudit(ctx, pw, auditLogPath)) }()
 	defer pr.Close()
 	err := scanAuditLines(pr, func(_ int, ev models.AuditEvent) error { return v.add(ev) })
+	if le := (*auditLineError)(nil); errors.As(err, &le) {
+		err = &auditIntegrityError{msg: err.Error()}
+	}
 	if err == nil {
 		err = v.finish()
 	}
 	return v.res, err
+}
+
+// auditIntegrityError is a verification failure caused by the content of the trail or its seals (not
+// by reading them).
+type auditIntegrityError struct {
+	msg  string
+	kind integrityKind
+}
+
+func (e *auditIntegrityError) Error() string { return e.msg }
+
+type integrityKind int
+
+const (
+	integrityViolation integrityKind = iota // modified, inserted, removed or reordered events or seals
+	integrityRecorded                       // a violation recorded earlier
+	// integrityStart: the trail does not start at its sealed origin. That is also the state between
+	// removing old generations (or rows) for retention and applying the retention point, so it is
+	// alerted but not recorded as a violation.
+	integrityStart
+	integrityPending // the legacy prefix awaits acceptance (everything else verified)
+)
+
+func integrityErr(kind integrityKind, format string, args ...any) error {
+	return &auditIntegrityError{msg: fmt.Sprintf(format, args...), kind: kind}
 }
 
 // auditVerifier checks a trail event by event, oldest first.
@@ -923,7 +975,7 @@ func (v *auditVerifier) add(ev models.AuditEvent) error {
 		v.res.FirstID = ev.ID
 		v.res.StartsAtGenesis = ev.PrevHash == zeroHash
 		if !v.window && ev.PrevHash != v.anchor.Origin {
-			return fmt.Errorf("the trail starts at event %s, which does not link to its sealed origin (older events missing or replaced)", ev.ID)
+			return integrityErr(integrityStart, "the trail starts at event %s, which does not link to its sealed origin (older events missing or replaced)", ev.ID)
 		}
 	}
 	v.res.LastID = ev.ID
@@ -931,20 +983,20 @@ func (v *auditVerifier) add(ev models.AuditEvent) error {
 		// The unkeyed hash can be recomputed by anyone: it is accepted only for the sealed prefix
 		// written before 2.1, never after the cutover (hash-version downgrade).
 		if v.keyed || v.legacyDone || v.anchor.LegacyHead == zeroHash || v.anchor.LegacyHead == "" {
-			return fmt.Errorf("event %s uses the unkeyed pre-2.1 hash after the keyed cutover (hash-version downgrade)", ev.ID)
+			return integrityErr(integrityViolation, "event %s uses the unkeyed pre-2.1 hash after the keyed cutover (hash-version downgrade)", ev.ID)
 		}
 		v.res.Legacy++
 	} else if !v.keyed {
 		v.keyed = true
 		if v.res.Legacy > 0 && !v.legacyDone {
-			return fmt.Errorf("the unkeyed pre-2.1 events before event %s do not end at the sealed cutover", ev.ID)
+			return integrityErr(integrityViolation, "the unkeyed pre-2.1 events before event %s do not end at the sealed cutover", ev.ID)
 		}
 	}
 	if ev.EventHash != computeAuditEventHash(ev.PrevHash, ev, v.key) {
-		return fmt.Errorf("hash mismatch at event %s (modified or forged)", ev.ID)
+		return integrityErr(integrityViolation, "hash mismatch at event %s (modified or forged)", ev.ID)
 	}
 	if v.prev != "" && ev.PrevHash != v.prev {
-		return fmt.Errorf("chain broken before event %s (events missing, reordered or inserted)", ev.ID)
+		return integrityErr(integrityViolation, "chain broken before event %s (events missing, reordered or inserted)", ev.ID)
 	}
 	if ev.HashVersion < 2 && ev.EventHash == v.anchor.LegacyHead {
 		v.legacyDone = true
@@ -959,21 +1011,21 @@ func (v *auditVerifier) add(ev models.AuditEvent) error {
 func (v *auditVerifier) finish() error {
 	v.res.HeadMatches = v.head == "" || v.sawHead
 	if !v.res.HeadMatches {
-		return fmt.Errorf("the trail ends before the newest event known to the control-plane (%s): newest events are missing", shortHash(v.head))
+		return integrityErr(integrityViolation, "the trail ends before the newest event known to the control-plane (%s): newest events are missing", shortHash(v.head))
 	}
 	if !v.window && v.headEvents > 0 {
 		v.res.CheckpointEvents = v.headEvents
 		if v.headAt != v.headEvents {
-			return fmt.Errorf("the trail holds %d events from its sealed origin up to its newest event %s, the sealed checkpoint %d: events were removed or inserted",
+			return integrityErr(integrityViolation, "the trail holds %d events from its sealed origin up to its newest event %s, the sealed checkpoint %d: events were removed or inserted",
 				v.headAt, shortHash(v.head), v.headEvents)
 		}
 		if v.headRevAt != v.headRevision {
-			return fmt.Errorf("the newest event %s carries revision %d, the sealed checkpoint %d (replaced)", shortHash(v.head), v.headRevAt, v.headRevision)
+			return integrityErr(integrityViolation, "the newest event %s carries revision %d, the sealed checkpoint %d (replaced)", shortHash(v.head), v.headRevAt, v.headRevision)
 		}
 		v.res.CheckpointMatches = true
 	}
 	if v.anchor.LegacyPending && !v.allowPending {
-		return fmt.Errorf("legacy_pending: the %d unkeyed (pre-2.1) events up to event hash %s are not trusted until a Super Admin accepts them after comparing them with an independent copy (the trail exported before the upgrade)",
+		return integrityErr(integrityPending, "legacy_pending: the %d unkeyed (pre-2.1) events up to event hash %s are not trusted until a Super Admin accepts them after comparing them with an independent copy (the trail exported before the upgrade)",
 			v.anchor.LegacyEvents, v.anchor.LegacyHead)
 	}
 	return nil

@@ -124,6 +124,9 @@ type Options struct {
 	Cluster        ClusterBackend
 	FlowRetention  time.Duration
 	EventRetention time.Duration
+	// AuditVerifyInterval verifies the complete audit trail in the background: at start-up, at this
+	// interval and after the audit log rotated (0 = only on request, GET /api/audit/verify).
+	AuditVerifyInterval time.Duration
 }
 
 type Store struct {
@@ -175,9 +178,16 @@ type Store struct {
 	lastCheckpointExport time.Time
 	lastCheckpointHead   string
 	lastCheckpointEvents int
-	closed               chan struct{}
-	closeOnce            sync.Once
-	persistWG            sync.WaitGroup
+	// Security events raised before the store went live (goLive) are queued: the exporter has no
+	// sinks and the notifier no channels yet. raisedAudit notes the audit alerts raised at this start.
+	alertsLive    bool
+	exportLive    bool
+	pendingAlerts []models.SecurityEvent
+	raisedAudit   map[string]bool
+	full          fullCheckState // complete verification of the audit trail (audit_verify.go)
+	closed        chan struct{}
+	closeOnce     sync.Once
+	persistWG     sync.WaitGroup
 
 	engine   *engine.PolicyEngine
 	notifier *notify.Dispatcher
@@ -221,6 +231,7 @@ func NewStore(opts Options) (*Store, error) {
 		revoked:    make(map[string]time.Time),
 		cluster:    opts.Cluster,
 	}
+	s.full.kick = make(chan string, 1)
 	if s.cluster != nil {
 		s.telemetry = newTelemetryQueue()
 		if err := s.initCluster(s.seedClusterLocked); err != nil {
@@ -233,15 +244,16 @@ func NewStore(opts Options) (*Store, error) {
 			s.log.Error("could not seal the audit trail anchor", "error", err)
 		}
 		s.mu.Lock()
-		s.exportAuditCheckpointLocked()
 		for _, f := range s.state.Flows {
 			s.traffic.add(f)
 		}
 		s.mu.Unlock()
+		s.goLive()
 		s.persistWG.Add(3)
 		go s.clusterLoops()
 		go s.housekeepingLoop()
 		go s.defenderLoop()
+		s.startAuditVerification()
 		s.registerCollectors()
 		return s, nil
 	}
@@ -251,12 +263,56 @@ func NewStore(opts Options) (*Store, error) {
 	if err := s.openFlowJournal(); err != nil {
 		return nil, err
 	}
+	s.goLive()
 	s.persistWG.Add(3)
 	go s.asyncDiskPersistLoop()
 	go s.housekeepingLoop()
 	go s.defenderLoop()
+	s.startAuditVerification()
 	s.registerCollectors()
 	return s, nil
+}
+
+// goLive configures the notification channels and starts the export sinks of the loaded
+// configuration (with the key that authenticates their spool records), and only then delivers the
+// security events raised while loading, such as integrity violations found at start-up, and reminds
+// of audit-trail states that persist across restarts.
+func (s *Store) goLive() {
+	s.mu.Lock()
+	s.exportLive = true
+	if s.notifier != nil {
+		s.notifier.UpdateConfig(s.state.NotifyConfig) // also for a cluster seeded or imported from a state file
+	}
+	if s.opts.Exporter != nil {
+		s.opts.Exporter.SetSpoolKey(s.exportSpoolKeyLocked())
+		s.opts.Exporter.SetAlertHandler(s.RecordExportAlert)
+	}
+	s.syncExportLocked()
+	s.mu.Unlock()
+	s.opts.Exporter.Sync() // outside the store lock: stopping replaced sinks may take a moment
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.alertsLive = true
+	pending := s.pendingAlerts
+	s.pendingAlerts = nil
+	for _, ev := range pending {
+		s.announceSecurityEventLocked(ev)
+	}
+	s.remindAuditStateLocked()
+	s.exportAuditCheckpointLocked()
+}
+
+// startAuditVerification starts the background verification of the complete audit trail.
+func (s *Store) startAuditVerification() {
+	if s.opts.AuditVerifyInterval <= 0 {
+		return
+	}
+	if s.cluster == nil {
+		s.opts.AuditSink.OnChange(s.kickAuditVerify)
+	}
+	s.persistWG.Add(1)
+	go s.auditVerifyLoop()
 }
 
 // seedClusterLocked initializes an empty cluster: an existing single-node state file is imported
@@ -541,13 +597,12 @@ func (s *Store) loadOrSeed() error {
 	}
 	s.dirty = true // always rewritten at start: migrations and re-encryption after a key rotation
 	s.persistNow()
-	s.exportAuditCheckpointLocked()
 	return nil
 }
 
-// syncExportLocked pushes the export sink configuration to the exporter.
+// syncExportLocked pushes the export sink configuration to the exporter (from goLive on).
 func (s *Store) syncExportLocked() {
-	if s.opts.Exporter == nil {
+	if s.opts.Exporter == nil || !s.exportLive {
 		return
 	}
 	s.opts.Exporter.Apply(s.state.ExportSinks)

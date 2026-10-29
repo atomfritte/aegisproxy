@@ -4800,9 +4800,12 @@ paths:
         it reaches the newest event known to the control-plane, and that this event is exactly where the
         sealed checkpoint saved with the configuration says (`checkpoint_matches`: no events cut off the
         end). In cluster mode the anchor, the checkpoint and the trail are read from one database snapshot.
-        A broken chain is reported with `200` and `valid: false`; so is an integrity violation detected at
-        start-up (it stays recorded until the data is restored from a backup) and a legacy prefix that
-        still awaits acceptance (`legacy_pending: true`, error starting with `legacy_pending:`).
+        A broken chain is reported with `200` and `valid: false`; so is an integrity violation detected
+        earlier (it stays recorded until the data is restored from a backup) and a legacy prefix that
+        still awaits acceptance (`legacy_pending: true`, error starting with `legacy_pending:`). A changed,
+        inserted or deleted event found here is recorded as an integrity violation (audited, alerted);
+        a trail that does not start at its sealed origin is alerted but not recorded (retention in
+        progress). The same verification runs in the background (`AEGIS_AUDIT_VERIFY_INTERVAL`).
 
         **Roles:** Super Admin, InfoSec Approver, Auditor (Team Leads: 403).
       responses:

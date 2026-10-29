@@ -259,45 +259,90 @@ func (s *Server) encryptionPostureCheck(add postureAdd) {
 	}
 }
 
-// auditPostureChecks: the audit trail is forwarded, intact, trusted end to end and writable.
+// auditSinkStale: an audit sink that has not delivered for this long while failing does not count as
+// forwarding the trail.
+const auditSinkStale = 15 * time.Minute
+
+// auditPostureChecks: the audit trail is forwarded, intact (verified completely), trusted end to end
+// and writable.
 func (s *Server) auditPostureChecks(add postureAdd) {
-	auditExport := false
-	for _, sink := range s.store.ExportSinks() {
-		if sink.Enabled && slices.Contains(sink.Streams, models.StreamAudit) {
-			auditExport = true
-		}
-	}
 	// Only an exported copy (with its AUDIT_CHECKPOINT records) reveals a rollback of the state and
-	// the audit log together, so production installations must forward the audit stream.
+	// the audit log together, so production installations must forward the audit stream, and a
+	// destination that does not take it does not count.
+	status := map[string]models.ExportSinkStatus{}
+	for _, st := range s.exporter.Status() {
+		status[st.ID] = st
+	}
+	configured, delivering := 0, 0
+	var failing []string
+	for _, sink := range s.store.ExportSinks() {
+		if !sink.Enabled || !slices.Contains(sink.Streams, models.StreamAudit) {
+			continue
+		}
+		configured++
+		st, running := status[sink.ID]
+		if !running || st.State == "ok" || st.State == "idle" || st.LastSuccessAt != nil && time.Since(*st.LastSuccessAt) < auditSinkStale {
+			delivering++ // not running yet: the configuration is being applied
+			continue
+		}
+		msg := sink.Name + ": " + st.State
+		if st.LastError != "" {
+			msg += " (" + st.LastError + ")"
+		}
+		if st.LastSuccessAt != nil {
+			msg += ", last delivery " + st.LastSuccessAt.UTC().Format(time.RFC3339)
+		}
+		failing = append(failing, msg)
+	}
 	exportStatus := "fail"
 	if s.store.DemoMode() {
 		exportStatus = "warn"
 	}
-	if auditExport {
-		exportStatus = "pass"
+	exportDetail := "without an exported copy a rollback of state and audit log together cannot be detected"
+	switch {
+	case delivering > 0:
+		exportStatus, exportDetail = "pass", itoa(delivering)+" destination(s) receive the audit stream"
+		if len(failing) > 0 {
+			exportDetail += "; failing: " + strings.Join(failing, "; ")
+		}
+	case configured > 0:
+		exportDetail = "the audit stream is configured but no destination receives it: " + strings.Join(failing, "; ")
 	}
-	add("audit-export", "governance", "Audit trail forwarded to a SIEM", exportStatus,
-		"without an exported copy a rollback of state and audit log together cannot be detected",
-		"Add a log export destination with the audit stream (Settings → Integrations → Log export).", "docs/log-export.md")
+	add("audit-export", "governance", "Audit trail forwarded to a SIEM", exportStatus, exportDetail,
+		"Add a log export destination with the audit stream (Settings → Integrations → Log export) and make sure it delivers (Log export status).", "docs/log-export.md")
 	audit := s.store.AuditStatus()
+	full := s.store.AuditFullCheck()
 	n, err := s.store.VerifyAuditChain()
+	verified := itoa(n) + " events verified (in-memory window)"
+	if full.Interval > 0 && full.At != nil && full.OK {
+		verified = itoa(full.Events) + " events verified completely at " + full.At.Format(time.RFC3339)
+	}
 	switch {
 	case audit.Integrity != "":
 		add("audit-chain", "governance", "Audit hash chain intact", "fail", audit.Integrity,
 			"Investigate tampering: compare with the exported audit trail and restore the data from a backup taken before the violation.", "docs/operations.md#audit-trail")
 	case err != nil:
 		add("audit-chain", "governance", "Audit hash chain intact", "fail", err.Error(), "Investigate tampering; compare with the exported audit trail.", "docs/operations.md#audit-trail")
+	case full.Interval > 0 && full.At != nil && !full.OK:
+		add("audit-chain", "governance", "Audit hash chain intact", "fail", "complete verification ("+full.Trigger+", "+full.At.Format(time.RFC3339)+") failed: "+full.Error,
+			"Compare the trail with the exported copy. A missing start is expected only until a retention point is applied; a trail that cannot be read must be made readable again (permissions, disk).", "docs/operations.md#audit-trail")
 	case audit.LegacyPending:
 		add("audit-chain", "governance", "Audit hash chain intact", "fail",
 			itoa(audit.LegacyEvents)+" unkeyed (pre-2.1) events up to "+audit.LegacyHead+" are not trusted until a Super Admin accepts them",
 			"Compare the legacy events with the trail exported before the upgrade, then accept them (Audit trail → Verify hash chain → Review and accept). If this installation already ran 2.1, the audit chain key and anchor were removed: do not accept, restore from a backup.",
 			"docs/operations.md#audit-trail")
+	case full.Interval > 0 && full.At == nil:
+		add("audit-chain", "governance", "Audit hash chain intact", "warn", verified+"; the complete verification of the trail has not finished yet",
+			"Wait for the complete verification started at start-up (large trails take a while), or run it: Audit trail → Verify hash chain.", "docs/operations.md#audit-trail")
+	case full.Interval > 0 && time.Since(*full.At) > 2*full.Interval+time.Hour:
+		add("audit-chain", "governance", "Audit hash chain intact", "warn", verified+"; the last complete verification is overdue (AEGIS_AUDIT_VERIFY_INTERVAL "+full.Interval.String()+")",
+			"Check the control-plane log for the complete verification of the audit trail.", "docs/operations.md#audit-trail")
 	case audit.LegacyEvents > 0:
 		// Pre-2.1 events use the unkeyed hash; a Super Admin accepted them as the prefix before the cutover.
-		add("audit-chain", "governance", "Audit hash chain intact", "warn", itoa(n)+" events verified; "+itoa(audit.LegacyEvents)+" accepted legacy events (pre-2.1, unkeyed hash) before the sealed cutover",
+		add("audit-chain", "governance", "Audit hash chain intact", "warn", verified+"; "+itoa(audit.LegacyEvents)+" accepted legacy events (pre-2.1, unkeyed hash) before the sealed cutover",
 			"Keep an archived copy of the legacy part of the trail (exported before the upgrade) as independent evidence.", "docs/operations.md#audit-trail")
 	default:
-		add("audit-chain", "governance", "Audit hash chain intact", "pass", itoa(n)+" events verified", "", "")
+		add("audit-chain", "governance", "Audit hash chain intact", "pass", verified, "", "")
 	}
 	if !audit.Writable {
 		// File storage refuses changes meanwhile; in a cluster the database stays the trail of record.

@@ -216,6 +216,7 @@ const (
 	alertEvicted        = "evicted"
 	alertEncoding       = "encoding"
 	alertOversize       = "oversize"
+	alertIntegrity      = "integrity"
 )
 
 var alertText = map[string]string{
@@ -224,6 +225,7 @@ var alertText = map[string]string{
 	alertEvicted:        "the spool limit was reached and the oldest spooled audit/security records were evicted",
 	alertEncoding:       "spooled audit/security records were written in an encoding the destination no longer uses (format, index or source type changed)",
 	alertOversize:       "audit/security records exceed the spool record limit",
+	alertIntegrity:      "spooled records failed the integrity check (no MAC or a wrong one: modified or added in the spool directory, or spooled by an earlier release) and were not resent",
 }
 
 // alertInterval rate-limits alerts per sink and cause.

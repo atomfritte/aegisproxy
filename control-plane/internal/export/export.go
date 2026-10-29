@@ -7,6 +7,7 @@ package export
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -72,6 +73,8 @@ type Manager struct {
 	sourceReady chan struct{}
 	sourceOnce  sync.Once
 
+	spoolKeyV atomic.Pointer[[]byte]
+
 	alertFn   atomic.Pointer[func(Alert)]
 	alerts    chan Alert
 	alertQuit chan struct{}
@@ -109,13 +112,49 @@ func (m *Manager) applyLoop() {
 	for {
 		select {
 		case <-m.signal:
-			if p := m.pending.Swap(nil); p != nil {
-				m.Configure(*p)
-			}
+			m.Sync()
 		case <-m.quit:
 			return
 		}
 	}
+}
+
+// Sync applies the newest configuration scheduled with Apply before it returns (the store calls it
+// once at start, so that records published right after find their sinks).
+func (m *Manager) Sync() {
+	if m == nil {
+		return
+	}
+	m.cfgMu.Lock()
+	defer m.cfgMu.Unlock()
+	if p := m.pending.Swap(nil); p != nil {
+		m.configureLocked(*p)
+	}
+}
+
+// SetSpoolKey sets the key that authenticates spool records (nil: records are spooled without MAC).
+// Call it before the first configuration: records spooled with a key are sent only with that key,
+// records without MAC are not sent once a key is set (they go to the dead-letter file).
+func (m *Manager) SetSpoolKey(key []byte) {
+	if m == nil {
+		return
+	}
+	if key == nil {
+		m.spoolKeyV.Store(nil)
+		return
+	}
+	k := slices.Clone(key)
+	m.spoolKeyV.Store(&k)
+}
+
+func (m *Manager) spoolKey() []byte {
+	if m == nil {
+		return nil
+	}
+	if k := m.spoolKeyV.Load(); k != nil {
+		return *k
+	}
+	return nil
 }
 
 // ExportDir is where "file" sinks write.
@@ -153,6 +192,10 @@ func (m *Manager) Configure(sinks []models.ExportSink) {
 	}
 	m.cfgMu.Lock()
 	defer m.cfgMu.Unlock()
+	m.configureLocked(sinks)
+}
+
+func (m *Manager) configureLocked(sinks []models.ExportSink) {
 	want := map[string]models.ExportSink{}
 	ids := map[string]bool{}
 	for _, s := range sinks {
@@ -199,7 +242,7 @@ func (m *Manager) Configure(sinks []models.ExportSink) {
 		if err != nil {
 			msg := scrubError(s, err.Error())
 			m.log.Error("export sink not started", "sink", s.Name, "type", s.Type, "error", msg)
-			m.sinks[id] = &runtime{cfg: s, sig: signature(s), failedStart: msg, done: closedChan()}
+			m.sinks[id] = &runtime{m: m, cfg: s, sig: signature(s), failedStart: msg, done: closedChan()}
 			continue
 		}
 		m.sinks[id] = rt
@@ -282,7 +325,11 @@ func (m *Manager) Publish(ev Event) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, rt := range m.sinks {
-		if rt.q == nil || !rt.accepts(ev) {
+		if !rt.accepts(ev) {
+			continue
+		}
+		if rt.q == nil {
+			rt.notStarted(ev)
 			continue
 		}
 		select {
@@ -395,7 +442,8 @@ type runtime struct {
 	alerted      map[string]time.Time
 	lastEvictLog time.Time
 
-	auditGap atomic.Bool // an audit record was lost: the cursor stays until the next start
+	auditGap     atomic.Bool // an audit record was lost: the cursor stays until the next start
+	startAlerted atomic.Bool // failedStart: the loss of audit/security records was alerted
 
 	sent, failed, dropped, discarded, replayedN, deadLettered atomic.Uint64
 	lastDropAlert                                             atomic.Int64 // unix nanos
@@ -434,29 +482,71 @@ func datas(recs []record) [][]byte {
 
 // spoolData is the spool form of a record: the event itself, so that it is encoded for the
 // destination configured when it is sent.
-func spoolData(r record) []byte {
+func (rt *runtime) spoolData(r record) []byte {
 	if r.raw {
 		return r.data
 	}
 	b, _ := json.Marshal(r.ev)
-	return append([]byte{eventMarker}, b...)
+	return rt.sealSpool(b)
 }
 
-var errLegacyEncoding = errors.New("spooled by an earlier release in an encoding this destination no longer uses (format, index or source type changed); not resent")
+// sealSpool prefixes an encoded event with its marker and, with a spool key, its MAC.
+func (rt *runtime) sealSpool(b []byte) []byte {
+	key := rt.m.spoolKey()
+	if key == nil {
+		return append([]byte{eventMarker}, b...)
+	}
+	out := make([]byte, 0, 1+sha256.Size+len(b))
+	out = append(append(out, macMarker), rt.spoolMAC(key, b)...)
+	return append(out, b...)
+}
+
+func (rt *runtime) spoolMAC(key, b []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(rt.cfg.ID))
+	h.Write([]byte{0})
+	h.Write(b)
+	return h.Sum(nil)
+}
+
+var (
+	errLegacyEncoding = errors.New("spooled by an earlier release in an encoding this destination no longer uses (format, index or source type changed); not resent")
+	errSpoolMAC       = errors.New("spool integrity: the record does not match its MAC (modified in the spool directory, or spooled with another key); not resent")
+	errSpoolUnsigned  = errors.New("spool integrity: the record has no MAC (spooled by an earlier release, or added to the spool directory); not resent")
+)
 
 // fromSpool turns a spooled record into a record for the current destination. On error the record
-// still carries what is known, for the dead-letter file.
+// still carries what is known, for the dead-letter file. With a spool key only records with a
+// matching MAC are sent.
 func (rt *runtime) fromSpool(sp *spool, data []byte) (record, error) {
-	if len(data) == 0 || data[0] != eventMarker {
+	key := rt.m.spoolKey()
+	switch {
+	case len(data) > 0 && data[0] == macMarker:
+		if len(data) < 1+sha256.Size {
+			return record{data: data[1:], raw: true}, errSpoolMAC
+		}
+		mac, body := data[1:1+sha256.Size], data[1+sha256.Size:]
+		if key == nil || !hmac.Equal(mac, rt.spoolMAC(key, body)) {
+			return record{data: body, raw: true}, errSpoolMAC
+		}
+		data = body
+	case key != nil:
+		if len(data) > 0 && data[0] == eventMarker {
+			data = data[1:]
+		}
+		return record{data: data, raw: true}, errSpoolUnsigned
+	case len(data) == 0 || data[0] != eventMarker:
 		r := record{data: data, raw: true}
 		if sp.legacyKey != legacyKey(rt.cfg) {
 			return r, errLegacyEncoding
 		}
 		return r, nil
+	default:
+		data = data[1:]
 	}
 	var ev Event
-	if err := json.Unmarshal(data[1:], &ev); err != nil {
-		return record{data: data[1:], raw: true}, fmt.Errorf("unreadable spool record: %v", err)
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return record{data: data, raw: true}, fmt.Errorf("unreadable spool record: %v", err)
 	}
 	ev = redacted(ev, &rt.cfg)
 	r := record{ev: ev}
@@ -475,7 +565,7 @@ func (rt *runtime) overflow(ev Event) bool {
 	if critical(ev.Stream) {
 		if sp := rt.sp.Load(); sp != nil {
 			if b, err := json.Marshal(redacted(ev, &rt.cfg)); err == nil {
-				if big, err := sp.Append([][]byte{append([]byte{eventMarker}, b...)}, true); err == nil && len(big) == 0 {
+				if big, err := sp.Append([][]byte{rt.sealSpool(b)}, true); err == nil && len(big) == 0 {
 					return true
 				}
 			}
@@ -490,6 +580,25 @@ func (rt *runtime) overflow(ev Event) bool {
 		rt.log.Warn(msg, "stream", ev.Stream)
 	}
 	return false
+}
+
+// notStarted counts an event for a sink that could not be started (failedStart) as dropped. The first
+// audit or security record raises a critical alert and an error log: nothing reaches the destination
+// until its configuration is fixed.
+func (rt *runtime) notStarted(ev Event) {
+	rt.dropped.Add(1)
+	if !critical(ev.Stream) || rt.m == nil || !rt.startAlerted.CompareAndSwap(false, true) {
+		return
+	}
+	a := Alert{SinkID: rt.cfg.ID, SinkName: rt.cfg.Name, Severity: "critical",
+		Detail: fmt.Sprintf("Log export %q could not be started (%s): audit/security records are not delivered and are dropped until its configuration is fixed (audit records are replayed from the audit trail afterwards when the sink kept its audit cursor)",
+			rt.cfg.Name, rt.failedStart)}
+	rt.m.log.Error("export sink not started: audit/security records are dropped", "sink", rt.cfg.Name, "stream", ev.Stream, "error", rt.failedStart)
+	select {
+	case rt.m.alerts <- a:
+	default:
+		rt.m.log.Warn("export alert dropped (alert queue full)", "detail", a.Detail)
+	}
 }
 
 // deadLetter appends records that cannot be delivered to <spool dir>/dead-letter.jsonl when the sink
@@ -685,7 +794,7 @@ func (rt *runtime) toSpool(recs []record) {
 	}
 	data := make([][]byte, len(recs))
 	for i, r := range recs {
-		data[i] = spoolData(r)
+		data[i] = rt.spoolData(r)
 	}
 	oversize, err := sp.Append(data, slices.ContainsFunc(recs, isCritical))
 	if err != nil {
@@ -895,7 +1004,10 @@ func (rt *runtime) drainSpool() {
 		// Unsendable records before the cut are set aside now; the others when the cut passes them.
 		if k := sort.SearchInts(badAt, cut); k > 0 {
 			kind := alertRejected
-			if slices.Contains(badReasons[:k], errLegacyEncoding.Error()) {
+			switch {
+			case slices.Contains(badReasons[:k], errSpoolMAC.Error()) || slices.Contains(badReasons[:k], errSpoolUnsigned.Error()):
+				kind = alertIntegrity
+			case slices.Contains(badReasons[:k], errLegacyEncoding.Error()):
 				kind = alertEncoding
 			}
 			rt.unsendable(bad[:k], badReasons[:k], kind)
