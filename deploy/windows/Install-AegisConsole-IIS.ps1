@@ -17,7 +17,8 @@
       to the Content-Security-Policy connect-src directive
     * binds HTTPS (SNI) with a certificate from Cert:\LocalMachine\My (by thumbprint)
     * with -ApiProxyTarget: proxies /api to the control-plane through Application Request Routing (same origin,
-      no CORS) and authenticates IIS to it with the proxy secret (X-Aegis-Proxy-Auth)
+      no CORS), authenticates IIS to it with the proxy secret (X-Aegis-Proxy-Auth, from a file that only
+      administrators can read and change) and replaces a client's X-Forwarded-For with the address it connected from
 
     The site directory is readable only by SYSTEM, Administrators and the application pool identity; anonymous
     requests are served with the pool identity (no IUSR access needed). An existing site directory is taken over
@@ -39,14 +40,18 @@
     for a control-plane on this host (Install-AegisControlPlane.ps1 -ListenAddress 127.0.0.1:8081 -TrustedProxies
     127.0.0.1/32). The rule goes into the deployed web.config together with the proxy secret, which only SYSTEM,
     Administrators and the application pool can read; ARR is enabled server-wide (response buffering off for the
-    live-traffic stream, no port in X-Forwarded-For). Pass it on every run: a run without it deploys web.config
-    without the rule. Excludes -ApiBaseUrl.
+    live-traffic stream, no port in X-Forwarded-For). The rule replaces an X-Forwarded-For header sent by the client
+    with the address the client connected from (IIS is the edge). Pass it on every run: a run without it deploys
+    web.config without the rule. Excludes -ApiBaseUrl.
 
 .PARAMETER ProxySecretFile
     The control-plane's AEGIS_TRUSTED_PROXY_SECRET_FILE, sent in X-Aegis-Proxy-Auth with -ApiProxyTarget: the
     control-plane trusts the X-Forwarded-For of a loopback peer only with it (every local account can connect from
     loopback). Default: %ProgramData%\AegisProxy\secrets\trusted-proxy-secret, which Install-AegisControlPlane.ps1
-    creates on this host. For a control-plane on another host copy that file over a protected channel.
+    creates on this host. For a control-plane on another host copy that file over a protected channel into a folder
+    that only administrators can read and change. The script stops if a non-administrator owns the file, may read or
+    change it, or may rename a directory above it, or if a junction or symbolic link is on the way (no override):
+    on a host without a control-plane every user may create the default path and so learn or choose the secret.
 
 .PARAMETER CertificateThumbprint
     Thumbprint of the TLS server certificate in Cert:\LocalMachine\My (private key required).
@@ -180,7 +185,10 @@ function Get-WritableSource {
     # -Location takes directories that the installers take over themselves (program, data and site directories) or
     # check otherwise (the Python directory): only the directories above them count, like those above a source.
     # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
-    param([string[]]$Path = @(), [string[]]$Location = @())
+    # -Secret takes files whose content is secret (keys, the proxy secret, the CA private key): checked like a source,
+    # and reading them (ReadData) counts as well - except for services (NT SERVICE\..., S-1-5-80-...: only an
+    # administrator can install one; the control-plane service reads its secrets), which may read but not change them.
+    param([string[]]$Path = @(), [string[]]$Location = @(), [string[]]$Secret = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
@@ -188,11 +196,14 @@ function Get-WritableSource {
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
     $starts = New-Object System.Collections.Generic.List[object]
     foreach ($p in @($Path | Where-Object { $_ })) {
-        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $false }) }
+    }
+    foreach ($p in @($Secret | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $true }) }
     }
     foreach ($p in @($Location | Where-Object { $_ })) {
         $full = [System.IO.Path]::GetFullPath($p)
-        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true; Secret = $false }) }
     }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
@@ -200,11 +211,13 @@ function Get-WritableSource {
         $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
         $above = $start.Above
-        while ($current -and -not $seen.ContainsKey("$above|$current")) {
-            $seen["$above|$current"] = $true
-            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
+        $isSecret = $start.Secret
+        while ($current -and -not $seen.ContainsKey("$above|$isSecret|$current")) {
+            $seen["$above|$isSecret|$current"] = $true
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above; Secret = $isSecret }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
+            $isSecret = $false
         }
     }
     $found = [ordered]@{}
@@ -229,8 +242,10 @@ function Get-WritableSource {
                         $sid = "$($rule.IdentityReference.Value)"
                         if ("$($rule.AccessControlType)" -ne 'Allow' -or $trusted -contains $sid -or $ownerOnly -contains $sid) { continue }
                         if ($check.Above -and "$($rule.PropagationFlags)" -match 'InheritOnly') { continue }
-                        if (-not ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band $mask)) { continue }
-                        $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid })
+                        $rights = ConvertTo-FileRight ([int]$rule.FileSystemRights)
+                        $name = if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid }
+                        if ($rights -band $mask) { $who += $name }
+                        elseif ($check.Secret -and ($rights -band 1) -and $sid -notlike 'S-1-5-80-*') { $who += "${name}: read" }
                     }
                 }
                 if (-not $check.Above -and $item.PSIsContainer) {
@@ -282,6 +297,26 @@ function Assert-TrustedLocation {
         ($list -join "`n"), $folder[0]
     if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
     Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Assert-ProtectedSecret {
+    # Stops before a secret file is read when Get-WritableSource -Secret reports it or a directory above it: whoever
+    # can read it knows the secret, whoever can replace it chooses the secret. There is no override.
+    param([string[]]$Path = @())
+    $exposed = @(Get-WritableSource -Secret $Path | Sort-Object -Property Path)
+    if (-not $exposed.Count) { return }
+    $list = @($exposed | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($exposed.Count -gt 15) { $list += "  ... and $($exposed.Count - 15) more" }
+    $folder = Join-Path $env:SystemDrive 'AegisSecrets'
+    throw (("Non-administrators can read or replace secret files that this script reads, or rename a directory above them:`n{0}`n" +
+        'Whoever can read a secret knows it, whoever can replace it chooses it. Copy the secret over a protected channel ' +
+        "into a folder that only administrators can read and change, and pass that copy:`n" +
+        "  New-Item -ItemType Directory -Force `"{1}`"`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`"`n" +
+        "  (copy the secret into it)`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /T /L /C /Q`n" +
+        'If others could read it, treat the secret as known and replace it (docs/deployment/windows.md, troubleshooting).') -f
+        ($list -join "`n"), $folder)
 }
 
 function Get-NewParent([string[]]$Path) {
@@ -430,7 +465,11 @@ if ($ApiProxyTarget) {
         throw ("Proxy secret {0} not found. Install-AegisControlPlane.ps1 creates it (-TrustedProxies 127.0.0.1/32 or -ProxySecret); " +
             'for a control-plane on another host copy its secrets\trusted-proxy-secret over a protected channel and pass -ProxySecretFile.') -f $ProxySecretFile
     }
-    $proxySecret = ([System.IO.File]::ReadAllText($ProxySecretFile)).Trim([char[]]@([char]0xFEFF, ' ', "`t", "`r", "`n"))
+    # On a host without a control-plane every user may create %ProgramData%\AegisProxy\secrets\trusted-proxy-secret
+    # (and learn or choose the secret IIS sends): only administrators may read and change it (the control-plane
+    # service may read it), up to the volume root.
+    Assert-ProtectedSecret -Path @($ProxySecretFile)
+    $proxySecret =([System.IO.File]::ReadAllText($ProxySecretFile)).Trim([char[]]@([char]0xFEFF, ' ', "`t", "`r", "`n"))
     if ($proxySecret.Length -lt 32 -or $proxySecret -cnotmatch '^[A-Za-z0-9._~+/=-]+$') {
         throw "$ProxySecretFile is not a valid proxy secret (at least 32 characters of letters, digits and -._~+/=)."
     }
@@ -528,12 +567,16 @@ if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Take ownership, restrict ACL and dep
     }
     if ($ApiProxyTarget) {
         # /api through ARR. HTTP_X_AEGIS_PROXY_AUTH replaces an X-Aegis-Proxy-Auth header sent by the client; the
-        # https redirect rule runs first, so the proxied request always came in over https.
+        # https redirect rule runs first, so the proxied request always came in over https. IIS is the edge: an
+        # X-Forwarded-For sent by the client is replaced by the address it connected from (REMOTE_ADDR), otherwise a
+        # local user connecting through IIS on loopback would choose the client address the control-plane sees (ARR
+        # appends REMOTE_ADDR once more: "a, a").
         $nl = if ($webConfig.Contains("`r`n")) { "`r`n" } else { "`n" }
         $rule = @(
             '<rule name="AegisApiReverseProxy" stopProcessing="true">',
             '          <match url="^api/(.*)" />',
             '          <serverVariables>',
+            '            <set name="HTTP_X_FORWARDED_FOR" value="{REMOTE_ADDR}" />',
             '            <set name="HTTP_X_FORWARDED_PROTO" value="https" />',
             ('            <set name="HTTP_X_AEGIS_PROXY_AUTH" value="{0}" />' -f $proxySecret),
             '          </serverVariables>',
@@ -602,7 +645,7 @@ if ($ApiProxyTarget -and $PSCmdlet.ShouldProcess('IIS (applicationHost.config)',
     }
     $allowedFilter = 'system.webServer/rewrite/allowedServerVariables'
     $allowed = @(Get-WebConfigurationProperty -PSPath $apphost -Location $SiteName -Filter $allowedFilter -Name 'Collection' | ForEach-Object { "$($_.name)" })
-    foreach ($var in @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')) {
+    foreach ($var in @('HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')) {
         if ($allowed -notcontains $var) { Add-WebConfigurationProperty -PSPath $apphost -Location $SiteName -Filter $allowedFilter -Name '.' -Value @{ name = $var } }
     }
     Write-Ok "ARR: /api proxied to $ApiProxyTarget with X-Aegis-Proxy-Auth from $ProxySecretFile (proxy enabled server-wide, no response buffering)."

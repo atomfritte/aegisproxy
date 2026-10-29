@@ -151,16 +151,33 @@ icacls C:\Install /setowner *S-1-5-32-544 /T /L /C /Q
 
 Protect the folder directly below the drive root (`C:\Install`), not only `C:\Install\AegisProxy`: whoever may rename
 a folder above the package can put another package in its place. Before they run or copy anything, the installers
-check the script itself and every source they use - `-BinaryPath`, `-UiDir`, `-TlsCertFile`/`-TlsKeyFile`,
+check the script itself and every source they use - `-BinaryPath`, `-UiDir`, `-TlsCertFile`,
 `-ImportSecretsDir`/`-CaSourceDir` (control-plane); the WinSW template, `-WinSWExe`, `-SourceDir`, `-RequirementsFile`,
-`-CaFile`, `-ControlPlaneCaFile` (data-plane); `-DistDir`, `-WebConfigTemplate` (IIS) - with everything below them,
+`-ControlPlaneCaFile` (data-plane); `-DistDir`, `-WebConfigTemplate` (IIS) - with everything below them,
 and every folder above them up to the volume root. Only SYSTEM, Administrators and TrustedInstaller may own them or
 hold an allow ACE that lets them write, create files or folders, delete, rename, change the permissions or take
 ownership (for the folders above the sources: rename, delete entries, change the permissions, take ownership - the
 volume root's "create folders" for users is fine, the *Modify* it passes on to a folder created below it is not).
 Junctions and symbolic links on the way are refused, their targets are not checked. `-AllowWritableSource`
-overrides the check (not recommended). Keep secrets and certificates that you pass to the installers (`-TlsKeyFile`,
-`-CaFile`, ...) in the same protected folder or another one that only administrators control.
+overrides the check (not recommended).
+
+**Secret files** that you pass to the installers - `-TlsKeyFile` and the `jwt.key`, `dataplane.key`,
+`encryption.key`, `trusted-proxy-secret` and `mitmproxy-ca.pem` that `-ImportSecretsDir`/`-CaSourceDir` copy
+(control-plane), `-DataPlaneKeyFile` and `-CaFile` (data-plane), `-ProxySecretFile` (IIS) - are checked the same way
+before they are read, and in addition nobody else may *read* them: whoever can read a secret knows it, whoever can
+replace it chooses it. Services (`NT SERVICE\...`) may read them - the control-plane service reads its own secrets -
+but not change them. There is no override. The package folder above grants users nothing, so secrets copied into it
+pass; for secrets you keep apart from the release use a folder like it:
+
+```powershell
+New-Item -ItemType Directory -Force C:\AegisSecrets
+icacls C:\AegisSecrets /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+# copy the secrets into it over a protected channel, then:
+icacls C:\AegisSecrets /setowner *S-1-5-32-544 /T /L /C /Q
+```
+
+The files a control-plane installer created on the same host (`C:\ProgramData\AegisProxy\secrets\*`,
+`certs\mitmproxy-ca.pem`) pass as they are. A profile, download or shared folder does not.
 
 If the scripts were downloaded, unblock them first: `Get-ChildItem C:\Install\AegisProxy -Recurse | Unblock-File`.
 Run them with `powershell.exe -ExecutionPolicy RemoteSigned -File ...` or sign them with your code-signing
@@ -364,7 +381,11 @@ cd C:\Install\AegisProxy\deploy\windows
 
 On a separate host, copy `dataplane.key` and `mitmproxy-ca.pem` from the control-plane over an
 administrative channel (SMB with encryption - `New-SmbMapping -RemotePath '\\cp1\c$' -RequirePrivacy $true` - or
-your secret store), run the script, then delete the copies - the script stages its own copies with tight ACLs.
+your secret store) into a folder that only administrators can read and change (`C:\AegisSecrets` as in section 2),
+run the script, then delete the copies - the script stages its own copies with tight ACLs. Before it reads them, the
+script refuses a key or CA that a non-administrator owns, may read or change, or that sits below a directory others
+may rename or behind a junction (section 2, *Secret files*; no override). Passing the files on the encrypted share
+itself works as well: the control-plane's ACLs (administrators, its service may read) pass the check.
 When `-DataPlaneKeyFile` / `-CaFile` point to an SMB path, the script checks `Get-SmbConnection` and refuses an
 unencrypted connection unless `-AllowUnencryptedImport` is given. Every spelling of a network path counts:
 `\\server\share`, `//server/share` and mixed separators, `\\?\UNC\...`, `\\.\UNC\...`, `\??\UNC\...`,
@@ -453,6 +474,16 @@ installation fail, but no longer choose the code: a wheel whose hash is not in t
 offline installation pass `-PipArgs '--no-index','--find-links','\\fs\aegis\wheels'` with a wheel share that holds
 the locked versions.
 
+**No pip configuration.** pip reads its configuration files - the machine-wide `C:\ProgramData\pip\pip.ini`, which
+every local user may create, the administrator's own `pip.ini` and the venv's - and `PIP_*` environment variables
+even with Python's `-I` and pip's `--isolated`. A `requirement = <file>` there adds a requirements file of its own
+(with hashes, so `--require-hashes` is satisfied), `find-links`/`index-url` add package sources, `log` makes the
+administrator's pip write to a file of the user's choice. The script therefore runs every pip command with
+`PIP_CONFIG_FILE=nul` (`os.devnull`: pip then reads no configuration file at all) and removes the session's other
+`PIP_*` variables for that command (ensurepip, which creates the venv's pip, does the same). An internal index,
+proxy or CA bundle goes into `-PipArgs`, e.g.
+`-PipArgs '--index-url','https://nexus.corp.example/repository/pypi/simple','--proxy','http://proxy.corp.example:3128','--cert','C:\Install\pki\corp-root.pem'`.
+
 `-RequirementsFile` replaces the shipped lock with your own complete lock file with hashes for every package,
 including `yara-x` and the security baseline (checked the same way, installed with `--require-hashes --no-deps`;
 `-NoYara` does not edit it). Generate it on a build host with uv, whose `--override` raises Brotli above
@@ -511,24 +542,34 @@ then install the control-plane behind IIS and the console with `-ApiProxyTarget`
 ```
 
 IIS connects to the control-plane from `127.0.0.1` - like every other local account. The control-plane therefore
-accepts the `X-Forwarded-For` that ARR appends only from a request that also carries `X-Aegis-Proxy-Auth` with the
+accepts the `X-Forwarded-For` of a loopback peer only from a request that also carries `X-Aegis-Proxy-Auth` with the
 proxy secret (`AEGIS_TRUSTED_PROXY_SECRET_FILE`); without it a local user could send requests with any client
 address and so use a stolen CIDR-bound API key, escape the per-source sign-in lockout or lock out somebody else.
-With `-ApiProxyTarget` the IIS script:
+The secret authenticates IIS, not the client: a local user can also connect to the IIS site itself on
+`127.0.0.1:443`. IIS is the edge, so the rule replaces any `X-Forwarded-For` the client sent with the address the
+client connected from. With `-ApiProxyTarget` the IIS script:
 
 - reads the secret from `-ProxySecretFile` (default `C:\ProgramData\AegisProxy\secrets\trusted-proxy-secret`,
   created by the control-plane installer; for a control-plane on another host copy the file over a protected
-  channel - and use an `https://` target there; without `-AllowHttpApi` plain `http://` is accepted only for a
-  loopback target),
+  channel into a folder that only administrators can read and change, e.g. `C:\AegisSecrets` of section 2 - and use
+  an `https://` target there; without `-AllowHttpApi` plain `http://` is accepted only for a loopback target). On a
+  console host without a control-plane every user may create the default path and so choose or learn the secret
+  IIS sends: the script stops before any change if a non-administrator owns the file, may read or change it, may
+  rename a directory above it, or if a junction is on the way (section 2, *Secret files*; no override),
 - inserts the rule `AegisApiReverseProxy` into the deployed `web.config` after the HTTPS redirect: `/api/*` is
-  rewritten to the target, `X-Forwarded-Proto: https` and `X-Aegis-Proxy-Auth: <secret>` are set (replacing headers
-  of these names sent by the client), and compression is turned off for the live-traffic stream
-  `/api/flows/stream`. The secret thus lives in `web.config`, which - like the whole site directory - only SYSTEM,
-  Administrators and the application pool identity can read (verified before the site starts),
+  rewritten to the target, `X-Forwarded-For: {REMOTE_ADDR}` (the address the client connected from),
+  `X-Forwarded-Proto: https` and `X-Aegis-Proxy-Auth: <secret>` are set (replacing headers of these names sent by the
+  client), and compression is turned off for the live-traffic stream `/api/flows/stream`. ARR then appends the
+  client address once more (`X-Forwarded-For: 10.20.30.7, 10.20.30.7`), which leads to the same client address. The
+  secret thus lives in `web.config`, which - like the whole site directory - only SYSTEM, Administrators and the
+  application pool identity can read (verified before the site starts),
 - enables the ARR proxy server-wide in `applicationHost.config` (`preserveHostHeader`, `responseBufferLimit=0`
   for the Server-Sent Events stream, `includePortInXForwardedFor=false` so that the control-plane sees plain
   addresses, `reverseRewriteHostInResponseHeaders=false`) and allows the server variables
-  `HTTP_X_FORWARDED_PROTO` and `HTTP_X_AEGIS_PROXY_AUTH` for this site only.
+  `HTTP_X_FORWARDED_FOR`, `HTTP_X_FORWARDED_PROTO` and `HTTP_X_AEGIS_PROXY_AUTH` for this site only.
+
+A load balancer or another proxy in front of IIS is not supported with this rule: the control-plane would see the
+load balancer's address as the client of every request.
 
 Pass `-ApiProxyTarget` on every run: a run without it deploys `web.config` without the rule (the server-wide ARR
 settings stay). Use `127.0.0.1` rather than `localhost` (IIS may connect via `::1`, which `127.0.0.1/32` does not
@@ -710,6 +751,9 @@ systemd drop-ins). Details: [`linux.md`](linux.md#10-rolling-out-the-ca-and-prox
 | Cluster | One node at a time; wait for `/readyz` on the upgraded node before the next one. Upgrade the control-plane before the workers |
 | Packages in folders that others can change (new in 2.1) | The installers now refuse a package - or a `-TlsKeyFile`, `-CaFile`, `-RequirementsFile`, ... - that non-administrators can change, e.g. below a `C:\Install` created without its own ACL, in a download folder or on a file share. Create the package folder as in section 2 and copy the new release into it before the upgrade; `-AllowWritableSource` skips the check (not recommended) |
 | Installation directories below folders that others can rename (new in 2.1) | The installers now check every directory above `-InstallDir`, `-DataRoot`, the IIS `-PhysicalPath` and the Python directory up to the volume root, and count *Delete* (rename) as well: before, only the directory directly above Python and above a custom `-DataRoot` was checked, without *Delete*. An installation in the default directories on Windows Server is not affected. A re-run stops for a custom path below a folder created in the volume root of a client edition (`C:\Tools`: *Modify* for authenticated users), below a folder a single account owns (on a client edition possibly the administrator account that created it, also `C:\Program Files\AegisProxy`), or behind a junction. Fix the listed directory (section 14) or move the installation; `-AllowWritableParent` / `-AllowWritablePython` skip the check (not recommended). Missing directories above are now created with an ACL of their own |
+| Secret files that others can read (new in 2.1) | `-TlsKeyFile`, the secrets and CA key that `-ImportSecretsDir`/`-CaSourceDir` copy, `-DataPlaneKeyFile`, `-CaFile` and the IIS `-ProxySecretFile` are now refused before they are read if a non-administrator owns them, may read or change them, may rename a directory above them, or if a junction is on the way (section 2, *Secret files*). There is no override, and `-AllowWritableSource` no longer covers `-TlsKeyFile` and `-CaFile`. The files of a control-plane on the same host and on its encrypted admin share pass; a key in `C:\pki` created in the volume root (users may read below it), copies in a profile or download folder, or a copy owned by the administrator account on a client edition do not. Copy them into `C:\AegisSecrets` (section 2) and pass those copies; replace a secret that others could read (section 14) |
+| pip configuration (new in 2.1) | The data-plane installer runs pip with `PIP_CONFIG_FILE=nul` and without the session's `PIP_*` variables (any local user may create `C:\ProgramData\pip\pip.ini`). A site that pointed pip at an internal index, proxy or CA bundle through a machine-wide `pip.ini` or `PIP_INDEX_URL`/`PIP_PROXY`/`PIP_CERT` now passes them with `-PipArgs` (section 6, *No pip configuration*); otherwise pip goes to pypi.org |
+| IIS/ARR `X-Forwarded-For` (new in 2.1) | The `/api` rule now replaces a client's `X-Forwarded-For` with the address it connected from (before, ARR appended to the header the client sent, so a local user going through IIS on loopback chose the client address the control-plane saw). Re-run `Install-AegisConsole-IIS.ps1 ... -ApiProxyTarget <same>` after the upgrade: it rewrites `web.config` and allows `HTTP_X_FORWARDED_FOR` for the site. A load balancer in front of IIS then shows up as the client of every request |
 
 Check `aegis-control-plane.exe version`, `GET /api/public/meta` (field `version`) and `aegis_build_info` on `/metrics`.
 Back up before every upgrade (section 12).
@@ -796,13 +840,15 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | Console blank / CSP or CORS errors in the browser console | `config.js` points to another origin without matching CSP/CORS | Re-run the IIS script with `-ApiBaseUrl`; set `-CorsOrigins` on the control-plane |
 | IIS returns 500.19 | URL Rewrite (or ARR for the `/api` rule) missing | Install the module(s) |
 | Every sign-in and audit entry shows `127.0.0.1`; control-plane log: `forwarding headers from a trusted proxy address without the proxy secret are ignored` | the proxy secret exists (loopback trusted) but IIS does not send it: `web.config` deployed without `-ApiProxyTarget`, or the secret was replaced afterwards | Re-run `Install-AegisConsole-IIS.ps1 ... -ApiProxyTarget http://127.0.0.1:8081` |
-| IIS script: `Proxy secret ... not found` / `is not a valid proxy secret` | the control-plane installer has not created `secrets\trusted-proxy-secret` (no loopback in `-TrustedProxies`), or `-ProxySecretFile` points to the wrong file | Re-run `Install-AegisControlPlane.ps1 -TrustedProxies 127.0.0.1/32` (or `-ProxySecret`), or copy the control-plane's file and pass `-ProxySecretFile` |
+| IIS script: `Proxy secret ... not found` / `is not a valid proxy secret` | the control-plane installer has not created `secrets\trusted-proxy-secret` (no loopback in `-TrustedProxies`), or `-ProxySecretFile` points to the wrong file | Re-run `Install-AegisControlPlane.ps1 -TrustedProxies 127.0.0.1/32` (or `-ProxySecret`), or copy the control-plane's file into a folder that only administrators can read and change (section 2, `C:\AegisSecrets`) and pass `-ProxySecretFile` |
 | IIS script: `-ApiProxyTarget needs Application Request Routing 3.0` | ARR not installed | Install `requestRouter_amd64.msi` (<https://www.iis.net/downloads/microsoft/application-request-routing>), re-run |
 | A new CA appeared after a restore | `certs\mitmproxy-ca-cert.pem` was missing, the control-plane generated a new CA | Restore the original `certs\` and restart; re-stage the CA on the workers |
 | Installer: `Refusing to adopt N file(s) that existed before this installation` | first installation (no service) or directories with an unexpected owner/ACL contain files | Check the listed files. Delete them if you do not know where they come from; re-run with `-AdoptExistingSecrets` for a restore, a reinstallation after `-Uninstall` or an interrupted first run |
 | Installer: `ACL verification failed` | an ACE or owner could not be changed (e.g. an inheritance-blocking policy, a tool that re-adds ACEs) | Fix the listed paths (`icacls <path>`), re-run; the service is not started until the check passes |
 | Installer: `Python at ... can be modified by non-administrators` | interpreter outside `Program Files` (e.g. `C:\Python312`), or an account other than SYSTEM/Administrators/TrustedInstaller/the service owns or may write to one of the listed paths; a directory above the Python directory (up to the volume root) that others own or may rename, delete entries in, re-ACL or take over (e.g. `C:\Tools` created in the volume root of a client edition); or a junction/symbolic link on the way | Reinstall python.org Python for all users into `C:\Program Files\Python312`, or remove the listed ACEs (`icacls <path> /remove <account>`). A listed directory above Python that inherits the access: `icacls <directory> /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"` (this also changes what everything below it inherits). An `owner <SID>` entry on a Windows client edition is usually the administrator account that created the files: after checking it, `icacls <path> /setowner *S-1-5-32-544 /T /L` |
 | Installer: `Non-administrators can change installation sources that this script runs or copies with administrator rights` | the package (or a file passed by parameter) is in a folder that other accounts may change: below a folder created in the volume root without its own ACL (client editions: *Modify* for authenticated users; Windows Server: users may add files), in a user profile or on a file share; an individual account owns a listed file (on client editions usually the administrator account that copied it); or a junction is on the way | Create a folder as in section 2 (`icacls <folder> /inheritance:r /grant:r ...`), copy the release into it, `icacls <folder> /setowner *S-1-5-32-544 /T /L /C /Q`, and run the scripts from there. Copy it again rather than fixing the ACLs in place: files that others could change may have been altered. `-AllowWritableSource` skips the check (not recommended) |
+| Installer: `Non-administrators can read or replace secret files that this script reads` | a key, the CA private key or the proxy secret (`-TlsKeyFile`, `-ImportSecretsDir`/`-CaSourceDir` files, `-DataPlaneKeyFile`, `-CaFile`, `-ProxySecretFile`) is readable for users (`Users: read`: e.g. below a folder created in the volume root of Windows Server, or copied next to a release folder that grants users read access), changeable by another account, owned by one (`owner <SID>`: a local user created it, or on a client edition the administrator account that copied it), below a directory others may rename, or behind a junction. On a console host without a control-plane: a user created `C:\ProgramData\AegisProxy\secrets\trusted-proxy-secret` before you copied the real one | Copy the secret over a protected channel into a folder that only administrators can read and change (section 2: `C:\AegisSecrets` with `icacls ... /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"`, then `/setowner *S-1-5-32-544 /T /L /C /Q`) and pass that copy; delete a planted `C:\ProgramData\AegisProxy` on a console host. A secret that others could read may be known to them: replace it - `dataplane.key`/`jwt.key` on the control-plane (then every node and worker), the proxy secret (delete `secrets\trusted-proxy-secret`, re-run the control-plane installer, then the IIS script), the TLS key (new certificate), the CA (new CA, roll it out again, section 10). There is no override |
+| pip goes to pypi.org instead of the internal index, or fails behind the proxy, after the upgrade to 2.1 | the index, proxy or CA bundle came from a machine-wide `pip.ini` or `PIP_*` variables, which the data-plane installer now ignores | Pass them with `-PipArgs '--index-url','https://...','--proxy','http://...','--cert','C:\...\corp-root.pem'` |
 | Installer: `... over an SMB connection that is not encrypted` | `-ImportSecretsDir`/`-CaSourceDir`/`-DataPlaneKeyFile`/`-CaFile` on a plain SMB share (any spelling: `//host/share`, `\\?\UNC\...`, mapped drive) | `New-SmbMapping -RemotePath \\host\share -RequirePrivacy $true`, or copy the files over a protected channel |
 | Installer: `... is a device path` | a source path like `\\?\GLOBALROOT\...` or `\\?\Volume{...}\...` | Pass a drive-letter or UNC path |
 | Installer: `Junctions/symbolic links and hard-linked files are not allowed`, `Junction/symbolic link in the installation directories`, `... has further hard links` | a link or a hard-linked file in a directory that existed before (ACL changes and deletions would reach the file elsewhere) | Remove the listed entries (`Remove-Item` on the link itself; `fsutil hardlink list <file>` shows the other names of a hard-linked file) and re-run |
@@ -834,7 +880,12 @@ Remove-Item Env:AEGIS_LOG_FILE
       `-AllowWritablePython`); release copied into a folder that only administrators control (section 2, no
       `-AllowWritableSource`); custom `-InstallDir`, `-DataRoot` and `-PhysicalPath` only below directories that
       administrators control (no `-AllowWritableParent`); secrets copied between hosts only over encrypted SMB or
-      another protected channel.
+      another protected channel, into a folder that only administrators can read (section 2, `C:\AegisSecrets`),
+      and deleted after the installation where the script stages its own copy.
+- [ ] Data-plane package sources only through `-PipArgs` (pip configuration files and `PIP_*` variables are
+      ignored); no `C:\ProgramData\pip` of unknown origin left on the worker.
+- [ ] IIS/ARR deployed with this release's `Install-AegisConsole-IIS.ps1 -ApiProxyTarget` (the `/api` rule sets
+      `X-Forwarded-For` to the connecting address; no load balancer in front of IIS).
 - [ ] No secret values in the registry environment (only `*_FILE` paths).
 - [ ] Services run as virtual accounts (`NT SERVICE\AegisControlPlane`, `NT SERVICE\AegisDataPlane`), never as
       LocalSystem.
@@ -858,7 +909,7 @@ Remove-Item Env:AEGIS_LOG_FILE
 
 The CI job `windows` (`.github/workflows/ci.yml`) runs on every push on Windows Server 2022 and 2025:
 
-1. the installer unit tests (Pester, 405 tests against an in-memory Windows model with owners, ACL
+1. the installer unit tests (Pester, 436 tests against an in-memory Windows model with owners, ACL
    inheritance, links, hard links, SMB connections and a local user racing the installer; nothing on the runner
    changes);
 2. the control-plane Go test suite and the data-plane unit tests on Windows CPython 3.12;

@@ -79,9 +79,9 @@ function Initialize-FakeWindows {
     $global:FakeWin.Acl[(Get-FakeFullPath $drive)] = @{ Protected = $true; Grants = [ordered]@{
             $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX'
             $script:SidAuthenticatedUsers = '(OI)(CI)(IO)M'; 'NT AUTHORITY\Authenticated Users' = '(AD)' } }
-    # Everything else below the root (test sources, link targets) only administrators can change.
-    $global:FakeWin.Acl[$Root] = @{ Protected = $true; Grants = [ordered]@{
-            $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F'; $script:SidUsers = '(OI)(CI)RX' } }
+    # Everything else below the root (test sources, copied secrets, link targets) is a package folder as in the Windows
+    # guide, section 2: only administrators can read and change it.
+    $global:FakeWin.Acl[$Root] = @{ Protected = $true; Grants = [ordered]@{ $script:SidSystem = '(OI)(CI)F'; $script:SidAdmins = '(OI)(CI)F' } }
 
     function global:Get-Service {
         [CmdletBinding()]
@@ -409,12 +409,15 @@ function Initialize-FakeWindows {
 
     function global:FakePython {
         # python.exe double: version probe, venv creation, pip, compileall and the import checks. Leading interpreter
-        # options (-I, -S, -E, ...) are recorded as Options; Args holds the rest of the command line.
+        # options (-I, -S, -E, ...) are recorded as Options; Args holds the rest of the command line, PipEnv the PIP_*
+        # variables the process got.
         $a = @($args)
         $options = @()
         while ($a.Count -and $a[0] -cmatch '^-[BEIOPSsuv]$') { $options += $a[0]; $a = @($a | Select-Object -Skip 1) }
         $self = $global:FakeWin.InvokedExe
-        $global:FakeWin.Calls.Add([pscustomobject]@{ Command = 'python'; Exe = $self; Options = $options; Args = $a })
+        $pipEnv = [ordered]@{}
+        foreach ($item in @(Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'PIP_*' } | Sort-Object -Property Name)) { $pipEnv[$item.Name] = $item.Value }
+        $global:FakeWin.Calls.Add([pscustomobject]@{ Command = 'python'; Exe = $self; Options = $options; Args = $a; PipEnv = $pipEnv })
         $py = $global:FakeWin.Python
         $global:LASTEXITCODE = 0
         if ($a[0] -eq '-m' -and $a[1] -eq 'venv') {
@@ -431,6 +434,18 @@ function Initialize-FakeWindows {
         }
         if ($a[0] -eq '-m' -and $a[1] -eq 'pip') {
             $scripts = Split-Path -Parent $self
+            # Like pip (pip/_internal/configuration.py), independent of -I and --isolated: the configuration files -
+            # the global %ProgramData%\pip\pip.ini and PIP_CONFIG_FILE - count unless PIP_CONFIG_FILE is os.devnull
+            # ('nul'), then the PIP_* variables. Modelled: "requirement = <file>" and PIP_REQUIREMENT add a -r file.
+            $extra = @()
+            if ($env:PIP_CONFIG_FILE -cne 'nul') {
+                foreach ($ini in @((Join-Path $env:ProgramData 'pip\pip.ini'), $env:PIP_CONFIG_FILE)) {
+                    if (-not $ini -or -not [System.IO.File]::Exists($ini)) { continue }
+                    foreach ($line in [System.IO.File]::ReadAllLines($ini)) { if ($line -match '^\s*requirement\s*=\s*(?<f>\S.*?)\s*$') { $extra += @('-r', $Matches['f']) } }
+                }
+            }
+            if ($env:PIP_REQUIREMENT) { $extra += @('-r', $env:PIP_REQUIREMENT) }
+            $a = @($a) + $extra
             for ($i = 2; $i -lt $a.Count; $i++) {
                 if ($a[$i] -eq '-r') {
                     # Kept for the tests: the installer may delete a requirements file it generated.

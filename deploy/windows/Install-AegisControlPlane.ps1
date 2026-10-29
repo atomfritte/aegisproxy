@@ -13,6 +13,8 @@
     What the script does (idempotent - a re-run upgrades the binary and keeps all secrets/state):
       * refuses installation sources that non-administrators can change (this script, the binary, the console, TLS
         and cluster imports, and every folder above them), before it runs or copies any of them
+      * refuses secrets it copies (-TlsKeyFile, the secrets and CA key of -ImportSecretsDir / -CaSourceDir) that
+        non-administrators can read or change, or that sit below a directory they may rename (no override)
       * refuses -InstallDir / -DataRoot below a directory that non-administrators may rename or replace (every
         directory up to the volume root); directories it creates above them get an ACL of their own
       * copies the binary (and optionally the built web console) to -InstallDir
@@ -72,7 +74,8 @@
     PEM certificate (chain) for native HTTPS. Copied to <DataRoot>\secrets\tls-cert.pem.
 
 .PARAMETER TlsKeyFile
-    Unencrypted PEM private key (PKCS#1/PKCS#8/EC). Copied to <DataRoot>\secrets\tls-key.pem.
+    Unencrypted PEM private key (PKCS#1/PKCS#8/EC). Copied to <DataRoot>\secrets\tls-key.pem. Only administrators
+    may read and change it and rename the directories above it (docs/deployment/windows.md, section 2).
 
 .PARAMETER BootstrapAdminPassword
     Optional password for the bootstrap super admin "admin" (min. 12 characters). Without it the
@@ -112,12 +115,15 @@
 
 .PARAMETER AllowWritableSource
     Accept installation sources that non-administrators can change: this script, -BinaryPath, -UiDir, -TlsCertFile,
-    -TlsKeyFile, -ImportSecretsDir, -CaSourceDir (everything below them) and every folder above them up to the volume
-    root. Allowed are only SYSTEM, Administrators and TrustedInstaller as owners and as principals that may write,
+    -ImportSecretsDir, -CaSourceDir (everything below them) and every folder above them up to the volume root.
+    Allowed are only SYSTEM, Administrators and TrustedInstaller as owners and as principals that may write,
     create, delete, rename, change the permissions or take ownership (above the sources: rename, delete entries,
     change the permissions, take ownership). The script runs and copies these files with administrator rights, so
     whoever can change them gets those rights. Not recommended: keep the release in a folder that only
-    administrators control (docs/deployment/windows.md, section 2).
+    administrators control (docs/deployment/windows.md, section 2). The secrets it copies - -TlsKeyFile, jwt.key,
+    dataplane.key, encryption.key and trusted-proxy-secret in -ImportSecretsDir, mitmproxy-ca.pem in -CaSourceDir -
+    are checked the same way and must not be readable by non-administrators either (services may read them); for
+    them there is no override.
 
 .PARAMETER AllowWritableParent
     Accept -InstallDir or -DataRoot below a directory that non-administrators own or may rename, delete entries in,
@@ -473,7 +479,10 @@ function Get-WritableSource {
     # -Location takes directories that the installers take over themselves (program, data and site directories) or
     # check otherwise (the Python directory): only the directories above them count, like those above a source.
     # Directories that do not exist yet are skipped: the installers create them with an ACL of their own (Get-NewParent).
-    param([string[]]$Path = @(), [string[]]$Location = @())
+    # -Secret takes files whose content is secret (keys, the proxy secret, the CA private key): checked like a source,
+    # and reading them (ReadData) counts as well - except for services (NT SERVICE\..., S-1-5-80-...: only an
+    # administrator can install one; the control-plane service reads its secrets), which may read but not change them.
+    param([string[]]$Path = @(), [string[]]$Location = @(), [string[]]$Secret = @())
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $ownerOnly = @('S-1-3-0', 'S-1-3-1', 'S-1-3-4')
     $names = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-4' = 'INTERACTIVE'; 'S-1-5-7' = 'ANONYMOUS LOGON'; 'S-1-5-11' = 'Authenticated Users'
@@ -481,11 +490,14 @@ function Get-WritableSource {
         'S-1-5-19' = 'LOCAL SERVICE'; 'S-1-5-20' = 'NETWORK SERVICE' }
     $starts = New-Object System.Collections.Generic.List[object]
     foreach ($p in @($Path | Where-Object { $_ })) {
-        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false }) }
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $false }) }
+    }
+    foreach ($p in @($Secret | Where-Object { $_ })) {
+        if (Test-Path -LiteralPath $p) { $starts.Add(@{ Path = (Resolve-Path -LiteralPath $p).ProviderPath; Above = $false; Secret = $true }) }
     }
     foreach ($p in @($Location | Where-Object { $_ })) {
         $full = [System.IO.Path]::GetFullPath($p)
-        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true }) }
+        if ($full.Length -gt 3) { $starts.Add(@{ Path = [System.IO.Path]::GetDirectoryName($full.TrimEnd('\', '/')); Above = $true; Secret = $false }) }
     }
     $checks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
@@ -493,11 +505,13 @@ function Get-WritableSource {
         $current = $start.Path
         if ($current.Length -gt 3) { $current = $current.TrimEnd('\', '/') }
         $above = $start.Above
-        while ($current -and -not $seen.ContainsKey("$above|$current")) {
-            $seen["$above|$current"] = $true
-            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above }) }
+        $isSecret = $start.Secret
+        while ($current -and -not $seen.ContainsKey("$above|$isSecret|$current")) {
+            $seen["$above|$isSecret|$current"] = $true
+            if (Test-Path -LiteralPath $current) { $checks.Add(@{ Path = $current; Above = $above; Secret = $isSecret }) }
             $current = [System.IO.Path]::GetDirectoryName($current)
             $above = $true
+            $isSecret = $false
         }
     }
     $found = [ordered]@{}
@@ -522,8 +536,10 @@ function Get-WritableSource {
                         $sid = "$($rule.IdentityReference.Value)"
                         if ("$($rule.AccessControlType)" -ne 'Allow' -or $trusted -contains $sid -or $ownerOnly -contains $sid) { continue }
                         if ($check.Above -and "$($rule.PropagationFlags)" -match 'InheritOnly') { continue }
-                        if (-not ((ConvertTo-FileRight ([int]$rule.FileSystemRights)) -band $mask)) { continue }
-                        $who += $(if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid })
+                        $rights = ConvertTo-FileRight ([int]$rule.FileSystemRights)
+                        $name = if ($names.ContainsKey($sid)) { $names[$sid] } else { $sid }
+                        if ($rights -band $mask) { $who += $name }
+                        elseif ($check.Secret -and ($rights -band 1) -and $sid -notlike 'S-1-5-80-*') { $who += "${name}: read" }
                     }
                 }
                 if (-not $check.Above -and $item.PSIsContainer) {
@@ -575,6 +591,26 @@ function Assert-TrustedLocation {
         ($list -join "`n"), $folder[0]
     if (-not $Allow) { throw "$message. Or pass -AllowWritableParent to accept the risk." }
     Write-Note "$message. Continuing because of -AllowWritableParent."
+}
+
+function Assert-ProtectedSecret {
+    # Stops before a secret file is read when Get-WritableSource -Secret reports it or a directory above it: whoever
+    # can read it knows the secret, whoever can replace it chooses the secret. There is no override.
+    param([string[]]$Path = @())
+    $exposed = @(Get-WritableSource -Secret $Path | Sort-Object -Property Path)
+    if (-not $exposed.Count) { return }
+    $list = @($exposed | Select-Object -First 15 | ForEach-Object { '  {0} ({1})' -f $_.Path, $_.Who })
+    if ($exposed.Count -gt 15) { $list += "  ... and $($exposed.Count - 15) more" }
+    $folder = Join-Path $env:SystemDrive 'AegisSecrets'
+    throw (("Non-administrators can read or replace secret files that this script reads, or rename a directory above them:`n{0}`n" +
+        'Whoever can read a secret knows it, whoever can replace it chooses it. Copy the secret over a protected channel ' +
+        "into a folder that only administrators can read and change, and pass that copy:`n" +
+        "  New-Item -ItemType Directory -Force `"{1}`"`n" +
+        "  icacls `"{1}`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`"`n" +
+        "  (copy the secret into it)`n" +
+        "  icacls `"{1}`" /setowner *S-1-5-32-544 /T /L /C /Q`n" +
+        'If others could read it, treat the secret as known and replace it (docs/deployment/windows.md, troubleshooting).') -f
+        ($list -join "`n"), $folder)
 }
 
 function Get-NewParent([string[]]$Path) {
@@ -871,7 +907,14 @@ if ($loopbackTrusted -and $ExtraEnvironment -and $ExtraEnvironment.ContainsKey('
 
 # Everything this script runs or copies as Administrator - the binary runs right below ("version") and as the service -
 # must be out of reach of other accounts, including the folders above it (whoever may rename one can replace the files).
-Assert-TrustedSource -Path @($PSCommandPath, $BinaryPath, $UiDir, $TlsCertFile, $TlsKeyFile, $ImportSecretsDir, $CaSourceDir) -Allow:$AllowWritableSource
+Assert-TrustedSource -Path @($PSCommandPath, $BinaryPath, $UiDir, $TlsCertFile, $ImportSecretsDir, $CaSourceDir) -Allow:$AllowWritableSource
+# The secrets it copies (TLS key, the first node's secrets and CA key): whoever can read them knows them, whoever can
+# replace them chooses them. Only administrators may read and change them, up to the volume root (no override).
+$ImportedSecrets = @('jwt.key', 'dataplane.key', 'encryption.key', 'trusted-proxy-secret')
+$secretInputs = @($TlsKeyFile)
+if ($ImportSecretsDir) { $secretInputs += @($ImportedSecrets | ForEach-Object { Join-Path $ImportSecretsDir $_ }) }
+if ($CaSourceDir) { $secretInputs += Join-Path $CaSourceDir 'mitmproxy-ca.pem' }
+Assert-ProtectedSecret -Path $secretInputs
 
 # The program and data directories are taken over below; whoever may rename a directory above them could put other ones
 # in their place (a binary that runs as the service, its secrets, the CA). Directories that do not exist yet are listed
@@ -999,7 +1042,7 @@ $proxySecretNew  = $false
 if ($PSCmdlet.ShouldProcess($SecretsDir, 'Import/generate secrets')) {
     if ($ImportSecretsDir) {
         $imported = @()
-        foreach ($name in @('jwt.key', 'dataplane.key', 'encryption.key', 'trusted-proxy-secret')) {
+        foreach ($name in $ImportedSecrets) {
             $src = Join-Path $ImportSecretsDir $name
             $value = Read-SecretFile $src
             if ($name -eq 'trusted-proxy-secret') {

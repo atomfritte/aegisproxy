@@ -374,9 +374,14 @@ Describe 'Install-AegisConsole-IIS.ps1' {
 
     Context 'same-origin API through ARR (-ApiProxyTarget)' {
         BeforeEach {
-            # Written by Install-AegisControlPlane.ps1 for -TrustedProxies 127.0.0.1/32.
-            $script:SecretFile = Join-Path $env:ProgramData 'AegisProxy\secrets\trusted-proxy-secret'
+            # Written by Install-AegisControlPlane.ps1 for -TrustedProxies 127.0.0.1/32, with its ACLs: the data root
+            # for SYSTEM/Administrators, the secrets also readable by the control-plane service.
+            $script:AegisData = Join-Path $env:ProgramData 'AegisProxy'
+            $script:SecretFile = Join-Path $AegisData 'secrets\trusted-proxy-secret'
             New-Item -ItemType Directory -Path (Split-Path -Parent $SecretFile) -Force | Out-Null
+            $FakeWin.Acl[(Get-FakeFullPath $AegisData)] = @{ Protected = $true; Grants = [ordered]@{ '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F' } }
+            $FakeWin.Acl[(Get-FakeFullPath (Split-Path -Parent $SecretFile))] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; 'NT SERVICE\AegisControlPlane' = '(OI)(CI)R' } }
             $script:Secret = '0123456789abcdef' * 4
             [System.IO.File]::WriteAllText($SecretFile, "$Secret`n")
             $script:Proxied = Join-Parameters $Base @{ ApiProxyTarget = 'http://127.0.0.1:8081/'; AddHttpBinding = $true }
@@ -401,6 +406,7 @@ Describe 'Install-AegisConsole-IIS.ps1' {
             }
             $vars['HTTP_X_AEGIS_PROXY_AUTH'] | Should -Be $Secret
             $vars['HTTP_X_FORWARDED_PROTO'] | Should -Be 'https'
+            $vars['HTTP_X_FORWARDED_FOR'] | Should -BeExactly '{REMOTE_ADDR}' -Because 'IIS is the edge: a client, also one on loopback, must not choose its address'
             $stream = @($xml.configuration.location | Where-Object path -eq 'api/flows/stream')
             $stream.Count | Should -Be 1
             $stream[0].'system.webServer'.urlCompression.doDynamicCompression | Should -Be 'false'
@@ -417,7 +423,7 @@ Describe 'Install-AegisConsole-IIS.ps1' {
                 $FakeWin.Iis.Config["$AppHost||system.webServer/proxy|$name"] | Should -Be $expected[$name] -Because $name
             }
             $allowed = $FakeWin.Iis.Collections["$AppHost|AegisConsole|system.webServer/rewrite/allowedServerVariables"]
-            @($allowed | ForEach-Object { $_.name }) | Should -Be @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')
+            @($allowed | ForEach-Object { $_.name }) | Should -Be @('HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')
             @($FakeWin.Iis.Collections.Keys | Where-Object { $_ -like '*allowedServerVariables' }).Count | Should -Be 1 -Because 'only this site may set them'
         }
 
@@ -438,14 +444,62 @@ Describe 'Install-AegisConsole-IIS.ps1' {
             [System.IO.File]::ReadAllText((Join-Path $Site 'web.config')) | Should -Be ([System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\iis\web.config')))
         }
 
-        It 'proxies to a control-plane on another host with a copied secret (-ProxySecretFile)' {
-            $copied = Join-Path $FakeWin.Root 'cp-secret.txt'
+        It 'adds HTTP_X_FORWARDED_FOR to the allowed server variables of a site set up by an earlier release' {
+            $key = "$AppHost|AegisConsole|system.webServer/rewrite/allowedServerVariables"
+            $FakeWin.Iis.Collections[$key] = New-Object System.Collections.Generic.List[hashtable]
+            foreach ($var in @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')) { $FakeWin.Iis.Collections[$key].Add(@{ name = $var }) }
+            (Invoke-Installer -Path $Installer -Parameters $Proxied).ExitCode | Should -Be 0
+            @($FakeWin.Iis.Collections[$key] | ForEach-Object { $_.name }) | Should -Be @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH', 'HTTP_X_FORWARDED_FOR')
+        }
+
+        It 'proxies to a control-plane on another host with a secret copied into a folder created as the refusal shows' {
+            # The commands of the refusal message (and of the Windows guide, section 7).
+            $folder = Join-Path $env:SystemDrive 'AegisSecrets'
+            New-Item -ItemType Directory -Force $folder | Out-Null
+            icacls.exe $folder /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+            $copied = Join-Path $folder 'trusted-proxy-secret'
             [System.IO.File]::WriteAllText($copied, ('Zz9-._~+/=' * 4))
+            icacls.exe $folder /setowner '*S-1-5-32-544' /T /L /C /Q | Out-Null
             $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ ApiProxyTarget = 'https://aegis-cp.corp.example:8443'; ProxySecretFile = $copied })
             $run.ExitCode | Should -Be 0
             $rule = @(([xml][System.IO.File]::ReadAllText((Join-Path $Site 'web.config'))).configuration.'system.webServer'.rewrite.rules.rule)[1]
             $rule.action.url | Should -Be 'https://aegis-cp.corp.example:8443/api/{R:1}'
             (@($rule.serverVariables.set) | Where-Object name -eq 'HTTP_X_AEGIS_PROXY_AUTH').value | Should -Be ('Zz9-._~+/=' * 4)
+        }
+
+        It 'refuses the proxy secret a local user planted on a host without a control-plane, before changing anything' {
+            # Separate console host: no control-plane installer took %ProgramData%\AegisProxy, so a user created it
+            # (ProgramData lets users create folders and read what they inherit) and chose the secret.
+            foreach ($dir in @($AegisData, (Split-Path -Parent $SecretFile))) { $FakeWin.Acl.Remove((Get-FakeFullPath $dir)) }
+            Set-FakeOwner -Path $AegisData -Sid 'S-1-5-21-111-222-333-1007'
+            $err = { & $Installer @Base -ApiProxyTarget 'https://aegis-cp.corp.example:8443' } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $SecretFile) (owner S-1-5-21-111-222-333-1007, Users: read)"))
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $AegisData) (owner S-1-5-21-111-222-333-1007)"))
+            "$err" | Should -Match ([regex]::Escape('icacls "') + '.*AegisSecrets" /inheritance:r')
+            "$err" | Should -Not -Match '-Allow' -Because 'there is no override for secrets'
+            $FakeWin.Iis.Features.Count | Should -Be 0
+            $FakeWin.Iis.AppPools.Count | Should -Be 0
+            (Get-FakeCall 'icacls.exe').Count | Should -Be 0
+            Test-Path -LiteralPath $Site | Should -BeFalse
+        }
+
+        It 'refuses a copied proxy secret that <Case>' -TestCases @(
+            @{ Case = 'users can read'; Grantee = '*S-1-5-32-545'; Ace = 'R'; Expect = 'Users: read' },
+            @{ Case = 'authenticated users can change'; Grantee = '*S-1-5-11'; Ace = 'M'; Expect = 'Authenticated Users' },
+            @{ Case = 'another account owns'; Owner = 'S-1-5-21-111-222-333-1007'; Expect = 'owner S-1-5-21-111-222-333-1007' }
+        ) {
+            $copied = Join-Path $FakeWin.Root 'cp-secret.txt'
+            [System.IO.File]::WriteAllText($copied, ('Zz9-._~+/=' * 4))
+            if ($Owner) { $FakeWin.Owner[(Get-FakeFullPath $copied)] = $Owner }
+            else { $FakeWin.Acl[(Get-FakeFullPath $copied)] = @{ Protected = $false; Grants = [ordered]@{ $Grantee = $Ace } } }
+            $err = { & $Installer @Base -ApiProxyTarget 'https://aegis-cp.corp.example:8443' -ProxySecretFile $copied } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $copied) ($Expect)"))
+            $FakeWin.Iis.Sites.Count | Should -Be 0
+        }
+
+        It 'accepts the proxy secret of the control-plane on this host, which its service may read' {
+            (Get-FakeAccess $SecretFile)['NT SERVICE\AegisControlPlane'] | Should -Be 'R'
+            (Invoke-Installer -Path $Installer -Parameters $Proxied).ExitCode | Should -Be 0
         }
 
         It 'refuses the proxy target <Target>' -TestCases @(

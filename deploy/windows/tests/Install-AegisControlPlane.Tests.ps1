@@ -698,7 +698,10 @@ Describe 'Install-AegisControlPlane.ps1' {
                 [System.IO.File]::WriteAllText((Join-Path (Join-Path $Node1 'secrets') $name), ("{0}`n" -f ($name.Substring(0, 1) * 64)))
             }
             $script:Node1Fp = New-TestCa -Dir (Join-Path $Node1 'certs')
-            $script:Dsn = 'postgres://aegis:S3cr3t-Db-Pass@db.corp.example:5432/aegis?sslmode=verify-full'
+            # As the first node's installer left them: its service may read the secrets.
+            $FakeWin.Acl[(Get-FakeFullPath (Join-Path $Node1 'secrets'))] = @{ Protected = $true; Grants = [ordered]@{
+                    '*S-1-5-18' = '(OI)(CI)F'; '*S-1-5-32-544' = '(OI)(CI)F'; 'NT SERVICE\AegisControlPlane' = '(OI)(CI)R' } }
+            $script:Dsn ='postgres://aegis:S3cr3t-Db-Pass@db.corp.example:5432/aegis?sslmode=verify-full'
             $script:Cluster = Join-Parameters $Base @{ Storage = 'postgres'; DatabaseUrl = $Dsn; ImportSecretsDir = (Join-Path $Node1 'secrets')
                 CaSourceDir = (Join-Path $Node1 'certs'); SkipFirewall = $true }
         }
@@ -732,6 +735,25 @@ Describe 'Install-AegisControlPlane.ps1' {
             { & $Installer @noSecrets } | Should -Throw '*A different CA already exists*'
             (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Cluster @{ Force = $true })).ExitCode | Should -Be 0
             ([System.IO.File]::ReadAllText((Join-Path $SecretsDir 'jwt.key'))).Trim() | Should -Be ('j' * 64)
+        }
+
+        It 'refuses an imported secret or CA key that <Case>, before changing anything' -TestCases @(
+            @{ Case = 'users can read'; Relative = 'secrets\jwt.key'; Grantee = '*S-1-5-32-545'; Ace = 'R'; Expect = 'Users: read' },
+            @{ Case = 'the first node''s service could change'; Relative = 'secrets\encryption.key'; Grantee = 'NT SERVICE\AegisControlPlane'; Ace = 'M' },
+            @{ Case = 'users can read (the CA private key)'; Relative = 'certs\mitmproxy-ca.pem'; Grantee = '*S-1-5-32-545'; Ace = 'RX'; Expect = 'Users: read' }
+        ) {
+            $weak = Get-FakeFullPath (Join-Path $Node1 $Relative)
+            $FakeWin.Acl[$weak] = @{ Protected = $false; Grants = [ordered]@{ $Grantee = $Ace } }
+            $who = if ($Expect) { $Expect } else { Get-FakeSid $Grantee }
+            $err = { & $Installer @Cluster -AllowWritableSource } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$weak ($who)"))
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $DataRoot | Should -BeFalse
+        }
+
+        It 'imports a CA whose public certificate users can read' {
+            $FakeWin.Acl[(Get-FakeFullPath (Join-Path $Node1 'certs\mitmproxy-ca-cert.pem'))] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-32-545' = 'R' } }
+            (Invoke-Installer -Path $Installer -Parameters $Cluster).ExitCode | Should -Be 0
         }
 
         It 'rejects imported secrets shorter than 32 characters' {
@@ -854,6 +876,16 @@ Describe 'Install-AegisControlPlane.ps1' {
             (Get-FakeCall 'aegis-control-plane' | Where-Object { $_.Args[0] -eq 'healthcheck' })[-1].Tls | Should -Be (Join-Path $SecretsDir 'tls-cert.pem')
             $env:AEGIS_TLS_CERT_FILE | Should -BeNullOrEmpty
             $run.Output | Should -Match 'Listener\s+: https://'
+        }
+
+        It 'refuses a TLS key that users can read, also with -AllowWritableSource, before changing anything' {
+            # C:\pki created in the volume root of Windows Server: users may read what is below it.
+            $FakeWin.Acl[(Get-FakeFullPath (Split-Path -Parent $KeyFile))] = @{ Protected = $false; Grants = [ordered]@{ '*S-1-5-32-545' = '(OI)(CI)RX' } }
+            $err = { & $Installer @Base -TlsCertFile $CertFile -TlsKeyFile $KeyFile -SkipFirewall -AllowWritableSource } | Should -Throw '*Non-administrators can read or replace secret files*' -PassThru
+            "$err" | Should -Match ([regex]::Escape("$(Get-FakeFullPath $KeyFile) (Users: read)"))
+            "$err" | Should -Not -Match ([regex]::Escape((Get-FakeFullPath $CertFile))) -Because 'the certificate is public'
+            $FakeWin.Services.Count | Should -Be 0
+            Test-Path -LiteralPath $DataRoot | Should -BeFalse
         }
 
         It 'rejects an encrypted private key' {
