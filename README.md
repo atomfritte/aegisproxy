@@ -121,11 +121,11 @@ $ curl -x http://proxy.corp.example:8080 http://example.com/
 --------------------------------------------------------------------------------
  INSTALL THE ROOT CA
   Compare the installer's SHA-256 with the AegisProxy console (TLS & CA) before running it.
-    Linux:   curl -fsSLo aegis-ca-install.sh http://localhost:8081/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh
-             sudo bash aegis-ca-install.sh
-    Windows: iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
-             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
-             powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1
+    Linux:   d=$(mktemp -d); curl -fsSLo "$d/aegis-ca-install.sh" http://localhost:8081/api/public/ca/install-linux.sh && sha256sum "$d/aegis-ca-install.sh"
+             sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"
+    Windows: $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+             iwr -UseBasicParsing http://localhost:8081/api/public/ca/install-windows.ps1 -OutFile $f; Get-FileHash $f -Algorithm SHA256
+             powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName
 ================================================================================
 ```
 

@@ -99,7 +99,11 @@ func (s *Server) handlePublicCAInfo(w http.ResponseWriter, r *http.Request) {
 // caInstallCommands are copy-paste commands that download a trust installer, check it against its
 // SHA-256 and only then run it with root/administrator rights. Installers are never piped into a
 // shell: the hash comes from the authenticated console, so a script altered in transit (plain http,
-// a TLS-intercepting middlebox, a spoofed host) is refused before it runs.
+// a TLS-intercepting middlebox, a spoofed host) is refused before it runs. The checked bytes are the
+// ones that run: the download lands in a freshly created private directory (Linux: mktemp -d, 0700;
+// Windows: the bytes are hashed in memory and written with CreateNew into a new random-named
+// directory), never under a fixed name in a shared temp directory where another local user could
+// plant or swap the file between the check and the run.
 type caInstallCommands struct {
 	LinuxSHA256, WindowsSHA256 string
 	Linux, Windows             string
@@ -109,9 +113,19 @@ func (s *Server) caInstallCommands() caInstallCommands {
 	ls := sha256.Sum256([]byte(s.linuxInstallScript()))
 	ws := sha256.Sum256([]byte(s.windowsInstallScript()))
 	c := caInstallCommands{LinuxSHA256: hex.EncodeToString(ls[:]), WindowsSHA256: hex.EncodeToString(ws[:])}
-	c.Linux = fmt.Sprintf(`curl -fsSLo aegis-ca-install.sh %s && echo '%s  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh`,
+	// A subshell, so the exit status is the installer's (or the failed check's) and the directory is
+	// removed either way without closing the user's shell.
+	c.Linux = fmt.Sprintf(`(d=$(mktemp -d) || exit 1; curl -fsSLo "$d/aegis-ca-install.sh" %s && echo "%s  $d/aegis-ca-install.sh" | sha256sum -c - && sudo bash "$d/aegis-ca-install.sh"; r=$?; rm -rf "$d"; exit $r)`,
 		shellQuoteSingle(s.cfg.PublicURL+"/api/public/ca/install-linux.sh"), c.LinuxSHA256)
-	c.Windows = fmt.Sprintf(`$f = Join-Path $env:TEMP 'aegis-ca-install.ps1'; iwr -UseBasicParsing '%s' -OutFile $f; if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '%s') { throw 'aegis-ca-install.ps1: SHA-256 mismatch, not running it' }; powershell -NoProfile -ExecutionPolicy Bypass -File $f`,
+	// A child scope with ErrorActionPreference Stop (and no progress bar, which slows downloads in Windows
+	// PowerShell 5.1): any failed step ends the command, and the user's session keeps its variables and
+	// preferences. The script is run with -File, not as an in-memory script block, so that its
+	// "#Requires -RunAsAdministrator" applies.
+	c.Windows = fmt.Sprintf(`& { $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; $b = (Invoke-WebRequest -UseBasicParsing '%s').RawContentStream.ToArray(); `+
+		`if ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-', '') -ne '%s') { throw 'aegis-ca-install.ps1: SHA-256 mismatch, not running it' }; `+
+		`$d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); `+
+		`try { $f = Join-Path $d.FullName 'aegis-ca-install.ps1'; $s = [IO.File]::Open($f, 'CreateNew', 'Write', 'None'); try { $s.Write($b, 0, $b.Length) } finally { $s.Close() }; `+
+		`powershell -NoProfile -ExecutionPolicy Bypass -File $f } finally { Remove-Item -LiteralPath $d.FullName -Recurse -Force } }`,
 		strings.ReplaceAll(s.cfg.PublicURL+"/api/public/ca/install-windows.ps1", "'", "''"), c.WindowsSHA256)
 	return c
 }
@@ -161,11 +175,12 @@ echo "[!] WARNING: this installer was served over plain http (AEGIS_PUBLIC_URL);
 # AegisProxy Enterprise Root CA - Automated Server Trust Installer
 # The CA is pinned to its SHA-256 fingerprint. Verify the fingerprint below against the value shown
 # in the AegisProxy console (TLS & CA) before running this script with root privileges.
-# Usage: never pipe it into a shell. Download it, compare its SHA-256 with the value shown in the
-# console (or use the verified one-liner from there), then run it:
-#   curl -fsSLo aegis-ca-install.sh %[3]s/api/public/ca/install-linux.sh
-#   sha256sum aegis-ca-install.sh
-#   sudo bash aegis-ca-install.sh
+# Usage: never pipe it into a shell. Download it into a private directory, compare its SHA-256 with
+# the value shown in the console (or use the verified one-liner from there), then run that file:
+#   d=$(mktemp -d)
+#   curl -fsSLo "$d/aegis-ca-install.sh" %[3]s/api/public/ca/install-linux.sh
+#   sha256sum "$d/aegis-ca-install.sh"
+#   sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"
 set -euo pipefail
 %[4]s
 EXPECTED_FP='%[1]s'
@@ -254,12 +269,15 @@ Write-Warning 'This installer was served over plain http (AEGIS_PUBLIC_URL); mak
 	}
 	script := fmt.Sprintf(`#Requires -RunAsAdministrator
 # AegisProxy Enterprise Root CA - Windows Server Trust Installer
-# Usage (elevated PowerShell): never pipe it into iex. Download it, compare its SHA-256 with the value
-# shown in the AegisProxy console (TLS & CA, or use the verified one-liner from there), then run it:
+# Usage (elevated PowerShell): never pipe it into iex. Download it into a new private directory, compare
+# its SHA-256 with the value shown in the AegisProxy console (TLS & CA, or use the verified one-liner from
+# there), then run that file:
 #   $env:AEGIS_PROXY = "aegis-proxy.corp.example:8080"   # optional: also configure proxy settings
-#   iwr -UseBasicParsing %s/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
-#   Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1
+#   $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid()))
+#   $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+#   iwr -UseBasicParsing %s/api/public/ca/install-windows.ps1 -OutFile $f
+#   Get-FileHash $f -Algorithm SHA256
+#   powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName
 $ErrorActionPreference = 'Stop'
 $ExpectedFingerprint = '%s'
 $CaUrl = '%s'

@@ -27,13 +27,18 @@ machines that already send traffic appear under **Servers → Discovered**. Deta
 
 Never pipe a downloaded installer into a shell. **TLS & CA** in the console (and `linux_command` /
 `windows_command` of `GET /api/public/ca/info`) shows one-liners that download the installer, check it
-against the SHA-256 of the script this deployment serves and only then run it. Manually:
+against the SHA-256 of the script this deployment serves and only then run it. The download goes into a fresh
+private directory (Linux `mktemp -d`; Windows: hashed in memory, then written into a new random-named
+directory), so the file that is checked is the file that runs: never download it under a fixed name into the
+current or a shared temp directory, where another local user could swap it in between. Manually:
 
 Linux:
 
 ```bash
-curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh
-echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
+d=$(mktemp -d)   # private directory: the file that is checked is the file that runs
+curl -fsSLo "$d/aegis-ca-install.sh" https://aegis.corp.example/api/public/ca/install-linux.sh
+echo "<linux_script_sha256 from the console>  $d/aegis-ca-install.sh" | sha256sum -c - && sudo bash "$d/aegis-ca-install.sh"
+rm -rf "$d"
 cat <<'EOF' | sudo tee /etc/profile.d/aegis-proxy.sh
 export http_proxy=http://svc-web-01:<token>@aegis-proxy.corp.example:8080
 export https_proxy=$http_proxy HTTP_PROXY=$http_proxy HTTPS_PROXY=$http_proxy
@@ -45,10 +50,18 @@ Windows (elevated PowerShell):
 
 ```powershell
 $env:AEGIS_PROXY = "aegis-proxy.corp.example:8080"
-$f = Join-Path $env:TEMP 'aegis-ca-install.ps1'
-iwr -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1 -OutFile $f
-if ((Get-FileHash $f -Algorithm SHA256).Hash -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch' }
-powershell -NoProfile -ExecutionPolicy Bypass -File $f
+& {   # in memory, then into a new random-named directory: the bytes that are checked are the bytes that run
+  $ErrorActionPreference = 'Stop'
+  $b = (Invoke-WebRequest -UseBasicParsing https://aegis.corp.example/api/public/ca/install-windows.ps1).RawContentStream.ToArray()
+  $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-', '')
+  if ($h -ne '<windows_script_sha256 from the console>') { throw 'SHA-256 mismatch, not running it' }
+  $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid()))
+  try {
+    $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+    $s = [IO.File]::Open($f, 'CreateNew', 'Write', 'None'); try { $s.Write($b, 0, $b.Length) } finally { $s.Close() }
+    powershell -NoProfile -ExecutionPolicy Bypass -File $f
+  } finally { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
+}
 ```
 
 Both installers pin the CA by its SHA-256 fingerprint (shown in the console under **TLS & CA**). They refuse a

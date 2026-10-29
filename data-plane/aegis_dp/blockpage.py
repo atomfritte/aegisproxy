@@ -51,6 +51,21 @@ AUTH_FAILED_HELP = (
 )
 
 
+def ca_install_steps(base: str, prefix: str = "/api/public/ca") -> str:
+    """CA installer steps of the terminal messages (the control-plane's blockpage.CLICAInstallSteps). The installer is
+    downloaded into a fresh private directory and exactly that file runs after the SHA-256 comparison: never a fixed
+    name in a shared or the current directory, where another local user could swap it between the check and the run."""
+    return (
+        f"    Linux:   d=$(mktemp -d); curl -fsSLo \"$d/aegis-ca-install.sh\" {base}{prefix}/install-linux.sh"
+        " && sha256sum \"$d/aegis-ca-install.sh\"\n"
+        "             sudo bash \"$d/aegis-ca-install.sh\"; rm -rf \"$d\"\n"
+        "    Windows: $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid()));"
+        " $f = Join-Path $d.FullName 'aegis-ca-install.ps1'\n"
+        f"             iwr -UseBasicParsing {base}{prefix}/install-windows.ps1 -OutFile $f; Get-FileHash $f -Algorithm SHA256\n"
+        "             powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName\n"
+    )
+
+
 def render_cli(ctx: Dict[str, str], groups: List[str]) -> str:
     public = ctx["public_url"]
     payload = json.dumps({"block_token": ctx["block_token"], "requester": f"root@{_clean(ctx['server_hostname'])}",
@@ -82,11 +97,7 @@ def render_cli(ctx: Dict[str, str], groups: List[str]) -> str:
         f"{action}\n"
         " 🔐 3. INSTALL SSL/TLS ROOT CA CERTIFICATE ON THIS SERVER (compare the installer's SHA-256 with\n"
         "    the AegisProxy console, TLS & CA, before running it):\n"
-        f"    Linux:   curl -fsSLo aegis-ca-install.sh {public}/api/public/ca/install-linux.sh && sha256sum aegis-ca-install.sh\n"
-        "             sudo bash aegis-ca-install.sh\n"
-        f"    Windows: iwr -UseBasicParsing {public}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1\n"
-        "             Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256\n"
-        "             powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1\n"
+        f"{ca_install_steps(public)}"
         "================================================================================\n"
     )
 
@@ -201,12 +212,16 @@ duration:document.getElementById('duration').value,reason:document.getElementByI
 <div class="card"><h2 class="h2">Enterprise Root CA</h2>
 <p>Install the AegisProxy root certificate to avoid TLS errors on this server. Compare the installer's SHA-256
 with the AegisProxy console (TLS &amp; CA) before running it:</p>
-<pre>curl -fsSLo aegis-ca-install.sh {e['public_url']}/api/public/ca/install-linux.sh &amp;&amp; sha256sum aegis-ca-install.sh
-sudo bash aegis-ca-install.sh
+<pre>d=$(mktemp -d)
+curl -fsSLo "$d/aegis-ca-install.sh" {e['public_url']}/api/public/ca/install-linux.sh
+sha256sum "$d/aegis-ca-install.sh"
+sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"
 
-iwr -UseBasicParsing {e['public_url']}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1   # Windows (admin)
-Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256
-powershell -NoProfile -ExecutionPolicy Bypass -File .\aegis-ca-install.ps1</pre>
+# Windows (admin)
+$d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+iwr -UseBasicParsing {e['public_url']}/api/public/ca/install-windows.ps1 -OutFile $f
+Get-FileHash $f -Algorithm SHA256
+powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName</pre>
 <p><a href="{e['public_url']}/api/public/ca/aegis-ca.crt">Download CA (PEM)</a> · <a href="{e['public_url']}/api/public/ca/aegis-ca.der">Download CA (DER)</a></p>
 </div></div>
 <script type="application/json" id="aegis-data">{data}</script>

@@ -23,20 +23,24 @@ type InstallInfo = Pick<CAInfo, 'linux_command' | 'windows_command'> | null | un
 /**
  * Fingerprint-pinned installers served by the control plane. A downloaded script is never piped into a
  * shell: the control plane's commands check the script against its SHA-256 before running it; without
- * them (older control plane) the steps download, show the hash for a manual comparison and run.
+ * them (older control plane) the steps download, show the hash for a manual comparison and run. Either
+ * way the script lands in a fresh private directory and exactly the checked file runs (a fixed name in
+ * a shared or the current directory could be swapped by another local user between check and run).
  */
 export function installCommands(base: string, ca?: InstallInfo) {
   return {
     linux:
       ca?.linux_command ||
-      `curl -fsSLo aegis-ca-install.sh ${base}/api/public/ca/install-linux.sh
-sha256sum aegis-ca-install.sh   # compare with the console (TLS & CA)
-sudo bash aegis-ca-install.sh`,
+      `d=$(mktemp -d)
+curl -fsSLo "$d/aegis-ca-install.sh" ${base}/api/public/ca/install-linux.sh
+sha256sum "$d/aegis-ca-install.sh"   # compare with the console (TLS & CA)
+sudo bash "$d/aegis-ca-install.sh"; rm -rf "$d"`,
     windows:
       ca?.windows_command ||
-      `iwr -UseBasicParsing ${base}/api/public/ca/install-windows.ps1 -OutFile aegis-ca-install.ps1
-Get-FileHash aegis-ca-install.ps1 -Algorithm SHA256   # compare with the console (TLS & CA)
-powershell -NoProfile -ExecutionPolicy Bypass -File .\\aegis-ca-install.ps1`,
+      `$d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('aegis-ca-' + [guid]::NewGuid())); $f = Join-Path $d.FullName 'aegis-ca-install.ps1'
+iwr -UseBasicParsing ${base}/api/public/ca/install-windows.ps1 -OutFile $f
+Get-FileHash $f -Algorithm SHA256   # compare with the console (TLS & CA)
+powershell -NoProfile -ExecutionPolicy Bypass -File $f; Remove-Item -Recurse $d.FullName`,
   };
 }
 
@@ -60,12 +64,15 @@ type SnippetInfo = (Partial<Pick<CAInfo, 'fingerprint' | 'pem_sha256' | 'linux_c
 export function trustSnippet(os: TrustOs, base: string, ca?: SnippetInfo): string {
   const fp = ca?.fingerprint || '<SHA-256 fingerprint from the console>';
   const pemSha = ca?.pem_sha256 || '<pem_sha256 from the console>';
-  // openssl x509 re-encodes the first certificate only, so nothing else from the download is trusted
-  const verifiedPem = (dest: string, update: string) => `curl -fsSL ${base}/api/public/ca/aegis-ca.crt | openssl x509 -out aegis-ca.crt
-[ "$(openssl x509 -in aegis-ca.crt -noout -fingerprint -sha256 | cut -d= -f2)" = '${fp}' ] \\
-  && sudo install -m 0644 aegis-ca.crt ${dest} \\
+  // openssl x509 re-encodes the first certificate only, so nothing else from the download is trusted; the
+  // file lives in a fresh private directory, so the certificate that is checked is the one installed
+  const verifiedPem = (dest: string, update: string) => `d=$(mktemp -d)
+curl -fsSL ${base}/api/public/ca/aegis-ca.crt | openssl x509 -out "$d/aegis-ca.crt"
+[ "$(openssl x509 -in "$d/aegis-ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)" = '${fp}' ] \\
+  && sudo install -m 0644 "$d/aegis-ca.crt" ${dest} \\
   && sudo ${update} \\
-  || echo 'CA NOT installed: fingerprint mismatch or error' >&2`;
+  || echo 'CA NOT installed: fingerprint mismatch or error' >&2
+rm -rf "$d"`;
   switch (os) {
     case 'ubuntu':
       return `# Ubuntu / Debian / Proxmox — system-wide CA import, only after the fingerprint matched

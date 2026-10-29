@@ -225,14 +225,19 @@ jobs:
       - name: end to end through the Windows services
         run: |
           $ErrorActionPreference = 'Stop'
-          # Trust the enterprise CA with the product's own roll-out script, the documented way: download it, compare
-          # its SHA-256 with windows_script_sha256 of /api/public/ca/info, only then run it (never piped into iex).
-          $caScript = Join-Path $env:RUNNER_TEMP 'aegis-ca-install.ps1'
-          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/api/public/ca/install-windows.ps1 -OutFile $caScript
-          $expected = "$((Invoke-RestMethod http://127.0.0.1:8081/api/public/ca/info).windows_script_sha256)"
-          $actual = (Get-FileHash -LiteralPath $caScript -Algorithm SHA256).Hash
-          if ($expected -notmatch '^[0-9A-Fa-f]{64}$' -or $actual -ne $expected) { throw "CA installer SHA-256 $actual does not match windows_script_sha256 '$expected'" }
-          powershell -NoProfile -ExecutionPolicy Bypass -File $caScript
+          # Trust the enterprise CA with the product's own roll-out, exactly the command the console hands out
+          # (windows_command of /api/public/ca/info), in Windows PowerShell 5.1 as an administrator would: it
+          # downloads the installer into memory, compares it with windows_script_sha256, writes those bytes with
+          # CreateNew into a new random-named directory and runs that file. A wrong hash must stop it first.
+          $info = Invoke-RestMethod http://127.0.0.1:8081/api/public/ca/info
+          $sha = "$($info.windows_script_sha256)"
+          if ($sha -notmatch '^[0-9A-Fa-f]{64}$' -or -not "$($info.windows_command)".Contains("-ne '$sha'")) { throw "unexpected CA info: $($info | ConvertTo-Json -Compress)" }
+          function Invoke-WindowsPowerShell([string]$command) {
+            powershell -NoProfile -NonInteractive -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("$command; exit `$LASTEXITCODE")))
+          }
+          $out = Invoke-WindowsPowerShell $info.windows_command.Replace($sha, ('0' * 64)) 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0 -or $out -notmatch 'SHA-256 mismatch, not running it') { throw "CA installer command with a wrong hash was not refused ($LASTEXITCODE): $out" }
+          Invoke-WindowsPowerShell $info.windows_command
           if ($LASTEXITCODE -ne 0) { throw "CA installer failed with exit code $LASTEXITCODE" }
           $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
           $h = @{ 'X-Requested-With' = 'aegis-ui' }

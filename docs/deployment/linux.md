@@ -362,13 +362,17 @@ networks. Load balancers in front of workers must not SNAT client traffic unless
 
 Verify the CA fingerprint printed by the installer (also `https://aegis.corp.example/api/public/ca/info`)
 through a second channel. Never pipe the installers into a shell: the console (**TLS & CA**) shows
-one-liners that check the downloaded script against its SHA-256 before running it.
+one-liners that check the downloaded script against its SHA-256 before running it. Download into a fresh
+private directory (`mktemp -d`), never under a fixed name into the current or a shared directory, so the file
+that is checked is the file that runs.
 
 **Linux servers**
 
 ```bash
-curl -fsSLo aegis-ca-install.sh https://aegis.corp.example/api/public/ca/install-linux.sh
-echo '<linux_script_sha256 from the console>  aegis-ca-install.sh' | sha256sum -c - && sudo bash aegis-ca-install.sh
+d=$(mktemp -d)   # private directory: the file that is checked is the file that runs
+curl -fsSLo "$d/aegis-ca-install.sh" https://aegis.corp.example/api/public/ca/install-linux.sh
+echo "<linux_script_sha256 from the console>  $d/aegis-ca-install.sh" | sha256sum -c - && sudo bash "$d/aegis-ca-install.sh"
+rm -rf "$d"
 ```
 
 The script pins the CA fingerprint (it requires `curl` and `openssl`), refuses a download that holds more than
