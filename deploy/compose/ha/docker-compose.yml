@@ -88,7 +88,7 @@ services:
     <<: *cp
 
   lb:
-    image: haproxy:3.2-alpine@sha256:dfba86f031bd4c9039f10f8cc5de75991d1b6766d5460f0335b980408503baad   # pinned by digest
+    image: haproxy:3.4-alpine@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa   # pinned by digest
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
     depends_on: [control-plane-1, control-plane-2]
