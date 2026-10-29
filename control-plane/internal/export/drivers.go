@@ -190,14 +190,20 @@ func gz(b []byte) []byte {
 	return buf.Bytes()
 }
 
-// post sends a request and classifies the outcome.
+// post sends a request and classifies the outcome; at most 1 MiB of the response is read.
 func (h *httpBase) post(ctx context.Context, target string, body []byte, contentType string, compress bool, hdr map[string]string) ([]byte, error) {
+	resp, _, err := h.postRead(ctx, target, body, contentType, compress, hdr, 1<<20)
+	return resp, err
+}
+
+// postRead is post reading up to limit bytes of the response; complete is false when it was longer.
+func (h *httpBase) postRead(ctx context.Context, target string, body []byte, contentType string, compress bool, hdr map[string]string, limit int64) (resp []byte, complete bool, err error) {
 	if compress {
 		body = gz(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, &permanentError{fmt.Sprintf("%s: %v", h.redact(target), stripURL(err))}
+		return nil, false, &permanentError{fmt.Sprintf("%s: %v", h.redact(target), stripURL(err))}
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "AegisProxy-Exporter/"+h.meta.Version)
@@ -210,19 +216,21 @@ func (h *httpBase) post(ctx context.Context, target string, body []byte, content
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
-	resp, err := h.client.Do(req)
+	res, err := h.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", h.redact(target), stripURL(err))
+		return nil, false, fmt.Errorf("%s: %w", h.redact(target), stripURL(err))
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	defer res.Body.Close()
+	respBody, rerr := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	complete = rerr == nil && int64(len(respBody)) <= limit
+	respBody = respBody[:min(int64(len(respBody)), limit)]
 	switch {
-	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return respBody, nil
-	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, h.redact(target), snippet(respBody))
+	case res.StatusCode >= 200 && res.StatusCode < 300:
+		return respBody, complete, nil
+	case res.StatusCode == http.StatusRequestTimeout || res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500:
+		return nil, false, fmt.Errorf("HTTP %d from %s: %s", res.StatusCode, h.redact(target), snippet(respBody))
 	default:
-		return nil, &permanentError{fmt.Sprintf("HTTP %d from %s: %s", resp.StatusCode, h.redact(target), snippet(respBody))}
+		return nil, false, &permanentError{fmt.Sprintf("HTTP %d from %s: %s", res.StatusCode, h.redact(target), snippet(respBody))}
 	}
 }
 
@@ -770,6 +778,12 @@ func (d *splunkDriver) awaitAck(ctx context.Context, eventURL string, p hecPendi
 
 type elasticDriver struct{ httpBase }
 
+// The bulk response is reduced to what decides delivery, and read completely up to maxBulkResponse.
+const (
+	elasticFilterPath = "items.*.status,items.*.error.type,items.*.error.reason"
+	maxBulkResponse   = 32 << 20
+)
+
 func (d *elasticDriver) encode(ev Event) ([]byte, error) {
 	index := d.cfg.Index
 	if index == "" {
@@ -791,13 +805,19 @@ func (d *elasticDriver) send(ctx context.Context, recs [][]byte) error {
 	case string(d.cfg.Secret) != "":
 		hdr["Authorization"] = "ApiKey " + string(d.cfg.Secret)
 	}
-	body, err := d.post(ctx, strings.TrimRight(d.cfg.Endpoint, "/")+"/_bulk", bytes.Join(recs, nil), "application/x-ndjson", true, hdr)
+	target := strings.TrimRight(d.cfg.Endpoint, "/") + "/_bulk?filter_path=" + elasticFilterPath
+	body, complete, err := d.postRead(ctx, target, bytes.Join(recs, nil), "application/x-ndjson", true, hdr, maxBulkResponse)
 	if err != nil {
 		return err
 	}
+	// Only a complete bulk result that answers every document proves delivery: anything else (a proxy
+	// or another service answering 200, a truncated body) is retried. Documents carry their _id, so the
+	// ones already created come back as 409.
+	if !complete {
+		return fmt.Errorf("bulk response from %s is incomplete or larger than %d MiB; retrying", d.redact(target), maxBulkResponse>>20)
+	}
 	var res struct {
-		Errors bool `json:"errors"`
-		Items  []map[string]struct {
+		Items []map[string]struct {
 			Status int `json:"status"`
 			Error  *struct {
 				Type   string `json:"type"`
@@ -805,16 +825,24 @@ func (d *elasticDriver) send(ctx context.Context, recs [][]byte) error {
 			} `json:"error"`
 		} `json:"items"`
 	}
-	if err := json.Unmarshal(body, &res); err != nil || !res.Errors {
-		return nil
+	if err := json.Unmarshal(body, &res); err != nil {
+		return fmt.Errorf("bulk response from %s is not a bulk result (%v): %s; retrying", d.redact(target), err, snippet(body))
 	}
-	// Items answer the records in order. Throttled items retry the whole batch: documents carry their
-	// _id, so the ones already created come back as 409 (counted as delivered).
+	if len(res.Items) != len(recs) {
+		return fmt.Errorf("bulk response from %s answers %d of %d documents; retrying", d.redact(target), len(res.Items), len(recs))
+	}
+	// Items answer the records in order. Throttled or unanswered items retry the whole batch (counted
+	// as delivered when they come back as 409).
 	rejected, retry := map[int]string{}, false
 	msg := ""
 	for i, item := range res.Items {
+		if len(item) != 1 {
+			retry = true
+		}
 		for _, r := range item {
 			switch {
+			case r.Status == 0:
+				retry = true
 			case r.Status < 300 || r.Status == http.StatusConflict:
 			case r.Status == http.StatusTooManyRequests || r.Status >= 500:
 				retry = true
@@ -831,7 +859,7 @@ func (d *elasticDriver) send(ctx context.Context, recs [][]byte) error {
 		}
 	}
 	if retry {
-		return errors.New("bulk request partially throttled (429/5xx); retrying")
+		return errors.New("bulk request partially throttled (429/5xx) or not answered for every document; retrying")
 	}
 	if len(rejected) > 0 {
 		return &partialError{rejected: rejected, retryFrom: len(recs), kind: alertRejected,

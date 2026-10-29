@@ -2,6 +2,7 @@ package export
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -166,7 +167,13 @@ func (c *captured) handler(status func(n int) int) http.HandlerFunc {
 		c.mu.Lock()
 		c.bodies, c.hdrs, c.paths = append(c.bodies, b), append(c.hdrs, r.Header.Clone()), append(c.paths, r.URL.Path)
 		c.mu.Unlock()
-		w.WriteHeader(status(int(n.Add(1))))
+		code := status(int(n.Add(1)))
+		w.WriteHeader(code)
+		if r.URL.Path == "/_bulk" && code == 200 {
+			// A bulk result answering every document (action and document line each).
+			items := strings.Repeat(`{"create":{"status":201}},`, bytes.Count(b, []byte("\n"))/2)
+			_, _ = w.Write([]byte(`{"items":[` + strings.TrimSuffix(items, ",") + `]}`))
+		}
 	}
 }
 

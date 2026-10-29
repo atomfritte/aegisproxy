@@ -342,6 +342,8 @@ metrics:
     policyStaleSeconds: 120
     loginFailures: 50
     feedStaleSeconds: 172800
+    # Complete audit trail verification older than this (default: 2 × AEGIS_AUDIT_VERIFY_INTERVAL of 6h + 1h).
+    auditVerifyOverdueSeconds: 46800
 
 podSecurityContext:
   runAsNonRoot: true

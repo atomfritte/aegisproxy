@@ -111,6 +111,10 @@ func (s *Store) RecordExportAlert(a export.Alert) {
 	} else {
 		s.markTelemetryDirtyLocked()
 	}
+	live := s.alertsLive
+	if isNew && !live {
+		s.pendingAlerts = append(s.pendingAlerts, created) // announced by goLive
+	}
 	notifyCfg := s.state.NotifyConfig
 	s.mu.Unlock()
 	if s.telemetry != nil {
@@ -120,6 +124,9 @@ func (s *Store) RecordExportAlert(a export.Alert) {
 		return
 	}
 	s.log.Error("log export alert", "sink", a.SinkName, "sink_id", a.SinkID, "severity", a.Severity, "detail", a.Detail)
+	if !live {
+		return
+	}
 	s.opts.Exporter.Publish(export.SecurityEvent(created))
 	if s.notifier != nil && notifyCfg.NotifySecurityEvents {
 		s.notifier.NotifySecurityEvent(created)

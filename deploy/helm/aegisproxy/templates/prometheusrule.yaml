@@ -57,6 +57,18 @@ spec:
           labels: { severity: warning }
           annotations:
             summary: "Unkeyed pre-2.1 audit events await review and acceptance by a Super Admin"
+        - alert: AegisAuditVerificationFailed
+          expr: aegis_audit_full_verify_ok == 0
+          for: 20m
+          labels: { severity: critical }
+          annotations:
+            summary: "The complete verification of the AegisProxy audit trail fails on {{`{{ $labels.instance }}`}}"
+            description: "See the audit-chain item of the posture report and docs/operations.md (audit trail)."
+        - alert: AegisAuditVerificationOverdue
+          expr: time() - aegis_audit_full_verify_timestamp_seconds > {{ .Values.metrics.prometheusRule.auditVerifyOverdueSeconds }}
+          labels: { severity: warning }
+          annotations:
+            summary: "The complete verification of the AegisProxy audit trail has not finished for too long on {{`{{ $labels.instance }}`}}"
         - alert: AegisClamdUnavailable
           expr: aegis_dp_clamd_available == 0
           for: 5m

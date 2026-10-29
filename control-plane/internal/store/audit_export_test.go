@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -127,54 +128,85 @@ func TestRotatedAuditFileOrder(t *testing.T) {
 }
 
 func TestCompleteAuditVerificationDetectsForgery(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "audit.jsonl")
-	// A pre-2.1 (unkeyed) event at the start of the trail stays verifiable after the upgrade.
-	legacy := writeLegacyInstallation(t, dir, path)
-	st, _ := openAuditStore(t, dir, path)
-	if _, err := st.AcceptLegacyAudit(context.Background(), path, 1, legacy.EventHash, adminClaims); err != nil {
-		t.Fatal(err)
-	}
-	for _, g := range []string{"grp-1", "grp-2", "grp-3"} {
-		if _, err := st.UpsertGroup(models.ServerGroup{ID: g, Name: g}, adminClaims); err != nil {
+	// install: a pre-2.1 (unkeyed) event at the start of the trail stays verifiable after the upgrade;
+	// legacy + AUDIT_ANCHOR_SEALED + AUDIT_LEGACY_ACCEPTED + 3 changes.
+	install := func(t *testing.T) (*Store, string, [][]byte) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "audit.jsonl")
+		legacy := writeLegacyInstallation(t, dir, path)
+		st, _ := openAuditStore(t, dir, path)
+		if _, err := st.AcceptLegacyAudit(context.Background(), path, 1, legacy.EventHash, adminClaims); err != nil {
 			t.Fatal(err)
 		}
+		for _, g := range []string{"grp-1", "grp-2", "grp-3"} {
+			if _, err := st.UpsertGroup(models.ServerGroup{ID: g, Name: g}, adminClaims); err != nil {
+				t.Fatal(err)
+			}
+		}
+		res := st.VerifyCompleteAudit(context.Background(), path)
+		if !res.OK || res.Events != 6 || res.Legacy != 1 || res.FirstID != legacy.ID || !res.StartsAtGenesis || !res.HeadMatches {
+			t.Fatalf("verification of an intact trail: %+v", res)
+		}
+		raw, _ := os.ReadFile(path)
+		return st, path, bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
 	}
-	// legacy + AUDIT_ANCHOR_SEALED + AUDIT_LEGACY_ACCEPTED + 3 changes
-	res := st.VerifyCompleteAudit(context.Background(), path)
-	if !res.OK || res.Events != 6 || res.Legacy != 1 || res.FirstID != legacy.ID || !res.StartsAtGenesis || !res.HeadMatches {
-		t.Fatalf("verification of an intact trail: %+v", res)
+	// A detected forgery is recorded like a violation found at start-up: it stays although the
+	// evidence is put back, and it is audited and alerted.
+	recorded := func(t *testing.T, st *Store, path string, orig [][]byte, want string) {
+		t.Helper()
+		os.WriteFile(path, append(bytes.Join(orig, []byte("\n")), '\n'), 0o600)
+		if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, want) {
+			t.Fatalf("violation not kept after the trail was put back: %+v", res)
+		}
+		if a := st.AuditStatus(); !strings.Contains(a.Integrity, want) {
+			t.Fatalf("audit status: %+v", a)
+		}
+		snap := st.GetSnapshot()
+		alerted := slices.ContainsFunc(snap.SecurityEvents, func(e models.SecurityEvent) bool {
+			return e.Type == SecurityEventAuditViolation && strings.Contains(e.Detail, want)
+		})
+		audited := slices.ContainsFunc(snap.AuditEvents, func(e models.AuditEvent) bool {
+			return e.Action == "AUDIT_INTEGRITY_VIOLATION" && strings.Contains(e.Summary, "complete verification (api)")
+		})
+		if !alerted || !audited {
+			t.Fatalf("violation not recorded: alerted %v, audited %v", alerted, audited)
+		}
 	}
-	raw, _ := os.ReadFile(path)
-	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
-	var ev models.AuditEvent
-	json.Unmarshal(lines[2], &ev)
-	if ev.HashVersion != 2 {
-		t.Fatalf("new events must use hash version 2: %+v", ev)
-	}
-	// An attacker with file/database access rewrites a summary and recomputes an unkeyed hash.
-	ev.Summary = "nothing happened"
-	ev.EventHash = auditHashV1(ev.PrevHash, ev)
-	ev.HashVersion = 0
-	forged, _ := json.Marshal(ev)
-	orig := lines[2]
-	lines[2] = forged
-	os.WriteFile(path, append(bytes.Join(lines, []byte("\n")), '\n'), 0o600)
-	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "downgrade") {
-		t.Fatalf("forgery not detected: %+v", res)
-	}
-	// Dropping an event breaks the chain.
-	lines[2] = orig
-	os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3], lines[4], lines[5]}, []byte("\n")), '\n'), 0o600)
-	if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "chain broken") {
-		t.Fatalf("missing event not detected: %+v", res)
-	}
-	st.mu.RLock()
-	key := st.state.AuditChainKey
-	st.mu.RUnlock()
-	if len(key) != 64 || st.GetSnapshot().AuditChainKey != "" || st.GetSnapshot().AuditAnchor != "" {
-		t.Fatalf("audit chain key missing or key/anchor exposed in snapshots (len %d)", len(key))
-	}
+
+	t.Run("hash downgrade", func(t *testing.T) {
+		st, path, lines := install(t)
+		var ev models.AuditEvent
+		json.Unmarshal(lines[2], &ev)
+		if ev.HashVersion != 2 {
+			t.Fatalf("new events must use hash version 2: %+v", ev)
+		}
+		// An attacker with file/database access rewrites a summary and recomputes an unkeyed hash.
+		ev.Summary = "nothing happened"
+		ev.EventHash = auditHashV1(ev.PrevHash, ev)
+		ev.HashVersion = 0
+		forged, _ := json.Marshal(ev)
+		tampered := slices.Clone(lines)
+		tampered[2] = forged
+		os.WriteFile(path, append(bytes.Join(tampered, []byte("\n")), '\n'), 0o600)
+		if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "downgrade") {
+			t.Fatalf("forgery not detected: %+v", res)
+		}
+		recorded(t, st, path, lines, "downgrade")
+		st.mu.RLock()
+		key := st.state.AuditChainKey
+		st.mu.RUnlock()
+		if len(key) != 64 || st.GetSnapshot().AuditChainKey != "" || st.GetSnapshot().AuditAnchor != "" {
+			t.Fatalf("audit chain key missing or key/anchor exposed in snapshots (len %d)", len(key))
+		}
+	})
+	t.Run("dropped event", func(t *testing.T) {
+		st, path, lines := install(t)
+		os.WriteFile(path, append(bytes.Join([][]byte{lines[0], lines[1], lines[3], lines[4], lines[5]}, []byte("\n")), '\n'), 0o600)
+		if res := st.VerifyCompleteAudit(context.Background(), path); res.OK || !strings.Contains(res.Error, "chain broken") {
+			t.Fatalf("missing event not detected: %+v", res)
+		}
+		recorded(t, st, path, lines, "chain broken")
+	})
 }
 
 func TestAuditSinkRotatesBySize(t *testing.T) {

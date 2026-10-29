@@ -234,6 +234,7 @@ func run(ctx context.Context) error {
 		Cluster:                cluster,
 		FlowRetention:          cfg.FlowRetention,
 		EventRetention:         cfg.EventRetention,
+		AuditVerifyInterval:    cfg.AuditVerifyInterval,
 		DataDir:                cfg.DataDir,
 		DemoMode:               cfg.DemoMode,
 		BootstrapAdminPassword: cfg.BootstrapAdminPassword,
@@ -250,9 +251,9 @@ func run(ctx context.Context) error {
 	}
 	defer st.Close()
 	// Sinks replay audit records a crash may have lost from this node's audit trail and raise
-	// delivery alerts as security events; both are detached before the store closes.
+	// delivery alerts as security events (the store attached its alert handler when it started the
+	// sinks); both are detached before the store closes.
 	exporter.SetAuditSource(st)
-	exporter.SetAlertHandler(st.RecordExportAlert)
 	defer exporter.SetAuditSource(nil)
 	defer exporter.SetAlertHandler(nil)
 

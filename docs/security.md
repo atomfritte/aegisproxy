@@ -138,9 +138,10 @@ the control mapping for ISO 27001, NIST SP 800-53, BSI IT-Grundschutz and SOC 2 
 - [ ] ClamAV deployed; `StreamMaxLength` ≥ `av_max_scan_bytes`; signature updates monitored.
 - [ ] DLP switched from `monitor` to `block` after a review period.
 - [ ] `/metrics` protected (`AEGIS_METRICS_TOKEN`) or reachable only from the monitoring network.
-- [ ] Audit JSONL / `aegis_audit` shipped to the SIEM; `/api/audit/verify` checked regularly (`valid`,
-      `starts_at_genesis` and `head_matches` true); old generations removed only together with
-      `POST /api/audit/retention`.
+- [ ] Audit JSONL / `aegis_audit` shipped to the SIEM; the complete verification runs in the background
+      (`AEGIS_AUDIT_VERIFY_INTERVAL`) and is alerted on (`aegis_audit_full_verify_ok`,
+      `AUDIT_INTEGRITY_VIOLATION`/`AUDIT_VERIFICATION_FAILED` security events); old generations removed only
+      together with `POST /api/audit/retention`.
 - [ ] `AEGIS_TRUSTED_PROXIES` / `trustedProxyHosts` list only the reverse proxies in front of the control-plane.
 - [ ] CA installers are distributed with their SHA-256 (console, **TLS & CA**), never piped into a shell.
 - [ ] The security posture page shows no `fail` items.

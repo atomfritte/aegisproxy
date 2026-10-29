@@ -98,6 +98,9 @@ type Config struct {
 	AuditLogPath string
 	// AuditRotateBytes rotates audit.jsonl by size inside the process (0 = external rotation only).
 	AuditRotateBytes int64
+	// AuditVerifyInterval: the complete audit trail is verified at start-up, at this interval and
+	// after the audit log rotated.
+	AuditVerifyInterval time.Duration
 	// ExportDir is where "file" log export sinks write; ExportSpoolDir holds undelivered records.
 	ExportDir      string
 	ExportSpoolDir string
@@ -397,6 +400,9 @@ func Load() (*Config, error) {
 		return nil, errors.New("AEGIS_AUDIT_ROTATE_MB must be a number of megabytes between 0 (off) and 1048576")
 	}
 	c.AuditRotateBytes = int64(rotateMB) << 20
+	if c.AuditVerifyInterval, err = time.ParseDuration(env("AEGIS_AUDIT_VERIFY_INTERVAL", "6h")); err != nil || c.AuditVerifyInterval < time.Minute || c.AuditVerifyInterval > 7*24*time.Hour {
+		return nil, errors.New("AEGIS_AUDIT_VERIFY_INTERVAL must be a duration between 1m and 168h")
+	}
 	c.ExportDir = env("AEGIS_EXPORT_DIR", filepath.Join(c.DataDir, "export"))
 	c.ExportSpoolDir = env("AEGIS_EXPORT_SPOOL_DIR", filepath.Join(c.DataDir, "export-spool"))
 	return c, nil
