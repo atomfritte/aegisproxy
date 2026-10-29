@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -105,6 +106,25 @@ func TestStartupVerificationRecordsMidTrailTampering(t *testing.T) {
 		return e.Type == SecurityEventAuditViolation && strings.Contains(e.Detail, "still in effect")
 	}) {
 		t.Fatal("no reminder at the restart")
+	}
+}
+
+// Overlapping verifications (start-up, API, rotation): the outcome of the one that started last is
+// kept, even when an older one finishes after it.
+func TestOverlappingVerificationsKeepNewestOutcome(t *testing.T) {
+	dir := t.TempDir()
+	v := openVerifyingStore(t, dir, filepath.Join(dir, "audit.jsonl"))
+	waitFullCheck(t, v.st)
+	v.st.full.mu.Lock()
+	v.st.full.running += 2
+	v.st.full.started += 2
+	older, newer := v.st.full.started-1, v.st.full.started
+	v.st.full.mu.Unlock()
+	ctx := context.Background()
+	v.st.finishFullCheck(ctx, newer, "api", AuditVerification{}, errors.New("generation unreadable"), nil)
+	v.st.finishFullCheck(ctx, older, "start-up", AuditVerification{Events: 7}, nil, nil)
+	if c := v.st.AuditFullCheck(); c.OK || c.Trigger != "api" || !strings.Contains(c.Error, "generation unreadable") || c.Running {
+		t.Fatalf("an older verification replaced the newer outcome: %+v", c)
 	}
 }
 

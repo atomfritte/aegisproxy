@@ -37,6 +37,8 @@ type fullCheckState struct {
 	mu       sync.Mutex
 	last     AuditFullCheck
 	running  int
+	started  uint64      // verifications started so far
+	lastRun  uint64      // number of the verification in last
 	failures int         // consecutive verifications that could not finish
 	kick     chan string // requested verification (trigger)
 }
@@ -102,6 +104,8 @@ func (s *Store) auditVerifyLoop() {
 func (s *Store) checkCompleteTrail(ctx context.Context, path string, allowPending bool, trigger string) (AuditVerification, error) {
 	s.full.mu.Lock()
 	s.full.running++
+	s.full.started++
+	run := s.full.started
 	s.full.mu.Unlock()
 	// While the audit log cannot be written (file storage) the newest events are not in it yet.
 	unwritable := s.auditLogErr()
@@ -114,7 +118,7 @@ func (s *Store) checkCompleteTrail(ctx context.Context, path string, allowPendin
 		case <-ctx.Done():
 		}
 	}
-	s.finishFullCheck(ctx, trigger, res, err, errors.Join(unwritable, s.auditLogErr()))
+	s.finishFullCheck(ctx, run, trigger, res, err, errors.Join(unwritable, s.auditLogErr()))
 	return res, err
 }
 
@@ -126,7 +130,7 @@ func (s *Store) auditLogErr() error {
 	return s.opts.AuditSink.Err()
 }
 
-func (s *Store) finishFullCheck(ctx context.Context, trigger string, res AuditVerification, err, unwritable error) {
+func (s *Store) finishFullCheck(ctx context.Context, run uint64, trigger string, res AuditVerification, err, unwritable error) {
 	now := time.Now().UTC()
 	c := AuditFullCheck{At: &now, Trigger: trigger, OK: err == nil, Events: res.Events, LegacyPending: res.LegacyPending}
 	ie := (*auditIntegrityError)(nil)
@@ -163,7 +167,11 @@ func (s *Store) finishFullCheck(ctx context.Context, trigger string, res AuditVe
 			alert = "The audit trail does not start at its sealed origin: " + err.Error() + ". That is expected only between removing old generations (or rows) for retention and applying the retention point (POST /api/audit/retention); otherwise the oldest events were deleted: compare the trail with the SIEM copy."
 		}
 	}
-	s.full.last = c
+	// Overlapping verifications (start-up, API, rotation): one that started earlier but finished later
+	// does not replace the newer outcome.
+	if run > s.full.lastRun {
+		s.full.last, s.full.lastRun = c, run
+	}
 	s.full.mu.Unlock()
 
 	switch {
