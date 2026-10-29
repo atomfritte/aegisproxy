@@ -214,10 +214,10 @@ in-memory Windows model (Pester). The CI job `windows` repeats all of it on Wind
 
 | Scope | Result |
 |---|---|
-| Control-plane Go suites built for `windows/amd64` (Wine) | 123 passed, 0 failed, incl. the 6 PostgreSQL cluster tests; skipped: UDP syslog (Wine lacks `SIO_UDP_CONNRESET`), the logrotate rename test (impossible on Windows by design), the cross-language token test |
+| Control-plane Go suites built for `windows/amd64` (Wine) | 268 passed, 0 failed, incl. the PostgreSQL cluster tests; 10 skipped: UDP syslog (Wine lacks `SIO_UDP_CONNRESET`), the logrotate rename test (impossible on Windows by design), tests that need Unix directory modes, symbolic links, bash or PowerShell inside the container, the cross-language token test |
 | `aegis-control-plane.exe` as console process | 19/19: bootstrap, policy set publish, data-plane bundle (key accepted/refused), enterprise CA on Windows paths, built-in audit rotation at 1 MB with delayed gzip compression, complete chain verification and export across generations, JSON log file, restart durability |
 | `aegis-control-plane.exe` as service under Wine's SCM | 10/10: `sc create` with the `service` argument, `net start` → `RUNNING`, login, `net stop` with drain and state flush, persistence, restart, exit code 0, invalid setting → `STOPPED` with exit code 1 |
-| Data-plane on python.org Windows CPython 3.12.10 (`win_amd64` wheels: mitmproxy 12.3.0, Brotli 1.2.1, YARA-X 1.22.0) | unit tests 51/51; proxy end to end 11/11 with the WinSW arguments: allowed HTTPS with a certificate issued by the enterprise CA, default deny with block page, method restriction, access log on a Windows path, heartbeat with YARA-X, flows at the control-plane |
+| Data-plane on python.org Windows CPython 3.12.10 (`win_amd64` wheels of the hash lock: mitmproxy 12.3.0, YARA-X 1.22.0, Brotli 1.2.1, tornado 6.6) | unit tests 94/94 (none skipped); proxy end to end 11/11 with the WinSW arguments: allowed HTTPS with a certificate issued by the enterprise CA, default deny with block page, method restriction, access log on a Windows path, heartbeat with YARA-X, flows at the control-plane |
 | Installers (Pester 5.9.1, PowerShell 7.5) | 183/183; PSScriptAnalyzer 1.25.0: 0 findings |
 
 Defects found this way and fixed (each with a regression test):
