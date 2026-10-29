@@ -54,6 +54,16 @@ jobs:
           python -m venv /tmp/audit
           /tmp/audit/bin/pip install -q --require-hashes --only-binary=:all: -r .github/requirements-audit.txt
           /tmp/audit/bin/pip-audit --path /tmp/dp/lib/python3*/site-packages
+      # The venv above holds only what Linux CPython 3.14 installs. The lock also pins packages for Windows (pydivert,
+      # mitmproxy-windows), macOS and CPython 3.12/3.13 (backports-zstd), and the console regression suite has its own
+      # lock: every pin of both, with the environment markers removed, is audited as well (still hash-locked).
+      - name: pip-audit (every pin of the data-plane and e2e locks, any platform or Python version)
+        run: |
+          for lock in data-plane/requirements-lock.txt frontend/e2e/requirements.txt; do
+            sed -E '/^[^#]/ s/ *;[^\\]*( \\)$/\1/' "$lock" > "$RUNNER_TEMP/all-pins.txt"
+            if grep -qE '^[A-Za-z0-9][^#]*;' "$RUNNER_TEMP/all-pins.txt"; then echo "::error::$lock: environment marker left"; exit 1; fi
+            /tmp/audit/bin/pip-audit --disable-pip --require-hashes -r "$RUNNER_TEMP/all-pins.txt"
+          done
       - name: cross-language block token
         run: |
           TOK=$(python -I -c "import sys; sys.path.insert(0,'data-plane'); from aegis_dp.controlplane import sign_block_token; print(sign_block_token('k'*40, {'ip':'10.1.0.5','url':'https://x.example/ü','m':'GET','tid':'t'}))")

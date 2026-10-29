@@ -54,7 +54,9 @@ Trivy scanner image, the BuildKit image and the charts/manifests downloaded by t
 by digest or SHA-256. Pull requests fail on fixable critical/high vulnerabilities in any of the four images.
 The data-plane image ships without pip/setuptools. `data-plane/requirements-lock.txt` pins every Python
 dependency of the data-plane (including transitive ones) with SHA-256 hashes; the Linux installer installs from
-it with `--require-hashes` by default, and the CI audit runs pip-audit (itself installed hash-locked) against it.
+it with `--require-hashes` by default, and the CI audit runs pip-audit (itself installed hash-locked) against the
+installed environment and against every pin of the lock, including the Windows, macOS and CPython 3.12/3.13-only
+entries, and of the console regression suite's lock (`frontend/e2e/requirements.txt`).
 Where mitmproxy's version bounds exclude a security fix of a dependency, `data-plane/requirements-security.txt`
 installs the fixed release (currently Brotli 1.2.1, CVE-2026-111497) in the image, in both installers and in the
 lock.
