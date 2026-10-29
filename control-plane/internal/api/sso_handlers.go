@@ -237,6 +237,8 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 			code = "not_authorized"
 		} else if errors.Is(err, store.ErrSSOUserDisabled) {
 			code = "account_disabled"
+		} else if errors.Is(err, store.ErrSSOLinkConflict) {
+			code = "account_link"
 		}
 		s.ssoFail(w, r, code, err.Error())
 		return

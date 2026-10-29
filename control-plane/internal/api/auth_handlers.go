@@ -52,7 +52,8 @@ func (s *Server) getClaims(r *http.Request) (*auth.TokenClaims, bool, error) {
 
 // csrfOK protects cookie-authenticated state-changing requests. Browsers cannot attach the
 // custom X-Requested-With header cross-origin without a CORS preflight (which we deny), and the
-// session cookie is SameSite=Strict.
+// session cookie is SameSite=Strict. An Origin header must name an allowed origin: "null" (sandboxed
+// frames, data: documents, some redirects) and unparsable values count as cross-site.
 func (s *Server) csrfOK(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -61,9 +62,10 @@ func (s *Server) csrfOK(r *http.Request) bool {
 	if r.Header.Get("X-Requested-With") == "" {
 		return false
 	}
-	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+	if _, sent := r.Header["Origin"]; sent {
+		origin := r.Header.Get("Origin")
 		u, err := url.Parse(origin)
-		if err != nil {
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			return false
 		}
 		if u.Host == r.Host {
@@ -151,7 +153,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// Emergency access must survive an attacker who knows the name: failures lock the account only
 		// for their own source, and account-wide only for a short, bounded time under a sustained flood.
 		perSource := acctKey + "@" + src.label
-		keys = append(keys, auth.Key{Name: perSource}, auth.Key{Name: acctKey, Factor: breakGlassFactor, MaxLock: breakGlassMaxLock})
+		keys = append(keys, auth.Key{Name: perSource, Shed: src.proxy != ""}, auth.Key{Name: acctKey, Factor: breakGlassFactor, MaxLock: breakGlassMaxLock})
 		reset = append(reset, perSource)
 	} else {
 		keys = append(keys, auth.Key{Name: acctKey})

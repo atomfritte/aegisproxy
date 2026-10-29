@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net/mail"
 	"net/url"
 	"regexp"
@@ -171,6 +172,18 @@ func ValidateBlockPageTemplate(t *models.BlockPageTemplate) error {
 	}
 	if !slices.Contains(tplLocale, t.DefaultLocale) {
 		return fmt.Errorf("default_locale must be one of %v", tplLocale)
+	}
+	// "%%" delimits the placeholders the data-plane fills in (%%AEGIS:<key>%%).
+	texts := map[string]string{"name": t.Name, "company_name": t.CompanyName, "title": t.Title, "message": t.Message,
+		"threat_message": t.ThreatMessage, "footer_text": t.FooterText, "cli_header": t.CLIHeader, "cli_footer": t.CLIFooter,
+		"support.label": sc.Label, "support.email": sc.Email, "support.phone": sc.Phone, "support.url": sc.URL}
+	for i, l := range t.Links {
+		texts[fmt.Sprintf("links[%d].label", i)], texts[fmt.Sprintf("links[%d].url", i)] = l.Label, l.URL
+	}
+	for _, field := range slices.Sorted(maps.Keys(texts)) {
+		if strings.Contains(texts[field], "%%") {
+			return fmt.Errorf(`%s must not contain "%%%%"`, field)
+		}
 	}
 	return nil
 }

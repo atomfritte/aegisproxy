@@ -2,6 +2,8 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net"
 	"net/http"
@@ -11,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"aegisproxy/control-plane/internal/auth"
 )
 
 type statusRecorder struct {
@@ -170,7 +170,7 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // clientIP returns the TCP peer, or the right-most untrusted X-Forwarded-For hop when the peer
-// is a configured trusted reverse proxy.
+// is a configured trusted reverse proxy (that sends the proxy secret, when one is configured).
 func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
@@ -181,7 +181,7 @@ func (s *Server) clientIP(r *http.Request) string {
 		return host
 	}
 	peer = peer.Unmap()
-	if !s.isTrustedProxy(peer) {
+	if !s.isTrustedProxy(peer) || !s.proxySecretOK(r, peer) {
 		return peer.String()
 	}
 	xff := r.Header.Values("X-Forwarded-For")
@@ -208,12 +208,41 @@ func (s *Server) isTrustedProxy(a netip.Addr) bool {
 	return s.proxyHosts.contains(a)
 }
 
-// rateLimiter is a fixed-window per-key limiter with bounded memory.
+// proxyAuthHeader carries AEGIS_TRUSTED_PROXY_SECRET from the trusted reverse proxies.
+const proxyAuthHeader = "X-Aegis-Proxy-Auth"
+
+// proxySecretOK reports whether a request from a trusted peer may assert the client address: always
+// without a configured proxy secret, otherwise only with exactly that secret in X-Aegis-Proxy-Auth. Other
+// local accounts share the proxy's address (loopback, a bridge gateway) but not the secret; their
+// forwarding headers are ignored and the peer counts as the client.
+func (s *Server) proxySecretOK(r *http.Request, peer netip.Addr) bool {
+	if s.cfg.TrustedProxySecret == "" {
+		return true
+	}
+	got := r.Header.Values(proxyAuthHeader)
+	want := sha256.Sum256([]byte(s.cfg.TrustedProxySecret))
+	var have [sha256.Size]byte
+	if len(got) == 1 {
+		have = sha256.Sum256([]byte(strings.TrimSpace(got[0])))
+	}
+	if len(got) == 1 && subtle.ConstantTimeCompare(have[:], want[:]) == 1 {
+		return true
+	}
+	if _, forwarded := forwardedClient(r.Header); forwarded && !s.proxySecretWarned.Swap(true) {
+		s.log.Warn("forwarding headers from a trusted proxy address without the proxy secret are ignored: configure the proxy to send "+
+			proxyAuthHeader+" with AEGIS_TRUSTED_PROXY_SECRET (deploy/nginx/aegis-console.conf)", "peer", peer.String())
+	}
+	return false
+}
+
+// rateLimiter is a fixed-window per-key limiter with bounded memory: expired windows are swept once per
+// window, and at most maxRateKeys keys are tracked.
 type rateLimiter struct {
-	mu     sync.Mutex
-	limit  int
-	window time.Duration
-	hits   map[string]*rlEntry
+	mu        sync.Mutex
+	limit     int
+	window    time.Duration
+	hits      map[string]*rlEntry
+	lastSweep time.Time
 }
 
 type rlEntry struct {
@@ -221,38 +250,76 @@ type rlEntry struct {
 	count int
 }
 
+// maxRateKeys bounds the keys of one rate limiter; overflowKey is shared by the clients a full limiter
+// does not track (with the per-proxy ceiling as its limit).
+const (
+	maxRateKeys = 100_000
+	overflowKey = "overflow|"
+)
+
 func newRateLimiter(limit int, window time.Duration) *rateLimiter {
 	return &rateLimiter{limit: limit, window: window, hits: make(map[string]*rlEntry)}
 }
 
-func (l *rateLimiter) Allow(key string) bool { return l.allow(key, l.limit) }
+func (l *rateLimiter) Allow(key string) bool { return l.allowSource(throttleSource{label: key}) }
 
 // allowSource limits one client. Behind a forwarding proxy that is not trusted, the key is the proxy and the
 // client it claims (one client cannot use up the limit of everybody behind the proxy), and everything behind
-// that proxy shares auth.FactorProxy times the limit (inventing client addresses does not lift it).
+// that proxy shares publicProxyFactor times the limit (inventing client addresses does not lift it further).
+// A full limiter counts claimed clients it does not track against the proxy only.
 func (l *rateLimiter) allowSource(src throttleSource) bool {
-	return l.allow(src.label, l.limit) && (src.proxy == "" || l.allow("proxy|"+src.proxy, l.limit*auth.FactorProxy))
-}
-
-func (l *rateLimiter) allow(key string, limit int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.hits) > 20_000 {
-		for k, e := range l.hits {
-			if now.Sub(e.start) > l.window {
-				delete(l.hits, k)
-			}
+	l.sweepLocked(now)
+	ceiling := l.limit * publicProxyFactor
+	var proxy *rlEntry
+	if src.proxy != "" {
+		if proxy = l.entryLocked("proxy|"+src.proxy, now, true); proxy.count >= ceiling {
+			return false
 		}
 	}
-	e := l.hits[key]
-	if e == nil || now.Sub(e.start) > l.window {
-		l.hits[key] = &rlEntry{start: now, count: 1}
-		return true
+	client := l.entryLocked(src.label, now, false)
+	limit := l.limit
+	if client == nil && proxy == nil {
+		client, limit = l.entryLocked(overflowKey, now, true), ceiling
 	}
-	if e.count >= limit {
-		return false
+	if client != nil {
+		if client.count >= limit {
+			return false
+		}
+		client.count++
 	}
-	e.count++
+	if proxy != nil {
+		proxy.count++
+	}
 	return true
+}
+
+// entryLocked returns the current window of key. A new key is added only while the limiter has room,
+// unless force is set (nil otherwise).
+func (l *rateLimiter) entryLocked(key string, now time.Time, force bool) *rlEntry {
+	e := l.hits[key]
+	if e == nil {
+		if !force && len(l.hits) >= maxRateKeys {
+			return nil
+		}
+		e = &rlEntry{start: now}
+		l.hits[key] = e
+	} else if now.Sub(e.start) > l.window {
+		e.start, e.count = now, 0
+	}
+	return e
+}
+
+func (l *rateLimiter) sweepLocked(now time.Time) {
+	if len(l.hits) <= 1024 || now.Sub(l.lastSweep) < l.window {
+		return
+	}
+	l.lastSweep = now
+	for k, e := range l.hits {
+		if now.Sub(e.start) > l.window {
+			delete(l.hits, k)
+		}
+	}
 }

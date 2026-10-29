@@ -1,4 +1,5 @@
 // Helpers for the live traffic page: verdict classes, filter values, links and copy snippets.
+import { shellQuote } from '../../../lib/shell';
 import type { FlowVerdict, TrafficFlow } from '../../../types';
 import type { Tone } from '../../../ui';
 
@@ -196,16 +197,14 @@ export function portalUrl(f: Pick<TrafficFlow, 'server_ip' | 'full_url' | 'id' |
   return `/?${p.toString()}`;
 }
 
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
 /** curl command that repeats the request through the proxy (run it on the server). */
 export function curlCommand(f: Pick<TrafficFlow, 'method' | 'full_url' | 'user_agent'>, proxyAddress?: string): string {
   const parts = ['curl -sS'];
   parts.push(f.method === 'HEAD' ? '-I' : '-o /dev/null -w "%{http_code}\\n"');
   if (proxyAddress) parts.push(`-x ${shellQuote(proxyAddress.includes('://') ? proxyAddress : `http://${proxyAddress}`)}`);
-  if (f.method && !['GET', 'HEAD', 'CONNECT'].includes(f.method)) parts.push(`-X ${f.method}`);
+  // The method is chosen by the workload that sent the request: quote it like every other value (an HTTP
+  // token may contain ` | $ & and other shell metacharacters).
+  if (f.method && !['GET', 'HEAD', 'CONNECT'].includes(f.method)) parts.push(`-X ${shellQuote(f.method)}`);
   parts.push(shellQuote(f.full_url));
   return parts.join(' ');
 }

@@ -24,6 +24,9 @@ import (
 
 const minSecretLen = 32
 
+// proxySecretChars may appear in AEGIS_TRUSTED_PROXY_SECRET: it is a header value in proxy configurations.
+const proxySecretChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~+/="
+
 type Config struct {
 	ListenAddr string
 	CertsDir   string
@@ -78,7 +81,11 @@ type Config struct {
 	// addresses are trusted like TrustedProxies. Names with a dot are resolved as absolute names (never
 	// below the DNS search domains); stored without the trailing dot.
 	TrustedProxyHosts []string
-	InternalSuffix    []string
+	// TrustedProxySecret (AEGIS_TRUSTED_PROXY_SECRET) is sent by the trusted proxies in X-Aegis-Proxy-Auth.
+	// When set, forwarding headers count only from trusted peers that send it: an address such as loopback
+	// or a bridge gateway is shared by every local account, the secret only by the proxy.
+	TrustedProxySecret string
+	InternalSuffix     []string
 
 	MetricsToken string
 
@@ -272,6 +279,12 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("AEGIS_TRUSTED_PROXY_HOSTS: invalid host name %q", h)
 		}
 		c.TrustedProxyHosts = append(c.TrustedProxyHosts, h)
+	}
+	if c.TrustedProxySecret, err = readSecret("AEGIS_TRUSTED_PROXY_SECRET"); err != nil {
+		return nil, err
+	}
+	if s := c.TrustedProxySecret; s != "" && (len(s) < minSecretLen || strings.Trim(s, proxySecretChars) != "" || isKnownLeakedSecret(s)) {
+		return nil, fmt.Errorf("AEGIS_TRUSTED_PROXY_SECRET must be at least %d characters of letters, digits and -._~+/= (openssl rand -hex 32)", minSecretLen)
 	}
 	for i, s := range c.InternalSuffix {
 		s = strings.ToLower(s)

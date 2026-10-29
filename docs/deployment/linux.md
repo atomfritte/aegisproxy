@@ -185,6 +185,7 @@ references a removed credential).
 | `bootstrap-admin-password` | `AEGIS_BOOTSTRAP_ADMIN_PASSWORD_FILE` | initial super-admin password |
 | `metrics-token` | `AEGIS_METRICS_TOKEN_FILE` | bearer token for `/metrics` |
 | `tls.crt`, `tls.key` | `AEGIS_TLS_CERT_FILE`, `AEGIS_TLS_KEY_FILE` | native HTTPS without nginx |
+| `trusted-proxy-secret` | `AEGIS_TRUSTED_PROXY_SECRET_FILE` | secret nginx sends in `X-Aegis-Proxy-Auth` (generated on new installations, `--proxy-secret` on existing ones) |
 
 After adding or removing a file, re-run the installer (it regenerates the drop-in) - `LoadCredential=` fails
 the unit if a referenced file is missing.
@@ -240,6 +241,16 @@ AEGIS_PUBLIC_URL=https://aegis.corp.example
 AEGIS_LISTEN_ADDR=127.0.0.1:8081
 AEGIS_TRUSTED_PROXIES=127.0.0.1/32,::1/128
 ```
+
+**Proxy secret.** Loopback is shared by every local account: trusting it alone lets any local user choose
+the client address the control-plane sees (CIDR-bound API keys, sign-in throttling, audit entries). The
+installer therefore trusts loopback only together with a proxy secret: it generates
+`/etc/aegis/secrets/trusted-proxy-secret` (passed as `AEGIS_TRUSTED_PROXY_SECRET_FILE`) and
+`/etc/aegis/nginx-proxy-auth.conf` (root 0600), which `aegis-console.conf` includes to send the secret in
+`X-Aegis-Proxy-Auth`. Requests through an nginx without the include are attributed to `127.0.0.1`. Existing
+installations get both with `install-linux.sh --proxy-secret`; add the include to your nginx configuration
+before reloading it. With nginx on another host (or a cluster), copy `nginx-proxy-auth.conf` to the nginx host
+and the same `trusted-proxy-secret` to every control-plane node.
 
 The nginx configuration enforces TLS 1.2/1.3 with Mozilla *intermediate* ciphers, HSTS, `client_max_body_size 16m`,
 `X-Forwarded-For`/`X-Forwarded-Proto`, disables buffering for the SSE stream `/api/flows/stream`
@@ -502,7 +513,7 @@ sudo systemd-run --pty --uid=aegis --gid=aegis -p EnvironmentFile=/etc/aegis/con
 ## 15. Security hardening checklist
 
 - [ ] `AEGIS_PUBLIC_URL` is `https://`; nginx (or native TLS) with a PKI certificate; HSTS active.
-- [ ] `AEGIS_LISTEN_ADDR=127.0.0.1:8081` behind a local nginx; `AEGIS_TRUSTED_PROXIES` lists exactly the proxies/LBs.
+- [ ] `AEGIS_LISTEN_ADDR=127.0.0.1:8081` behind a local nginx; `AEGIS_TRUSTED_PROXIES` lists exactly the proxies/LBs, and loopback only together with the proxy secret (nginx includes `/etc/aegis/nginx-proxy-auth.conf`).
 - [ ] Admin password changed, password files removed, personal accounts with least privilege, `AEGIS_DEMO_MODE=false`.
 - [ ] `/etc/aegis/secrets` 0700 and files 0600 root; `/etc/aegis/ca/mitmproxy-ca.pem` 0600 root; no secrets in `*.env`.
 - [ ] Units unchanged or changed only via drop-ins; `systemd-analyze security aegis-control-plane aegis-dataplane` reviewed.

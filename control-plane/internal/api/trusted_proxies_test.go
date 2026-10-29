@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
@@ -130,6 +133,84 @@ func TestTrustedProxyHostsExpireWhileLookupsFail(t *testing.T) {
 	st := p.hostStatus()
 	if len(st) != 2 || st[0].addrs != 0 || st[1].addrs != 1 || st[1].age < 0 {
 		t.Fatalf("host status %+v", st)
+	}
+}
+
+// DEPLOY-1: loopback (or a bridge gateway) is shared by every local account. With AEGIS_TRUSTED_PROXY_SECRET
+// forwarding headers count only from trusted peers that send the secret; other local users are identified
+// as the peer itself (also for throttling, without the untrusted-proxy fallback keyed on their claims).
+func TestProxySecretRequiredFromTrustedPeers(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	s := &Server{cfg: &config.Config{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, TrustedProxySecret: secret}}
+	s.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	req := func(peer string, auth ...string) *http.Request {
+		r := httptest.NewRequest("POST", "/api/auth/login", nil)
+		r.RemoteAddr = peer
+		r.Header.Set("X-Forwarded-For", "10.20.30.7")
+		for _, a := range auth {
+			r.Header.Add(proxyAuthHeader, a)
+		}
+		return r
+	}
+	cases := []struct {
+		name, client string
+		r            *http.Request
+	}{
+		{"local user without the secret", "127.0.0.1", req("127.0.0.1:40000")},
+		{"wrong secret", "127.0.0.1", req("127.0.0.1:40000", secret+"x")},
+		{"secret prefix", "127.0.0.1", req("127.0.0.1:40000", secret[:16])},
+		{"secret sent twice", "127.0.0.1", req("127.0.0.1:40000", secret, secret)},
+		{"the proxy", "10.20.30.7", req("127.0.0.1:40000", secret)},
+		{"untrusted peer with the secret", "192.0.2.5", req("192.0.2.5:40000", secret)},
+	}
+	for _, c := range cases {
+		if got := s.clientIP(c.r); got != c.client {
+			t.Errorf("%s: client %s, want %s", c.name, got, c.client)
+		}
+	}
+	if src := s.throttleSource(req("127.0.0.1:40000")); src.label != "127.0.0.1" || src.proxy != "" {
+		t.Errorf("local user without the secret is throttled as %+v, want the peer", src)
+	}
+	if src := s.throttleSource(req("127.0.0.1:40000", secret)); src.label != "10.20.30.7" || src.proxy != "" {
+		t.Errorf("client of the proxy is throttled as %+v", src)
+	}
+	s.cfg.TrustedProxySecret = ""
+	if got := s.clientIP(req("127.0.0.1:40000")); got != "10.20.30.7" {
+		t.Errorf("without a configured secret the trusted peer asserts the client: %s", got)
+	}
+}
+
+// DEPLOY-1: the posture report warns when loopback or a broad range is trusted without the proxy secret.
+func TestTrustedProxyPosture(t *testing.T) {
+	status := func(secret string, hosts []string, prefixes ...string) string {
+		s := &Server{cfg: &config.Config{TrustedProxySecret: secret, TrustedProxyHosts: hosts}}
+		for _, p := range prefixes {
+			s.cfg.TrustedProxies = append(s.cfg.TrustedProxies, netip.MustParsePrefix(p))
+		}
+		var got string
+		s.trustedProxyPostureCheck(func(id, _, _, st, _, _, _ string) {
+			if id == "trusted-proxies" {
+				got = st
+			}
+		})
+		return got
+	}
+	for _, c := range []struct {
+		want, secret string
+		hosts        []string
+		prefixes     []string
+	}{
+		{"pass", "", nil, nil},
+		{"warn", "", nil, []string{"127.0.0.1/32", "::1/128"}},
+		{"warn", "", nil, []string{"10.0.0.0/8"}},
+		{"warn", "", nil, []string{"fd00::/32"}},
+		{"pass", "", nil, []string{"10.96.4.12/32"}},
+		{"pass", "", []string{"ingress.ingress-nginx.svc.cluster.local"}, nil},
+		{"pass", "0123456789abcdef0123456789abcdef", nil, []string{"127.0.0.1/32"}},
+	} {
+		if got := status(c.secret, c.hosts, c.prefixes...); got != c.want {
+			t.Errorf("%v %v secret=%t: %s, want %s", c.prefixes, c.hosts, c.secret != "", got, c.want)
+		}
 	}
 }
 

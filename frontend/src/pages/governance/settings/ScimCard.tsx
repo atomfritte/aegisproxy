@@ -231,8 +231,8 @@ export const ScimCard: React.FC<{ provider: SsoProvider; mappedGroups: number }>
                     base URL, Secret Token = a token from here, <span className="text-fg">Test Connection</span>.
                   </li>
                   <li>
-                    Mappings: keep userName ← userPrincipalName; map <code className="font-mono text-fg">externalId</code> ← <code className="font-mono text-fg">objectId</code> so that the
-                    first single sign-on (oid) lands on the provisioned account. Groups are matched by display name or object ID.
+                    Mappings: keep userName ← userPrincipalName; map <code className="font-mono text-fg">externalId</code> ← <code className="font-mono text-fg">objectId</code> (required):
+                    the first single sign-on links by the immutable ID (oid) only, never by user name. Groups are matched by display name or object ID.
                   </li>
                   <li>Assign the groups that are mapped to roles to the application, set the scope to “assigned users and groups” and start provisioning.</li>
                 </>
@@ -245,7 +245,8 @@ export const ScimCard: React.FC<{ provider: SsoProvider; mappedGroups: number }>
                   </li>
                   <li>
                     <span className="text-fg">To App</span>: enable Create Users, Update User Attributes and Deactivate Users; then <span className="text-fg">Push Groups</span> for every group mapped
-                    to a role.
+                    to a role. Other IdPs: send the user’s immutable ID (the token’s <code className="font-mono text-fg">sub</code>) as <code className="font-mono text-fg">externalId</code> — accounts are
+                    never linked by user name.
                   </li>
                 </>
               )}

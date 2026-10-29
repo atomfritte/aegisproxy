@@ -147,7 +147,9 @@ contextual escaping) into **shells** per template, locale (en, de) and variant (
 threat/quarantine block without). Request-specific values appear as placeholders (`%%AEGIS:url%%`). The shells
 travel in the policy bundle; on a block the worker picks the template of the server's first group that has one
 (else the default), selects the locale from `Accept-Language`, and fills the placeholders in a single pass with
-HTML-escaped values (control characters stripped for CLI text) and a fresh CSP nonce. If no shell is available
+HTML-escaped values (control characters stripped for CLI text) and a fresh CSP nonce. Only the nonce, the logo
+and the form's JSON data are inserted unescaped, and only in their own spot of the shell. Template texts may not
+contain `%%`, so they cannot add placeholders of their own. If no shell is available
 (older control-plane, rendering error) the worker falls back to its built-in page. The console preview uses the
 same renderer with sample data.
 

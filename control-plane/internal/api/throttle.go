@@ -12,11 +12,17 @@ import (
 
 // breakGlassFactor and breakGlassMaxLock bound the account-wide throttle of break-glass accounts: they
 // are locked per source address, and only a sustained flood from many sources (5 × 200 failures within
-// a lockout window) delays every sign-in, by at most one minute at a time.
+// a lockout window) delays every sign-in, by at most one minute at a time. The per-proxy ceiling is
+// capped the same way, as break-glass sign-ins behind that proxy depend on it as well.
 const (
 	breakGlassFactor  = 200
 	breakGlassMaxLock = time.Minute
 )
+
+// publicProxyFactor is the ceiling of the public rate limits for everything behind one forwarding peer
+// that is not trusted, as a multiple of the per-client limit. Any direct client can claim to be such a
+// proxy by sending X-Forwarded-For, so this is also how far it can lift its own limit.
+const publicProxyFactor = 5
 
 // throttleSource identifies the client of a failed authentication for throttling.
 //
@@ -24,8 +30,8 @@ const (
 // trusted reverse proxy (then clientIP is the forwarded address). Behind a reverse proxy that is not
 // trusted every client shares the proxy's address: keying on it alone would let one client lock out
 // everybody (including break-glass sign-ins and SCIM deprovisioning). The key then combines the proxy
-// with the client it claims, and a much higher per-proxy ceiling bounds spraying with invented
-// addresses.
+// with the client it claims, and a higher per-proxy ceiling bounds spraying with invented addresses.
+// IPv6 addresses are keyed on their /64, which a single host can fill with addresses of its own.
 type throttleSource struct {
 	label string // client address, or "<proxy>|<claimed client>"
 	proxy string // untrusted forwarding peer ("" when the client is attributable)
@@ -33,6 +39,9 @@ type throttleSource struct {
 
 func (s *Server) throttleSource(r *http.Request) throttleSource {
 	ip := s.clientIP(r)
+	if a, err := netip.ParseAddr(ip); err == nil {
+		ip = sourceKey(a)
+	}
 	peer, ok := peerAddr(r)
 	if !ok || s.isTrustedProxy(peer) {
 		return throttleSource{label: ip}
@@ -42,14 +51,27 @@ func (s *Server) throttleSource(r *http.Request) throttleSource {
 		return throttleSource{label: ip}
 	}
 	s.warnUntrustedProxy(peer)
-	return throttleSource{label: peer.String() + "|" + claimed, proxy: peer.String()}
+	return throttleSource{label: sourceKey(peer) + "|" + claimed, proxy: sourceKey(peer)}
 }
 
-// keys are the source dimensions of an attempt; prefix separates the throttled endpoints.
+// sourceKey is the throttling key of an address: IPv6 addresses count per /64.
+func sourceKey(a netip.Addr) string {
+	a = a.Unmap()
+	if a.Is6() {
+		if p, err := a.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return a.String()
+}
+
+// keys are the source dimensions of an attempt; prefix separates the throttled endpoints. The per-proxy
+// ceiling never locks longer than breakGlassMaxLock, and a full limiter keeps only that ceiling for
+// claimed clients it does not track yet.
 func (t throttleSource) keys(prefix string) []auth.Key {
-	keys := []auth.Key{{Name: prefix + "ip:" + t.label, Factor: auth.FactorSource}}
+	keys := []auth.Key{{Name: prefix + "ip:" + t.label, Factor: auth.FactorSource, Shed: t.proxy != ""}}
 	if t.proxy != "" {
-		keys = append(keys, auth.Key{Name: prefix + "proxy:" + t.proxy, Factor: auth.FactorProxy})
+		keys = append(keys, auth.Key{Name: prefix + "proxy:" + t.proxy, Factor: auth.FactorProxy, MaxLock: breakGlassMaxLock})
 	}
 	return keys
 }
@@ -67,7 +89,7 @@ func peerAddr(r *http.Request) (netip.Addr, bool) {
 }
 
 // forwardedClient returns the client a forwarding header claims (right-most entry, as the nearest
-// proxy appended it), normalized to an address; unparsable claims share one key.
+// proxy appended it), normalized to its sourceKey; unparsable claims share one key.
 func forwardedClient(h http.Header) (string, bool) {
 	var raw string
 	if v := strings.Join(h.Values("X-Forwarded-For"), ","); strings.TrimSpace(v) != "" {
@@ -90,10 +112,10 @@ func forwardedClient(h http.Header) (string, bool) {
 	}
 	raw = strings.Trim(strings.TrimSpace(raw), `"`)
 	if ap, err := netip.ParseAddrPort(raw); err == nil {
-		return ap.Addr().Unmap().String(), true
+		return sourceKey(ap.Addr()), true
 	}
 	if a, err := netip.ParseAddr(strings.Trim(raw, "[]")); err == nil {
-		return a.Unmap().String(), true
+		return sourceKey(a), true
 	}
 	return "unparsed", true
 }

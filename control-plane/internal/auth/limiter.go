@@ -14,6 +14,7 @@ type LoginLimiter struct {
 	entries   map[string]*loginAttempt
 	threshold int
 	maxLock   time.Duration
+	lastSweep time.Time
 }
 
 type loginAttempt struct {
@@ -24,18 +25,21 @@ type loginAttempt struct {
 }
 
 // Key is one throttling dimension of an attempt. Factor multiplies the account threshold (0 = 1);
-// MaxLock caps its lockout (0 = the limiter's maximum).
+// MaxLock caps its lockout (0 = the limiter's maximum). A full limiter skips a Shed key it does not
+// track yet (another key of the attempt bounds it, e.g. the per-proxy ceiling) and refuses attempts
+// that need any other new key.
 type Key struct {
 	Name    string
 	Factor  int
 	MaxLock time.Duration
+	Shed    bool
 }
 
 // Threshold factors of the keys used by the API.
 const (
 	FactorAccount = 1  // one account
 	FactorSource  = 4  // one client address: several operators can share one egress IP
-	FactorProxy   = 40 // every client behind one reverse proxy that is not trusted (ceiling against spraying)
+	FactorProxy   = 10 // every client behind one reverse proxy that is not trusted (ceiling against spraying)
 )
 
 // busyRetry is returned while the attempts in flight already reach a threshold (nothing is locked yet).
@@ -62,7 +66,8 @@ func (l *LoginLimiter) Begin(keys ...Key) (*Attempt, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	l.gcLocked(now)
+	l.sweepLocked(now)
+	full := len(l.entries) >= maxLimiterEntries
 	var wait time.Duration
 	for _, k := range keys {
 		if k.Name == "" {
@@ -70,6 +75,10 @@ func (l *LoginLimiter) Begin(keys ...Key) (*Attempt, time.Duration) {
 		}
 		e, ok := l.entries[k.Name]
 		if !ok {
+			if full && !k.Shed {
+				// Every entry is a lockout or an attempt in flight: refuse rather than forget one.
+				wait = max(wait, busyRetry)
+			}
 			continue
 		}
 		// After a lockout expired one attempt at a time may probe again; its failure locks longer.
@@ -87,6 +96,9 @@ func (l *LoginLimiter) Begin(keys ...Key) (*Attempt, time.Duration) {
 	a := &Attempt{l: l}
 	for _, k := range keys {
 		if k.Name == "" {
+			continue
+		}
+		if _, ok := l.entries[k.Name]; !ok && full && k.Shed {
 			continue
 		}
 		e := l.entryLocked(k.Name, now)
@@ -188,12 +200,22 @@ func (l *LoginLimiter) entryLocked(name string, now time.Time) *loginAttempt {
 	return e
 }
 
-const maxLimiterEntries = 50000
+const maxLimiterEntries = 100_000
 
-func (l *LoginLimiter) gcLocked(now time.Time) {
-	if len(l.entries) < 4096 {
+// sweepLocked forgets idle entries, at most once per minute (once per second while the limiter is
+// full), so a flood of new keys never makes every attempt scan the whole map.
+func (l *LoginLimiter) sweepLocked(now time.Time) {
+	if len(l.entries) <= 1024 {
 		return
 	}
+	interval := time.Minute
+	if len(l.entries) >= maxLimiterEntries {
+		interval = time.Second
+	}
+	if now.Sub(l.lastSweep) < interval {
+		return
+	}
+	l.lastSweep = now
 	idle := time.Hour
 	if len(l.entries) >= maxLimiterEntries/2 {
 		idle = 5 * time.Minute

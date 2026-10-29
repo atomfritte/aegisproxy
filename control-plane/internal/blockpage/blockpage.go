@@ -30,7 +30,8 @@ var Keys = []string{"status", "verdict", "reason", "server_hostname", "server_ip
 	"trace_id", "public_url", "portal_url", "suggested", "suggested_host", "nonce", "data_json", "logo", "cli_payload"}
 
 // RawKeys are inserted without HTML escaping: nonce (URL-safe random), data_json (JSON with "<"
-// escaped) and logo (validated data: URL, also checked by the data-plane).
+// escaped) and logo (validated data: URL, also checked by the data-plane). They stay raw only in their
+// own spot of the shell (nonce="…", id="aegis-data">…, src="…"); anywhere else they are escaped.
 var RawKeys = []string{"nonce", "data_json", "logo"}
 
 func ph(key string) string { return "%%AEGIS:" + key + "%%" }
@@ -51,20 +52,46 @@ var textVars = map[string]string{
 
 var varRe = regexp.MustCompile(`\{([a-z_]+)\}`)
 
+var percentRun = regexp.MustCompile(`%{2,}`)
+
+// literal neutralizes placeholder syntax in admin input: every run of "%" becomes one "%" (a single
+// "%%" → "%" replacement would turn "%%%AEGIS:x%%%" back into a placeholder).
+func literal(s string) string { return percentRun.ReplaceAllString(s, "%") }
+
+// literalTemplate applies literal to every text field of a template that ends up in a shell.
+func literalTemplate(t models.BlockPageTemplate) models.BlockPageTemplate {
+	for _, f := range []*string{&t.CompanyName, &t.Title, &t.Message, &t.ThreatMessage, &t.FooterText, &t.CLIHeader, &t.CLIFooter,
+		&t.Support.Label, &t.Support.Email, &t.Support.Phone, &t.Support.URL} {
+		*f = literal(*f)
+	}
+	links := make([]models.LinkItem, len(t.Links))
+	for i, l := range t.Links {
+		links[i] = models.LinkItem{Label: literal(l.Label), URL: literal(l.URL)}
+	}
+	t.Links = links
+	return t
+}
+
+var varMarkRe = regexp.MustCompile("\x00([a-z_]+)\x00")
+
 // expandText turns admin text into display text: "{hostname}" etc. become placeholders, "{company}"
-// the company name. Literal placeholder syntax in admin input is neutralized.
+// the company name. Literal placeholder syntax in admin input is neutralized, also where the company
+// name meets the text around it ("%{company}%"): variables are marked with NUL bytes (which admin
+// input cannot contain) until the text is literal.
 func expandText(text, company string) string {
-	text = strings.ReplaceAll(text, "%%", "%")
-	return varRe.ReplaceAllStringFunc(text, func(m string) string {
+	clean := func(s string) string { return literal(strings.ReplaceAll(s, "\x00", "")) }
+	company = clean(company)
+	text = varRe.ReplaceAllStringFunc(clean(text), func(m string) string {
 		name := m[1 : len(m)-1]
 		if name == "company" {
-			return strings.ReplaceAll(company, "%%", "%")
+			return company
 		}
-		if key, ok := textVars[name]; ok {
-			return ph(key)
+		if _, ok := textVars[name]; ok {
+			return "\x00" + name + "\x00"
 		}
 		return m
 	})
+	return varMarkRe.ReplaceAllStringFunc(literal(text), func(m string) string { return ph(textVars[m[1:len(m)-1]]) })
 }
 
 func paragraphs(text string) []string {
@@ -343,6 +370,7 @@ func scopeLabel(t strs, s string) string {
 
 // Render produces the shells of one template in one locale.
 func Render(t models.BlockPageTemplate, locale string) (Shells, error) {
+	t = literalTemplate(t) // the store refuses "%%" as well; no admin text may carry a placeholder into a shell
 	locale = normLocale(locale)
 	tr := strs{}
 	for k, v := range builtin[locale] {
@@ -460,34 +488,30 @@ func renderCLI(t models.BlockPageTemplate, tr strs, threat bool) string {
 // Substitution (reference implementation of the data-plane side, used for previews and tests)
 // ---------------------------------------------------------------------------
 
-var phRe = regexp.MustCompile(`%%AEGIS:([a-z_]+)%%`)
+// phRe matches a placeholder with the markup in front of it: raw values are inserted unescaped only in
+// the one context the shell puts them in (data_json contains quotes, which would break out of an attribute).
+var phRe = regexp.MustCompile(`(nonce="|src="|id="aegis-data">)?%%AEGIS:([a-z_]+)%%`)
 
-func isRaw(k string) bool {
-	for _, r := range RawKeys {
-		if r == k {
-			return true
-		}
-	}
-	return false
-}
+var rawContext = map[string]string{"nonce": `nonce="`, "data_json": `id="aegis-data">`, "logo": `src="`}
 
 // Fill substitutes values in one pass (values are never re-scanned).
 func Fill(shell string, values map[string]string, htmlMode bool) string {
 	return phRe.ReplaceAllStringFunc(shell, func(m string) string {
-		k := m[len("%%AEGIS:") : len(m)-2]
+		sub := phRe.FindStringSubmatch(m)
+		before, k := sub[1], sub[2]
 		v := values[k]
-		if htmlMode && !isRaw(k) {
-			return template.HTMLEscapeString(v)
+		if htmlMode && before != "" && rawContext[k] == before {
+			return before + v
 		}
-		if !htmlMode {
-			return strings.Map(func(r rune) rune {
-				if r < ' ' && r != '\n' || r == 0x7f {
-					return -1
-				}
-				return r
-			}, v)
+		if htmlMode {
+			return before + template.HTMLEscapeString(v)
 		}
-		return v
+		return before + strings.Map(func(r rune) rune {
+			if r < ' ' && r != '\n' || r == 0x7f {
+				return -1
+			}
+			return r
+		}, v)
 	})
 }
 

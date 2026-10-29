@@ -38,6 +38,11 @@ export function ssoErrorMessage(code: string): { title: string; text: string } {
   switch (code) {
     case 'account_disabled':
       return { title: 'Your account is disabled', text: 'Your account was disabled by an administrator. Contact your AegisProxy administrator.' };
+    case 'account_link':
+      return {
+        title: 'Your account could not be linked',
+        text: 'An account was provisioned for your user name, but its identifier does not match your sign-in. Ask your administrator to map the SCIM externalId to your immutable user ID in the identity provider.',
+      };
     case 'not_authorized':
       return {
         title: 'Your account has no AegisProxy role',
