@@ -140,7 +140,7 @@ Against real mitmproxy 12.3.0 with the 2.0 end-to-end state directory (schema 2,
 | | TLS without / with `ca_cert_pem`; `http://`, loopback and link-local URLs | verification error / success; all three URLs rejected |
 | | TAXII domain through the proxy | 403 at CONNECT, flow `THREAT_BLOCKED` with the feed as source |
 | Trivy (HIGH/CRITICAL, fixable) | all four images (`control-plane`, `control-plane-api`, `data-plane`, `console`) | 0 findings (mitmproxy base packages patched, among them msgpack 1.2.3 for CVE-2026-114613, pip/setuptools removed; console Alpine base upgraded) |
-| pip-audit | installed data-plane environment and every pin of the data-plane and console-suite locks | 0 findings after the Brotli 1.2.1 and tornado 6.6 overrides (CVE-2026-111497; CVE-2026-116577, -115927, -116578) |
+| pip-audit | installed data-plane environment, the 44 distributions in the built data-plane image (`scripts/audit-image-python.sh`) and every pin of the data-plane, image and console-suite locks | 0 findings after the Brotli 1.2.1 and tornado 6.6 overrides (CVE-2026-111497; CVE-2026-116577, -115927, -116578) |
 | Independent security review (1 critical, 8 high, 9 medium, ~14 low) | re-run of every proof of concept after the fixes | all blocked; regression tests added for each finding (Go and Python) |
 
 | MISP 2.5.50 (official misp-docker image, MariaDB, Valkey, TLS with a private CA) | MISP feed: wrong API key reported; IDS attributes imported via `/attributes/restSearch`; `domain|ip` split; non-IDS and deleted attributes skipped; lookups | 14/14 |
@@ -218,7 +218,7 @@ in-memory Windows model (Pester). The CI job `windows` repeats all of it on Wind
 | `aegis-control-plane.exe` as console process | 19/19: bootstrap, policy set publish, data-plane bundle (key accepted/refused), enterprise CA on Windows paths, built-in audit rotation at 1 MB with delayed gzip compression, complete chain verification and export across generations, JSON log file, restart durability |
 | `aegis-control-plane.exe` as service under Wine's SCM | 10/10: `sc create` with the `service` argument, `net start` → `RUNNING`, login, `net stop` with drain and state flush, persistence, restart, exit code 0, invalid setting → `STOPPED` with exit code 1 |
 | Data-plane on python.org Windows CPython 3.12.10 (`win_amd64` wheels of the hash lock: mitmproxy 12.3.0, YARA-X 1.22.0, Brotli 1.2.1, tornado 6.6) | unit tests 94/94 (none skipped); proxy end to end 11/11 with the WinSW arguments: allowed HTTPS with a certificate issued by the enterprise CA, default deny with block page, method restriction, access log on a Windows path, heartbeat with YARA-X, flows at the control-plane |
-| Installers (Pester 5.9.1, PowerShell 7.5, in-memory Windows model) | 405/405; PSScriptAnalyzer 1.25.0: 0 findings |
+| Installers (Pester 5.9.1, PowerShell 7.5, in-memory Windows model) | 436/436; PSScriptAnalyzer 1.25.0: 0 findings |
 
 Defects found this way and fixed (each with a regression test):
 
@@ -240,7 +240,7 @@ Defects found this way and fixed (each with a regression test):
   incomplete lock file).
 ### Adversarial review (2.1)
 
-Three rounds, each with fresh reviewers who attacked the code and a running installation from one attacker
+Four rounds, each with fresh reviewers who attacked the code and a running installation from one attacker
 model: a compromised server behind the proxy (egress bypass), a low-privileged console user, an unauthenticated
 client or a hostile IdP / SIEM endpoint (control plane), an insider with file or database access, a full disk or
 a crash (audit integrity), and a local user, a network attacker during installation or a supply-chain attacker
@@ -251,7 +251,8 @@ and the next round re-ran the earlier proofs of concept.
 |---|---|---|
 | 1 | 1 critical, 6 high, 17 medium, several low | Audit verification accepted unkeyed pre-2.1 hashes anywhere in the chain (rewrite without the key); the chain had no fixed start or end; the audit log followed symlinks and opened FIFOs; Team Leads read effective policies (with the proxy-token hash) and simulations of other groups; Windows installers adopted pre-existing `%ProgramData%` directories with planted keys or CA, and ran a user-writable base Python; Helm trusted all private ranges as proxies; secrets in export and notification errors |
 | 2 | 1 critical, 2 high, about 20 medium or low | One client could exhaust the shared inspection budget with announced but empty uploads, so other transfers passed unscanned (now a per-client share); CA installers checked the first certificate of the download but installed the whole file; default image names pointed to an unregistered Docker Hub namespace (now GHCR); Team Leads could change InfoSec BLOCK rules and see other groups' requests; a renamed SCIM group could gain roles; servers behind one NAT address shared redirect grants and learning sessions; long-lived connections outlived a revocation; the unkeyed legacy audit prefix was accepted without confirmation and a truncated tail went unnoticed; a full export queue dropped records |
-| 3 | 0 critical, 4 high, 19 medium or low | Below |
+| 3 | 0 critical, 4 high, 19 medium or low | Below (round 3) |
+| 4 | 0 critical, 3 high, 4 medium, 4 low | Below (round 4) |
 
 Round 3 in detail (all fixed):
 
@@ -271,3 +272,20 @@ Round 3 in detail (all fixed):
 Held in round 3 (attacked without success): OIDC signature, algorithm and claim checks, state / PKCE, open
 redirects, SCIM, CSRF, security headers, sessions, HTTP framing, revocation of long-lived connections, content
 inspection limits, block tokens, the audit anchor and checkpoint, and the hash-locked images.
+
+Round 4 in detail (all fixed):
+
+| Area | Finding | Fix |
+|---|---|---|
+| Control plane | RD4-1 (high): SCIM revived a deleted account by user name and kept its old SSO link, so the former user signed in to the account of the new person (a Super Admin in the proof of concept). RD4-2 (low): the first-sign-in link compared the subject case-insensitively (Unicode folding). RD4-3 (low): every Auditor could start any number of complete trail verifications at once | A deleted account is revived only on an exact SCIM external ID match; deleting or re-assigning it unlinks the SSO subject (`USER_UNLINKED_SSO`); SSO sign-in to a SCIM-managed account requires subject = external ID; exact comparison; one verification pass at a time, concurrent callers share its outcome |
+| Control plane | RD4-4 (low): the posture check "audit forwarded to a SIEM" stayed green when a sink for audit and traffic delivered traffic but every audit batch was rejected | Delivery is tracked per stream; the check passes only while audit records are delivered |
+| Egress | No exploitable defect. Hardened anyway: addresses in the SIIT prefix `::ffff:0:0:0/96` were classified by the IPv6 address | Classified by the embedded IPv4 address in both engines (shared vectors) |
+| Deployment | DEPLOY4-1 (high): the documented nginx configuration appended the client's `X-Forwarded-For`, and the control plane skipped the trusted loopback hop, so a local user could still forge the client address through nginx; posture reported pass. WIN4-1 (medium): the same in the IIS/ARR rule | nginx and ARR replace `X-Forwarded-For` with the address they see; the control plane never skips a loopback entry inside the header (it is the local client); the Linux installer warns about appending nginx configurations, posture about broad trusted ranges |
+| Deployment | WIN4-2 (high): the elevated Windows data-plane install honoured `%ProgramData%\pip\pip.ini` and `PIP_*` variables, which can point pip at another index. WIN4-3 (medium): secret files given to the installers (`-ProxySecretFile`, `-DataPlaneKeyFile`, …) were read without an ACL check | pip runs with `PIP_CONFIG_FILE=nul` and without inherited `PIP_*` variables (mirrors only through `-PipArgs`); secret input files must be owned by administrators, not readable or writable by users and not below a folder users can rename (no override) |
+| Deployment | Re-check of round 3: a release folder, or a folder above the program, data, site or Python directories, that non-administrators could change or rename let them swap files the elevated installer then used | The installers refuse such sources and parents (`-AllowWritableSource`, `-AllowWritableParent` to override) |
+| Dependencies | DEP4-1 / DEP4-2 (medium): untracked, hidden and git-ignored files from the checkout reached the images (a `vendor/` folder would bypass `go.sum`, a stray module could shadow data-plane code, an old `frontend/public/dist` ended up in the console). DEP4-3 (low): `pip-audit` covered the locks, not the packages installed in the image | The `.dockerignore` files allowlist exactly the tracked files (`scripts/gen-dockerignore.sh`, checked in CI); `make images` builds from `git archive` of a commit; Go builds use `-mod=readonly GOWORK=off`; `aegis_dp` accepts plain `.py` modules only; CI audits the data-plane image's `site-packages` (`scripts/audit-image-python.sh`) |
+
+Held in round 4: the proxy secret (missing, wrong, prefixed or duplicated header; constant-time comparison;
+never logged or forwarded), CSRF origin edge cases, endpoint authorization of the audit API, the earlier fixes
+R3-1 to R3-5 and N1, HTTP framing, revocation, inspection limits, the release workflow (apart from the
+repository settings), the Windows ACL and source checks, and DEP-1 to DEP-3.
