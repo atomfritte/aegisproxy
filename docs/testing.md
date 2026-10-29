@@ -139,8 +139,8 @@ Against real mitmproxy 12.3.0 with the 2.0 end-to-end state directory (schema 2,
 | OASIS TAXII 2.1 reference server (medallion 3.0, TLS with a private CA, Basic auth, page size 3) | feed import with pagination | 21/21: 7 active indicators (domain, URL, IPv4, SHA-256, OR-pattern) imported; revoked, expired, too old and non-STIX indicators skipped |
 | | TLS without / with `ca_cert_pem`; `http://`, loopback and link-local URLs | verification error / success; all three URLs rejected |
 | | TAXII domain through the proxy | 403 at CONNECT, flow `THREAT_BLOCKED` with the feed as source |
-| Trivy (HIGH/CRITICAL, fixable) | all four images (`control-plane`, `control-plane-api`, `data-plane`, `console`) | 0 findings (mitmproxy base packages patched, pip/setuptools removed; console Alpine base upgraded) |
-| pip-audit | installed data-plane environment | 0 findings after the Brotli 1.2.1 override (CVE-2026-111497) |
+| Trivy (HIGH/CRITICAL, fixable) | all four images (`control-plane`, `control-plane-api`, `data-plane`, `console`) | 0 findings (mitmproxy base packages patched, among them msgpack 1.2.3 for CVE-2026-114613, pip/setuptools removed; console Alpine base upgraded) |
+| pip-audit | installed data-plane environment and every pin of the data-plane and console-suite locks | 0 findings after the Brotli 1.2.1 and tornado 6.6 overrides (CVE-2026-111497; CVE-2026-116577, -115927, -116578) |
 | Independent security review (1 critical, 8 high, 9 medium, ~14 low) | re-run of every proof of concept after the fixes | all blocked; regression tests added for each finding (Go and Python) |
 
 | MISP 2.5.50 (official misp-docker image, MariaDB, Valkey, TLS with a private CA) | MISP feed: wrong API key reported; IDS attributes imported via `/attributes/restSearch`; `domain|ip` split; non-IDS and deleted attributes skipped; lookups | 14/14 |
@@ -165,10 +165,11 @@ for Endpoint / Microsoft Graph and Microsoft Sentinel / Azure Monitor Logs Inges
 | Target | Result |
 |---|---|
 | Docker Compose single host (`docker-compose.yml`) | 8/8: console + API on one origin, OpenAPI served, encryption at rest active, worker heartbeat with YARA engine, allowed HTTPS through the proxy, default deny |
+| Docker Compose HA (`deploy/compose/ha`: 2 control-planes, PostgreSQL, HAProxy, 2 workers, ClamAV, standalone console) | 9/9: sign-in through the console's nginx `/api` proxy and the load balancer, encryption at rest in postgres mode, both workers healthy, a policy set published through the console is visible on both replicas, allowed / denied HTTPS through the load-balanced workers, complete audit verification in cluster mode; `X-Forwarded-For` is honoured only from the load balancer and the console (spoofed values from the host ignored); the published Linux CA command installs the certificate in a fresh Ubuntu container and a wrong hash installs nothing |
 | Kubernetes 1.37 (kind, Cilium eBPF without kube-proxy) + CloudNativePG 1.30 (2 instances), 2 control-plane replicas, 2 workers, separate console | 9/9: login through the console's nginx `/api` proxy, replica-to-replica consistency, encryption active in postgres mode, both workers reporting, allowed/denied traffic through the NodePort, **100/100 writes** while a control-plane pod was deleted, complete audit trail verified from the database |
 | Linux installer (`install-linux.sh --component data-plane`) in Ubuntu 24.04 | venv with mitmproxy 12.3.0, YARA-X 1.22.0 and Brotli 1.2.1, addon import check, unit installed |
-| Console end-to-end (Playwright, Chrome) | 18/18 fleet/groups/requests/learning and 16/16 identity/security pages against the final backend; Team Lead need-to-know verified |
-| Helm | `helm lint` for all value combinations; the `PrometheusRule` alerts pass `promtool check rules` (9 rules) |
+| Console end-to-end (Playwright, Chrome; `frontend/e2e/run.sh`) | 19/19 fleet/groups/requests/learning, 16/16 identity/security pages and 12/12 Azure / Defender integration drawers against the final backend; Team Lead need-to-know verified |
+| Helm | `helm lint` and kubeconform for all value combinations (36 resources valid), exposure guard for an unrestricted proxy LoadBalancer; the `PrometheusRule` alerts pass `promtool check rules` (17 rules) and `promtool test rules` for the audit verification alerts |
 | NetworkPolicy enforcement (Cilium 1.20 eBPF, all policies on, `probes.mode=exec`) | 17/17 connectivity checks as intended (control-plane, ClamAV, PostgreSQL, console unreachable from other namespaces and unlabelled pods; proxy port open; data-plane egress to cluster ranges and cloud metadata blocked, internet open); `scripts/verify-networkpolicies.sh` 16/16; functional test 9/9 with policies enforced |
 
 
