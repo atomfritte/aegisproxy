@@ -67,4 +67,27 @@ function Set-WebConfigurationProperty {
     $global:FakeWin.Iis.Config["$PSPath|$Location|$Filter|$Name"] = $Value
 }
 
-Export-ModuleMember -Function New-WebAppPool, Start-WebAppPool, Get-Website, New-Website, Start-Website, Get-WebBinding, New-WebBinding, Set-WebConfigurationProperty
+# Collections (e.g. allowedServerVariables) live in $FakeWin.Iis.Collections["$PSPath|$Location|$Filter"] as a list of
+# hashtables; -Name Collection lists their entries like the real cmdlet.
+function Get-WebConfigurationProperty {
+    param([string]$PSPath, [string]$Location, [string]$Filter, [string]$Name)
+    if ($Name -eq 'Collection') {
+        $entries = $global:FakeWin.Iis.Collections["$PSPath|$Location|$Filter"]
+        if ($entries) { foreach ($e in $entries) { [pscustomobject]$e } }
+        return
+    }
+    $global:FakeWin.Iis.Config["$PSPath|$Location|$Filter|$Name"]
+}
+
+function Add-WebConfigurationProperty {
+    param([string]$PSPath, [string]$Location, [string]$Filter, [string]$Name, [hashtable]$Value)
+    $key = "$PSPath|$Location|$Filter"
+    if (-not $global:FakeWin.Iis.Collections.ContainsKey($key)) { $global:FakeWin.Iis.Collections[$key] = New-Object System.Collections.Generic.List[hashtable] }
+    foreach ($e in $global:FakeWin.Iis.Collections[$key]) {
+        if ($e.name -eq $Value.name) { throw "Cannot add duplicate collection entry of type 'add' with unique key attribute 'name' set to '$($Value.name)'" }
+    }
+    $global:FakeWin.Iis.Collections[$key].Add($Value)
+}
+
+Export-ModuleMember -Function New-WebAppPool, Start-WebAppPool, Get-Website, New-Website, Start-Website, Get-WebBinding, New-WebBinding,
+    Set-WebConfigurationProperty, Get-WebConfigurationProperty, Add-WebConfigurationProperty

@@ -18,6 +18,9 @@
       * generates missing secrets (32 random bytes, hex) into <DataRoot>\secrets and passes them to the
         service exclusively as AEGIS_*_FILE paths (the service environment in the registry is readable
         by local users, secret values never go there)
+      * trusts a loopback address in -TrustedProxies (IIS/ARR on this host) only together with the reverse-proxy
+        secret secrets\trusted-proxy-secret (AEGIS_TRUSTED_PROXY_SECRET_FILE): every local account can connect from
+        loopback, only the proxy that sends the secret in X-Aegis-Proxy-Auth may supply X-Forwarded-For
       * provisions the enterprise root CA with "aegis-control-plane gen-ca" if none exists; the CA private
         key (mitmproxy-ca.pem) is readable by SYSTEM/Administrators only - the control-plane only needs
         the public certificate, the data-plane receives its own copy of the key
@@ -35,7 +38,8 @@
       <InstallDir>\ui\                          web console       (optional, -UiDir)
       <DataRoot>\data\                          aegis_state.json(.bak), audit.jsonl, threat-intel cache
       <DataRoot>\certs\                         enterprise root CA (public certs; key restricted)
-      <DataRoot>\secrets\                       jwt.key, dataplane.key, encryption.key, database-url, tls-*.pem, ...
+      <DataRoot>\secrets\                       jwt.key, dataplane.key, encryption.key, database-url, tls-*.pem,
+                                                trusted-proxy-secret, ...
       <DataRoot>\logs\control-plane.log         AEGIS_LOG_FILE (stdout is discarded by the SCM)
 
 .PARAMETER BinaryPath
@@ -70,10 +74,23 @@
     Optional password for the bootstrap super admin "admin" (min. 12 characters). Without it the
     control-plane writes a random password to <DataRoot>\data\secrets\initial-admin-password.
 
+.PARAMETER TrustedProxies
+    AEGIS_TRUSTED_PROXIES - CIDRs (or addresses) of the reverse proxies / load balancers whose X-Forwarded-For is
+    trusted. List exactly their addresses. When one of them covers a loopback address (127.0.0.1/32 for IIS/ARR on
+    this host, ::1/128) the script also creates the proxy secret, see -ProxySecret.
+
+.PARAMETER ProxySecret
+    Creates secrets\trusted-proxy-secret (32 random bytes, hex) if it does not exist and passes it to the service as
+    AEGIS_TRUSTED_PROXY_SECRET_FILE: forwarding headers then count only from trusted proxies that send it in
+    X-Aegis-Proxy-Auth. Implied when -TrustedProxies covers a loopback address. Use it for a reverse proxy on another
+    host whose address is shared (NAT, a broad range), and copy the file to that proxy over a protected channel.
+    Install-AegisConsole-IIS.ps1 -ApiProxyTarget reads it on this host.
+
 .PARAMETER ImportSecretsDir
-    Cluster nodes 2..n: directory containing jwt.key, dataplane.key and encryption.key of the first node. All
-    control-plane replicas must use identical secrets. An SMB path (UNC or mapped drive) must use an encrypted
-    connection (New-SmbMapping -RequirePrivacy $true or a share with EncryptData), see -AllowUnencryptedImport.
+    Cluster nodes 2..n: directory containing jwt.key, dataplane.key and encryption.key (and trusted-proxy-secret, if
+    the first node has one) of the first node. All control-plane replicas must use identical secrets. An SMB path
+    (UNC or mapped drive) must use an encrypted connection (New-SmbMapping -RequirePrivacy $true or a share with
+    EncryptData), see -AllowUnencryptedImport.
 
 .PARAMETER CaSourceDir
     Cluster nodes 2..n: certs directory of the first node (the CA must be identical cluster-wide). Contains the
@@ -100,6 +117,12 @@
     .\Install-AegisControlPlane.ps1 -BinaryPath .\aegis-control-plane.exe `
         -PublicUrl https://aegis.corp.example:8081 -UiDir ..\..\frontend\dist `
         -TlsCertFile C:\pki\aegis.crt.pem -TlsKeyFile C:\pki\aegis.key.pem
+
+.EXAMPLE
+    # Console and API behind IIS on this host (then: Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081).
+    # Trusting loopback creates secrets\trusted-proxy-secret, which IIS sends in X-Aegis-Proxy-Auth.
+    .\Install-AegisControlPlane.ps1 -PublicUrl https://aegis.corp.example -ListenAddress 127.0.0.1:8081 `
+        -TrustedProxies 127.0.0.1/32 -SkipFirewall
 
 .EXAMPLE
     # Cluster node 2 (PostgreSQL storage, secrets + CA from node 1 over an encrypted SMB connection)
@@ -166,6 +189,10 @@ param(
     # AEGIS_TRUSTED_PROXIES: CIDRs of reverse proxies / load balancers.
     [Parameter(ParameterSetName = 'Install')]
     [string[]]$TrustedProxies,
+
+    # Creates secrets\trusted-proxy-secret (AEGIS_TRUSTED_PROXY_SECRET_FILE); implied by a loopback -TrustedProxies.
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$ProxySecret,
 
     # AEGIS_CORS_ORIGINS: origins of a separately hosted console.
     [Parameter(ParameterSetName = 'Install')]
@@ -235,7 +262,8 @@ $SidSystem       = '*S-1-5-18'                 # NT AUTHORITY\SYSTEM (locale ind
 $SidAdmins       = '*S-1-5-32-544'             # BUILTIN\Administrators
 $SidUsers        = '*S-1-5-32-545'             # BUILTIN\Users
 $PlainSecretVars = @('AEGIS_JWT_SECRET', 'AEGIS_DATAPLANE_KEY', 'AEGIS_BOOTSTRAP_ADMIN_PASSWORD',
-                     'AEGIS_METRICS_TOKEN', 'AEGIS_DATABASE_URL', 'AEGIS_ENCRYPTION_KEY', 'AEGIS_ENCRYPTION_KEY_PREVIOUS')
+                     'AEGIS_METRICS_TOKEN', 'AEGIS_DATABASE_URL', 'AEGIS_ENCRYPTION_KEY', 'AEGIS_ENCRYPTION_KEY_PREVIOUS',
+                     'AEGIS_TRUSTED_PROXY_SECRET')
 
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $DataRoot   = [System.IO.Path]::GetFullPath($DataRoot)
@@ -339,6 +367,34 @@ function Copy-WithRetry([string]$Source, [string]$Destination) {
 
 function Assert-NoControlChar([string]$Name, [string]$Value) {
     if ($Value -match '[\x00-\x1f]') { throw "$Name contains control characters." }
+}
+
+function Test-ProxySecret([string]$Value) {
+    # Same rule as the control-plane (AEGIS_TRUSTED_PROXY_SECRET): at least 32 characters of letters, digits and -._~+/=.
+    return [bool]($Value -and $Value.Length -ge 32 -and $Value -cmatch '^[A-Za-z0-9._~+/=-]+$')
+}
+
+function Test-LoopbackPrefix([string[]]$Cidr) {
+    # True when an entry of AEGIS_TRUSTED_PROXIES (CIDR or address, comma-separated) covers a loopback address:
+    # 127.0.0.0/8 or ::1, also through a wider prefix such as 0.0.0.0/0.
+    foreach ($entry in @($Cidr | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $text, $bitsText = $entry -split '/', 2
+        $addr = $null
+        if (-not [System.Net.IPAddress]::TryParse($text, [ref]$addr)) { continue }
+        $bytes = $addr.GetAddressBytes()
+        $bits = 8 * $bytes.Count
+        if ($bitsText -and -not [int]::TryParse($bitsText, [ref]$bits)) { continue }
+        if ($bits -lt 0 -or $bits -gt 8 * $bytes.Count) { continue }   # the control-plane refuses such an entry
+        if ($bytes.Count -eq 4) { $loopback = [byte[]](127, 0, 0, 1); $bits = [Math]::Min($bits, 8) }   # all of 127/8
+        else { $loopback = [System.Net.IPAddress]::IPv6Loopback.GetAddressBytes() }
+        $covers = $true
+        for ($i = 0; $i -lt $bits; $i++) {
+            $bit = 0x80 -shr ($i % 8)
+            if (($bytes[$i -shr 3] -band $bit) -ne ($loopback[$i -shr 3] -band $bit)) { $covers = $false; break }
+        }
+        if ($covers) { return $true }
+    }
+    return $false
 }
 
 function Show-LogTail {
@@ -605,7 +661,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Uninstall') {
 $ManagedKeys = @('CONTROL_PLANE_PORT', 'AEGIS_LISTEN_ADDR', 'AEGIS_PUBLIC_URL', 'AEGIS_DASHBOARD_URL', 'AEGIS_PROXY_ADDRESS', 'DATA_DIR',
     'CERTS_DIR', 'AEGIS_STORAGE', 'AEGIS_DATABASE_URL_FILE', 'AEGIS_JWT_SECRET_FILE', 'AEGIS_DATAPLANE_KEY_FILE', 'AEGIS_ENCRYPTION_KEY_FILE',
     'AEGIS_BOOTSTRAP_ADMIN_PASSWORD_FILE', 'AEGIS_METRICS_TOKEN_FILE', 'AEGIS_TLS_CERT_FILE', 'AEGIS_TLS_KEY_FILE',
-    'AEGIS_UI_DIR', 'AEGIS_TRUSTED_PROXIES', 'AEGIS_CORS_ORIGINS', 'AEGIS_LOG_FILE', 'AEGIS_LOG_FORMAT', 'AEGIS_DEMO_MODE')
+    'AEGIS_UI_DIR', 'AEGIS_TRUSTED_PROXIES', 'AEGIS_TRUSTED_PROXY_SECRET_FILE', 'AEGIS_CORS_ORIGINS', 'AEGIS_LOG_FILE',
+    'AEGIS_LOG_FORMAT', 'AEGIS_DEMO_MODE')
 $previousEnv = [ordered]@{}
 $prevProp = Get-ItemProperty -Path $ServiceKey -Name 'Environment' -ErrorAction SilentlyContinue
 if ($prevProp) {
@@ -642,6 +699,15 @@ if ($ExtraEnvironment) {
         }
         Assert-NoControlChar $key ([string]$ExtraEnvironment[$key])
     }
+}
+# A reverse proxy on this host (IIS/ARR) connects from loopback, which every local account shares: loopback is trusted
+# only together with the proxy secret that the proxy sends in X-Aegis-Proxy-Auth.
+$trustedEffective = @($TrustedProxies)
+if ($ExtraEnvironment -and $ExtraEnvironment.ContainsKey('AEGIS_TRUSTED_PROXIES')) { $trustedEffective = @([string]$ExtraEnvironment['AEGIS_TRUSTED_PROXIES']) }
+$loopbackTrusted = Test-LoopbackPrefix $trustedEffective
+if ($loopbackTrusted -and $ExtraEnvironment -and $ExtraEnvironment.ContainsKey('AEGIS_TRUSTED_PROXY_SECRET_FILE') -and
+    -not [string]$ExtraEnvironment['AEGIS_TRUSTED_PROXY_SECRET_FILE']) {
+    throw 'AEGIS_TRUSTED_PROXIES trusts a loopback address: AEGIS_TRUSTED_PROXY_SECRET_FILE cannot be removed (every local account could choose its client address).'
 }
 
 # --- binary ------------------------------------------------------------------------------------------
@@ -754,21 +820,29 @@ $bootstrapFile = Join-Path $SecretsDir 'bootstrap-admin-password'
 $metricsFile   = Join-Path $SecretsDir 'metrics.token'
 $tlsCertTarget = Join-Path $SecretsDir 'tls-cert.pem'
 $tlsKeyTarget  = Join-Path $SecretsDir 'tls-key.pem'
+$proxySecretFile = Join-Path $SecretsDir 'trusted-proxy-secret'
+$proxySecretNew  = $false
 
 if ($PSCmdlet.ShouldProcess($SecretsDir, 'Import/generate secrets')) {
     if ($ImportSecretsDir) {
-        foreach ($name in @('jwt.key', 'dataplane.key', 'encryption.key')) {
+        $imported = @()
+        foreach ($name in @('jwt.key', 'dataplane.key', 'encryption.key', 'trusted-proxy-secret')) {
             $src = Join-Path $ImportSecretsDir $name
             $value = Read-SecretFile $src
-            if (-not $value -or $value.Length -lt 32) { throw "$src is missing or shorter than 32 characters." }
+            if ($name -eq 'trusted-proxy-secret') {
+                if (-not $value) { continue }   # optional: only when the first node has one
+                if (-not (Test-ProxySecret $value)) { throw "$src is not a valid proxy secret (at least 32 characters of letters, digits and -._~+/=)." }
+            }
+            elseif (-not $value -or $value.Length -lt 32) { throw "$src is missing or shorter than 32 characters." }
             $dst = Join-Path $SecretsDir $name
             $existing = Read-SecretFile $dst
             if ($existing -and $existing -ne $value -and -not $Force) {
-                throw "$dst exists with a different value. Re-run with -Force to replace it (invalidates sessions / data-plane trust)."
+                throw "$dst exists with a different value. Re-run with -Force to replace it (invalidates sessions / data-plane trust / the reverse proxy's secret)."
             }
             Write-SecretFile -Path $dst -Value $value
+            $imported += $name
         }
-        Write-Ok "Imported jwt.key, dataplane.key and encryption.key from $ImportSecretsDir"
+        Write-Ok "Imported $($imported -join ', ') from $ImportSecretsDir"
     }
     foreach ($file in @($jwtFile, $dpKeyFile, $encKeyFile)) {
         $value = Read-SecretFile $file
@@ -780,6 +854,12 @@ if ($PSCmdlet.ShouldProcess($SecretsDir, 'Import/generate secrets')) {
     if ($GenerateMetricsToken -and -not (Read-SecretFile $metricsFile)) {
         Write-SecretFile -Path $metricsFile -Value (Get-RandomHex 32)
         Write-Ok "Generated $metricsFile (Prometheus: bearer_token_file)"
+    }
+    # The control-plane refuses to start with an invalid proxy secret: an existing file is replaced by a valid one.
+    if (($loopbackTrusted -or $ProxySecret -or (Test-Path -LiteralPath $proxySecretFile)) -and -not (Test-ProxySecret (Read-SecretFile $proxySecretFile))) {
+        Write-SecretFile -Path $proxySecretFile -Value (Get-RandomHex 32)
+        $proxySecretNew = $true
+        Write-Ok "Generated $proxySecretFile (the reverse proxy sends it in X-Aegis-Proxy-Auth)"
     }
     if ($DatabaseUrl) {
         Assert-NoControlChar 'DatabaseUrl' $DatabaseUrl
@@ -908,6 +988,7 @@ $envMap['AEGIS_DATAPLANE_KEY_FILE'] = $dpKeyFile
 $envMap['AEGIS_ENCRYPTION_KEY_FILE'] = $encKeyFile
 if (Test-Path -LiteralPath $bootstrapFile) { $envMap['AEGIS_BOOTSTRAP_ADMIN_PASSWORD_FILE'] = $bootstrapFile }
 if (Test-Path -LiteralPath $metricsFile)   { $envMap['AEGIS_METRICS_TOKEN_FILE'] = $metricsFile }
+if (Test-Path -LiteralPath $proxySecretFile) { $envMap['AEGIS_TRUSTED_PROXY_SECRET_FILE'] = $proxySecretFile }
 if ($tlsEnabled) {
     $envMap['AEGIS_TLS_CERT_FILE'] = $tlsCertTarget
     $envMap['AEGIS_TLS_KEY_FILE']  = $tlsKeyTarget
@@ -1043,6 +1124,14 @@ if ($ca) {
 }
 Write-Host "CA key (data-plane): $caKey   <- admin-only, copy securely to data-plane hosts"
 Write-Host "Data-plane key    : $dpKeyFile" -ForegroundColor Green
+if (Test-Path -LiteralPath $proxySecretFile) {
+    Write-Host "Proxy secret      : $proxySecretFile   <- the trusted reverse proxy sends it in X-Aegis-Proxy-Auth"
+    if ($proxySecretNew) {
+        Write-Note 'New proxy secret: until the reverse proxy sends it, its X-Forwarded-For is ignored and every request counts as coming from the proxy.'
+        Write-Note ("IIS on this host: .\Install-AegisConsole-IIS.ps1 ... -ApiProxyTarget {0}://127.0.0.1:{1} (reads {2}); another proxy: copy the file over a protected channel." -f
+            $(if ($tlsEnabled) { 'https' } else { 'http' }), $effectivePort, $proxySecretFile)
+    }
+}
 if (Test-Path -LiteralPath $bootstrapFile) {
     Write-Host "Admin password    : as given (-BootstrapAdminPassword), file $bootstrapFile"
 }

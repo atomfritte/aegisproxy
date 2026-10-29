@@ -38,7 +38,9 @@ control-plane takes it from `X-Forwarded-For` only when the TCP peer is a truste
   such an address without `AEGIS_TRUSTED_PROXY_SECRET` lets any of them choose its client address: use a
   stolen CIDR-bound API key from anywhere, escape the per-source sign-in lockout, or lock out somebody else's
   address. Set the secret and let the proxy send it (`deploy/nginx/aegis-console.conf` includes
-  `/etc/aegis/nginx-proxy-auth.conf`, which `install-linux.sh` generates); forwarding headers from a trusted
+  `/etc/aegis/nginx-proxy-auth.conf`, which `install-linux.sh` generates; on Windows
+  `Install-AegisControlPlane.ps1` creates the secret for a loopback `-TrustedProxies` and
+  `Install-AegisConsole-IIS.ps1 -ApiProxyTarget` lets ARR send it); forwarding headers from a trusted
   address without it are ignored and logged once. The posture report warns about loopback or broad ranges
   (/16 or larger, IPv6 /48) trusted without the secret.
 

@@ -68,7 +68,7 @@ Describe 'Install-AegisControlPlane.ps1' {
         It 'refuses the plain secret <Name> in -ExtraEnvironment (registry environment is readable by local users)' -TestCases @(
             @{ Name = 'AEGIS_JWT_SECRET' }, @{ Name = 'AEGIS_DATAPLANE_KEY' }, @{ Name = 'AEGIS_BOOTSTRAP_ADMIN_PASSWORD' },
             @{ Name = 'AEGIS_METRICS_TOKEN' }, @{ Name = 'AEGIS_DATABASE_URL' }, @{ Name = 'AEGIS_ENCRYPTION_KEY' },
-            @{ Name = 'AEGIS_ENCRYPTION_KEY_PREVIOUS' }
+            @{ Name = 'AEGIS_ENCRYPTION_KEY_PREVIOUS' }, @{ Name = 'AEGIS_TRUSTED_PROXY_SECRET' }
         ) {
             { & $Installer @Base -ExtraEnvironment @{ $Name = 'x' * 40 } } | Should -Throw "*$Name must not be passed as plain value*"
             $FakeWin.Services.Count | Should -Be 0
@@ -535,6 +535,16 @@ Describe 'Install-AegisControlPlane.ps1' {
             { & $Installer @Cluster } | Should -Throw '*shorter than 32 characters*'
         }
 
+        It 'imports the proxy secret of the first node when it has one, and only a valid one' {
+            $nodeSecret = Join-Path (Join-Path $Node1 'secrets') 'trusted-proxy-secret'
+            [System.IO.File]::WriteAllText($nodeSecret, ('p' * 63) + '=' + "`n")
+            (Invoke-Installer -Path $Installer -Parameters $Cluster).ExitCode | Should -Be 0
+            ([System.IO.File]::ReadAllText((Join-Path $SecretsDir 'trusted-proxy-secret'))).Trim() | Should -Be (('p' * 63) + '=')
+            (Get-RegistryEnvironment 'AegisControlPlane')['AEGIS_TRUSTED_PROXY_SECRET_FILE'] | Should -Be (Join-Path $SecretsDir 'trusted-proxy-secret')
+            [System.IO.File]::WriteAllText($nodeSecret, ('p' * 40) + '"')
+            { & $Installer @Cluster } | Should -Throw '*trusted-proxy-secret is not a valid proxy secret*'
+        }
+
         It 'refuses -<Parameter> from an SMB share without encryption before changing anything' -TestCases @(
             @{ Parameter = 'ImportSecretsDir'; Leaf = 'secrets' }, @{ Parameter = 'CaSourceDir'; Leaf = 'certs' }
         ) {
@@ -547,6 +557,77 @@ Describe 'Install-AegisControlPlane.ps1' {
             $FakeWin.Smb.Connections[0].Encrypted = $true
             $err = { & $Installer @p } | Should -Throw -PassThru
             "$err" | Should -Not -Match 'SMB connection'
+        }
+    }
+
+    Context 'reverse-proxy secret' {
+        BeforeEach {
+            $script:ProxySecretFile = Join-Path $SecretsDir 'trusted-proxy-secret'
+        }
+
+        It 'creates the proxy secret when -TrustedProxies <Trusted> covers loopback, and passes it only as a file' -TestCases @(
+            @{ Trusted = @('127.0.0.1/32') }, @{ Trusted = @('::1/128') }, @{ Trusted = @('127.0.0.1') },
+            @{ Trusted = @('10.0.0.10/32', '127.0.0.0/8') }, @{ Trusted = @('0.0.0.0/0') }, @{ Trusted = @('10.0.0.10/32,127.10.0.1/32') }
+        ) {
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ TrustedProxies = $Trusted; ListenAddress = '127.0.0.1:8081'; SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $text = [System.IO.File]::ReadAllText($ProxySecretFile)
+            $text | Should -Match '^[0-9a-f]{64}\n$'
+            $secret = $text.Trim()
+            $svcEnv = Get-RegistryEnvironment 'AegisControlPlane'
+            $svcEnv['AEGIS_TRUSTED_PROXY_SECRET_FILE'] | Should -Be $ProxySecretFile
+            $svcEnv['AEGIS_TRUSTED_PROXIES'] | Should -Be ($Trusted -join ',')
+            ($svcEnv.Values -join "`n") | Should -Not -Match $secret
+            $run.Output | Should -Not -Match $secret
+            $run.Output | Should -Match 'New proxy secret'
+            $run.Output | Should -Match ([regex]::Escape('-ApiProxyTarget http://127.0.0.1:8081'))
+            Get-PrincipalList $ProxySecretFile | Should -Be (Join-Sorted '*S-1-5-18', '*S-1-5-32-544', 'NT SERVICE\AegisControlPlane')
+            (Get-FakeAccess $ProxySecretFile)['NT SERVICE\AegisControlPlane'] | Should -Be 'R'
+        }
+
+        It 'creates no proxy secret for -TrustedProxies <Trusted>' -TestCases @(
+            @{ Trusted = @('10.0.0.10/32') }, @{ Trusted = @('126.0.0.0/8', '128.0.0.0/1') }, @{ Trusted = @('::2/128') }, @{ Trusted = @() }
+        ) {
+            $p = Join-Parameters $Base @{ SkipFirewall = $true }
+            if ($Trusted.Count) { $p.TrustedProxies = $Trusted }
+            (Invoke-Installer -Path $Installer -Parameters $p).ExitCode | Should -Be 0
+            Test-Path -LiteralPath $ProxySecretFile | Should -BeFalse
+            (Get-RegistryEnvironment 'AegisControlPlane').Contains('AEGIS_TRUSTED_PROXY_SECRET_FILE') | Should -BeFalse
+        }
+
+        It 'creates it with -ProxySecret for a proxy on another host' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ TrustedProxies = @('10.0.0.10/32'); ProxySecret = $true; SkipFirewall = $true })).ExitCode | Should -Be 0
+            ([System.IO.File]::ReadAllText($ProxySecretFile)).Trim() | Should -Match '^[0-9a-f]{64}$'
+            (Get-RegistryEnvironment 'AegisControlPlane')['AEGIS_TRUSTED_PROXY_SECRET_FILE'] | Should -Be $ProxySecretFile
+        }
+
+        It 'treats loopback trusted through -ExtraEnvironment like -TrustedProxies' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ ExtraEnvironment = @{ AEGIS_TRUSTED_PROXIES = '127.0.0.1/32' }; SkipFirewall = $true })).ExitCode | Should -Be 0
+            Test-Path -LiteralPath $ProxySecretFile | Should -BeTrue
+            (Get-RegistryEnvironment 'AegisControlPlane')['AEGIS_TRUSTED_PROXY_SECRET_FILE'] | Should -Be $ProxySecretFile
+        }
+
+        It 'refuses to drop the secret variable while loopback is trusted' {
+            { & $Installer @Base -TrustedProxies '127.0.0.1/32' -ExtraEnvironment @{ AEGIS_TRUSTED_PROXY_SECRET_FILE = '' } } | Should -Throw '*trusts a loopback address: AEGIS_TRUSTED_PROXY_SECRET_FILE cannot be removed*'
+            $FakeWin.Services.Count | Should -Be 0
+        }
+
+        It 'keeps the proxy secret on a re-run and replaces an invalid one' {
+            (Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ TrustedProxies = @('127.0.0.1/32'); SkipFirewall = $true })).ExitCode | Should -Be 0
+            $before = [System.IO.File]::ReadAllText($ProxySecretFile)
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            [System.IO.File]::ReadAllText($ProxySecretFile) | Should -Be $before
+            $run.Output | Should -Not -Match 'New proxy secret'
+            $svcEnv = Get-RegistryEnvironment 'AegisControlPlane'
+            $svcEnv['AEGIS_TRUSTED_PROXIES'] | Should -Be '127.0.0.1/32'
+            $svcEnv['AEGIS_TRUSTED_PROXY_SECRET_FILE'] | Should -Be $ProxySecretFile
+            # The control-plane refuses to start with a secret it cannot use (too short, characters outside -._~+/=).
+            [System.IO.File]::WriteAllText($ProxySecretFile, ('x' * 40) + '"')
+            $run = Invoke-Installer -Path $Installer -Parameters (Join-Parameters $Base @{ SkipFirewall = $true })
+            $run.ExitCode | Should -Be 0
+            $run.Output | Should -Match 'New proxy secret'
+            ([System.IO.File]::ReadAllText($ProxySecretFile)).Trim() | Should -Match '^[0-9a-f]{64}$'
         }
     }
 

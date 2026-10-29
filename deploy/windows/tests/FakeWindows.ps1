@@ -51,8 +51,9 @@ function Initialize-FakeWindows {
         VersionHangs  = $false
         VersionKilled = $false
         Python        = @{ Version = '3.12.10'; Packages = @{}; VenvsCreated = 0; PipCheck = @(); Requirements = @() }
-        Iis           = @{ AppPools = @{}; Sites = @{}; Features = @(); Config = @{} }
+        Iis           = @{ AppPools = @{}; Sites = @{}; Features = @(); Config = @{}; Collections = @{} }
         RewriteDll    = $true
+        ArrDll        = $true
         RewriteReg    = $null
         Certificates  = @{}
     }
