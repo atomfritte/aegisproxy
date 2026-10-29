@@ -260,6 +260,8 @@ Describe 'Install-AegisDataPlane.ps1' {
         }
 
         It 'accepts a protected base interpreter directly below the volume root, where users may only create folders' {
+            # RV6-1: a folder named pyvenv.cfg (users may create folders in the volume root) is not a pyvenv.cfg for CPython.
+            New-Item -ItemType Directory -Path (Join-Path $env:SystemDrive 'pyvenv.cfg') | Out-Null
             $pyHome = Join-Path $env:SystemDrive 'Python313'
             $py = Join-Path $pyHome 'python.exe'
             New-FakeBinary -Path $py

@@ -1103,10 +1103,11 @@ if ($pythonBase -like (Join-Path $env:SystemDrive 'Users\*')) {
 $pyHome = Split-Path -Parent $pythonBase
 # CPython also reads pyvenv.cfg next to python.exe and in the directory above it, in isolated mode (-I) as well: its
 # home = line moves the standard library that every start imports. A python.org installation has none, and only
-# administrators may create one there.
+# administrators may create one there. CPython reads only a file of that name (a folder, which users may create in the
+# volume root, is ignored).
 $pyParent = Split-Path -Parent $pyHome
 $pyVenvCfg = @(@($pyHome, $pyParent) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'pyvenv.cfg' } |
-        Where-Object { Test-Path -LiteralPath $_ })
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 if ($pyVenvCfg.Count) {
     throw ("{0} found: CPython would take its standard library from the location it names. Pass the python.exe of a python.org installation (not a virtual environment) and remove a pyvenv.cfg that nobody installed there; check its content first - it may have been planted." -f ($pyVenvCfg -join ', '))
 }
