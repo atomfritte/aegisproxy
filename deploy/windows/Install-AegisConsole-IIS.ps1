@@ -12,6 +12,8 @@
     * writes config.js (window.__AEGIS_CONFIG__.apiBaseUrl) and, for a separate API origin, adds that origin
       to the Content-Security-Policy connect-src directive
     * binds HTTPS (SNI) with a certificate from Cert:\LocalMachine\My (by thumbprint)
+    * with -ApiProxyTarget: proxies /api to the control-plane through Application Request Routing (same origin,
+      no CORS) and authenticates IIS to it with the proxy secret (X-Aegis-Proxy-Auth)
 
     The site directory is readable only by SYSTEM, Administrators and the application pool identity; anonymous
     requests are served with the pool identity (no IUSR access needed). An existing site directory is taken over
@@ -26,7 +28,21 @@
 .PARAMETER ApiBaseUrl
     Origin of the control-plane API when it is NOT reachable under the console's origin, e.g.
     https://aegis-api.corp.example. Empty (default) = same origin (control-plane behind the same host name, or
-    the optional ARR /api rule in web.config). The control-plane then needs AEGIS_CORS_ORIGINS=<console origin>.
+    -ApiProxyTarget). The control-plane then needs AEGIS_CORS_ORIGINS=<console origin>.
+
+.PARAMETER ApiProxyTarget
+    Origin of the control-plane that IIS proxies /api to (Application Request Routing 3.0), e.g. http://127.0.0.1:8081
+    for a control-plane on this host (Install-AegisControlPlane.ps1 -ListenAddress 127.0.0.1:8081 -TrustedProxies
+    127.0.0.1/32). The rule goes into the deployed web.config together with the proxy secret, which only SYSTEM,
+    Administrators and the application pool can read; ARR is enabled server-wide (response buffering off for the
+    live-traffic stream, no port in X-Forwarded-For). Pass it on every run: a run without it deploys web.config
+    without the rule. Excludes -ApiBaseUrl.
+
+.PARAMETER ProxySecretFile
+    The control-plane's AEGIS_TRUSTED_PROXY_SECRET_FILE, sent in X-Aegis-Proxy-Auth with -ApiProxyTarget: the
+    control-plane trusts the X-Forwarded-For of a loopback peer only with it (every local account can connect from
+    loopback). Default: %ProgramData%\AegisProxy\secrets\trusted-proxy-secret, which Install-AegisControlPlane.ps1
+    creates on this host. For a control-plane on another host copy that file over a protected channel.
 
 .PARAMETER CertificateThumbprint
     Thumbprint of the TLS server certificate in Cert:\LocalMachine\My (private key required).
@@ -41,10 +57,14 @@
     .\Install-AegisConsole-IIS.ps1 -HostName aegis-console.corp.example -CertificateThumbprint 3F2A...C9 `
         -ApiBaseUrl https://aegis-api.corp.example -AddHttpBinding
 
+.EXAMPLE
+    # Console and API on one origin, control-plane on this host behind IIS
+    .\Install-AegisConsole-IIS.ps1 -HostName aegis.corp.example -CertificateThumbprint 3F2A...C9 `
+        -ApiProxyTarget http://127.0.0.1:8081 -AddHttpBinding
+
 .NOTES
     Download URL Rewrite 2.1: https://www.iis.net/downloads/microsoft/url-rewrite
-    Optional same-origin API: Application Request Routing 3.0 (https://www.iis.net/downloads/microsoft/application-request-routing)
-    and the commented rule in iis\web.config.
+    Same-origin API (-ApiProxyTarget): Application Request Routing 3.0 (https://www.iis.net/downloads/microsoft/application-request-routing)
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -71,6 +91,11 @@ param(
 
     [AllowEmptyString()]
     [string]$ApiBaseUrl = '',
+
+    [AllowEmptyString()]
+    [string]$ApiProxyTarget = '',
+
+    [string]$ProxySecretFile = (Join-Path $env:ProgramData 'AegisProxy\secrets\trusted-proxy-secret'),
 
     [switch]$AddHttpBinding,
 
@@ -223,6 +248,31 @@ if ($ApiBaseUrl) {
 }
 else { $ApiOrigin = '' }
 
+$ApiProxyTarget = $ApiProxyTarget.Trim().TrimEnd('/')
+$proxySecret = ''
+if ($ApiProxyTarget) {
+    if ($ApiBaseUrl) { throw '-ApiProxyTarget (API on the console origin through ARR) and -ApiBaseUrl (API on another origin) exclude each other.' }
+    # Scheme, host and port only: the value is embedded verbatim in the rewrite rule.
+    if ($ApiProxyTarget -notmatch '^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:\d{1,5})?$') {
+        throw '-ApiProxyTarget must be the origin of the control-plane (scheme, host, port), e.g. http://127.0.0.1:8081.'
+    }
+    # Plain http only to this host: on the network it would carry the proxy secret and the session cookies in clear text.
+    $proxyLocal = $ApiProxyTarget -match '^http://(localhost|127(\.\d{1,3}){3}|\[::1\])(:|$)'
+    if ($ApiProxyTarget -notmatch '^https://' -and -not $proxyLocal -and -not $AllowHttpApi) {
+        throw '-ApiProxyTarget must use https:// for a control-plane on another host (pass -AllowHttpApi for lab setups).'
+    }
+    # The control-plane trusts the X-Forwarded-For of a loopback peer only together with its proxy secret.
+    $ProxySecretFile = [System.IO.Path]::GetFullPath($ProxySecretFile)
+    if (-not (Test-Path -LiteralPath $ProxySecretFile -PathType Leaf)) {
+        throw ("Proxy secret {0} not found. Install-AegisControlPlane.ps1 creates it (-TrustedProxies 127.0.0.1/32 or -ProxySecret); " +
+            'for a control-plane on another host copy its secrets\trusted-proxy-secret over a protected channel and pass -ProxySecretFile.') -f $ProxySecretFile
+    }
+    $proxySecret = ([System.IO.File]::ReadAllText($ProxySecretFile)).Trim([char[]]@([char]0xFEFF, ' ', "`t", "`r", "`n"))
+    if ($proxySecret.Length -lt 32 -or $proxySecret -cnotmatch '^[A-Za-z0-9._~+/=-]+$') {
+        throw "$ProxySecretFile is not a valid proxy secret (at least 32 characters of letters, digits and -._~+/=)."
+    }
+}
+
 $cert = Get-Item -LiteralPath "Cert:\LocalMachine\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
 if (-not $cert) { throw "Certificate $CertificateThumbprint not found in Cert:\LocalMachine\My." }
 if (-not $cert.HasPrivateKey) { throw "Certificate $CertificateThumbprint has no private key." }
@@ -265,6 +315,17 @@ if (-not (Test-Path -LiteralPath $rewriteDll) -and -not $rewriteReg) {
 }
 else { Write-Ok "URL Rewrite module found$(if ($rewriteReg -and ($rewriteReg.PSObject.Properties.Name -contains 'Version')) { " (version $($rewriteReg.Version))" })." }
 
+# --- Application Request Routing (only for -ApiProxyTarget) ------------------------------------------------
+if ($ApiProxyTarget) {
+    $arrDll = Join-Path $env:SystemRoot 'System32\inetsrv\requestRouter.dll'
+    $arrReg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\IIS Extensions\Application Request Routing' -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $arrDll) -and -not $arrReg) {
+        throw ('-ApiProxyTarget needs Application Request Routing 3.0, which is not installed: ' +
+            'https://www.iis.net/downloads/microsoft/application-request-routing (requestRouter_amd64.msi, silent: msiexec /i <msi> /qn).')
+    }
+    Write-Ok 'Application Request Routing found.'
+}
+
 Import-Module WebAdministration
 
 # --- application pool --------------------------------------------------------------------------------
@@ -294,6 +355,30 @@ if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Take ownership, restrict ACL and dep
         $before = $webConfig
         $webConfig = $webConfig.Replace("connect-src 'self';", "connect-src 'self' $ApiOrigin;")
         if ($webConfig -eq $before) { throw "Could not add $ApiOrigin to the CSP connect-src in web.config." }
+    }
+    if ($ApiProxyTarget) {
+        # /api through ARR. HTTP_X_AEGIS_PROXY_AUTH replaces an X-Aegis-Proxy-Auth header sent by the client; the
+        # https redirect rule runs first, so the proxied request always came in over https.
+        $nl = if ($webConfig.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $rule = @(
+            '<rule name="AegisApiReverseProxy" stopProcessing="true">',
+            '          <match url="^api/(.*)" />',
+            '          <serverVariables>',
+            '            <set name="HTTP_X_FORWARDED_PROTO" value="https" />',
+            ('            <set name="HTTP_X_AEGIS_PROXY_AUTH" value="{0}" />' -f $proxySecret),
+            '          </serverVariables>',
+            ('          <action type="Rewrite" url="{0}/api/{{R:1}}" />' -f $ApiProxyTarget),
+            '        </rule>') -join $nl
+        $stream = @(
+            '<location path="api/flows/stream">',
+            '    <system.webServer>',
+            '      <urlCompression doStaticCompression="false" doDynamicCompression="false" />',
+            '    </system.webServer>',
+            '  </location>') -join $nl
+        foreach ($marker in @('<!-- aegis:api-proxy-rule -->', '<!-- aegis:api-proxy-location -->')) {
+            if (-not $webConfig.Contains($marker)) { throw "web.config template lacks the marker $marker for -ApiProxyTarget." }
+        }
+        $webConfig = $webConfig.Replace('<!-- aegis:api-proxy-rule -->', $rule).Replace('<!-- aegis:api-proxy-location -->', $stream)
     }
     try { [void][xml]$webConfig } catch { throw "web.config is not well-formed XML: $($_.Exception.Message)" }
     [System.IO.File]::WriteAllText((Join-Path $PhysicalPath 'web.config'), $webConfig, (New-Object System.Text.UTF8Encoding($false)))
@@ -335,6 +420,24 @@ if ($PSCmdlet.ShouldProcess($SiteName, 'Create/update site and HTTPS binding')) 
     Write-Ok ("Binding https://{0}:{1} (SNI) with certificate {2}{3}." -f $HostName, $HttpsPort, $CertificateThumbprint, $(if ($AddHttpBinding) { ', http:80 redirects to https' } else { '' }))
 }
 
+# --- ARR reverse proxy for /api (server-wide proxy settings, server variables allowed for this site only) ----
+if ($ApiProxyTarget -and $PSCmdlet.ShouldProcess('IIS (applicationHost.config)', 'Enable the ARR proxy and allow the server variables of the /api rule')) {
+    $apphost = 'MACHINE/WEBROOT/APPHOST'
+    # responseBufferLimit 0: no buffering of the Server-Sent Events stream /api/flows/stream (live traffic).
+    # includePortInXForwardedFor false: the control-plane expects plain addresses in X-Forwarded-For.
+    $proxySettings = [ordered]@{ enabled = $true; preserveHostHeader = $true; reverseRewriteHostInResponseHeaders = $false
+        responseBufferLimit = 0; includePortInXForwardedFor = $false }
+    foreach ($name in $proxySettings.Keys) {
+        Set-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/proxy' -Name $name -Value $proxySettings[$name]
+    }
+    $allowedFilter = 'system.webServer/rewrite/allowedServerVariables'
+    $allowed = @(Get-WebConfigurationProperty -PSPath $apphost -Location $SiteName -Filter $allowedFilter -Name 'Collection' | ForEach-Object { "$($_.name)" })
+    foreach ($var in @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_AEGIS_PROXY_AUTH')) {
+        if ($allowed -notcontains $var) { Add-WebConfigurationProperty -PSPath $apphost -Location $SiteName -Filter $allowedFilter -Name '.' -Value @{ name = $var } }
+    }
+    Write-Ok "ARR: /api proxied to $ApiProxyTarget with X-Aegis-Proxy-Auth from $ProxySecretFile (proxy enabled server-wide, no response buffering)."
+}
+
 # --- ACL: site directory readable only by the pool identity (set before the deployment, verified here) ----
 if ($PSCmdlet.ShouldProcess($PhysicalPath, 'Verify ACL')) {
     $aclProblems = @(foreach ($path in @($PhysicalPath, (Join-Path $PhysicalPath 'index.html'), (Join-Path $PhysicalPath 'web.config'), (Join-Path $PhysicalPath 'config.js'))) {
@@ -359,9 +462,15 @@ if ($ApiBaseUrl) {
     Write-Host ("Control-plane : set AEGIS_CORS_ORIGINS=https://{0}{1}  (Install-AegisControlPlane.ps1 -CorsOrigins ...)" -f $HostName, $(if ($HttpsPort -ne 443) { ":$HttpsPort" }))
     Write-Host '                AEGIS_COOKIE_SAMESITE=none only if console and API are on different sites (registrable domains).'
 }
-else {
-    Write-Host 'API           : same origin - serve the control-plane under this host name or enable the ARR /api rule in web.config.'
+elseif ($ApiProxyTarget) {
+    Write-Host "API           : /api proxied by ARR to $ApiProxyTarget (X-Aegis-Proxy-Auth from $ProxySecretFile)"
+    Write-Host ("Control-plane : AEGIS_PUBLIC_URL=https://{0}{1}, AEGIS_TRUSTED_PROXIES = the address IIS connects from (127.0.0.1/32 on this host)" -f
+        $HostName, $(if ($HttpsPort -ne 443) { ":$HttpsPort" }))
+    Write-Host '                and AEGIS_TRUSTED_PROXY_SECRET_FILE with this secret (Install-AegisControlPlane.ps1 sets both for -TrustedProxies 127.0.0.1/32).'
 }
-Write-Host 'Upgrade       : rebuild the console and re-run this script (assets are mirrored, config.js regenerated).'
+else {
+    Write-Host 'API           : same origin - serve the control-plane under this host name or re-run with -ApiProxyTarget (ARR).'
+}
+Write-Host 'Upgrade       : rebuild the console and re-run this script with the same parameters (assets are mirrored, web.config and config.js regenerated).'
 # robocopy's success codes 1-7 must not become the script's exit code.
 exit 0

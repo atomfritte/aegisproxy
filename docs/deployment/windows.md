@@ -12,8 +12,8 @@ counterpart of this guide is [`linux.md`](linux.md).
 | `deploy/windows/Install-AegisControlPlane.ps1` | Install/upgrade/remove the control-plane service `AegisControlPlane` |
 | `deploy/windows/Install-AegisDataPlane.ps1` | Install/upgrade/remove a data-plane worker `AegisDataPlane` (Python venv + WinSW) |
 | `deploy/windows/aegis-dataplane.xml` | WinSW service template rendered by the data-plane script |
-| `deploy/windows/Install-AegisConsole-IIS.ps1` | Host the web console on IIS 10 with HTTPS |
-| `deploy/windows/iis/web.config` | IIS configuration: SPA routing, security headers, caching, optional ARR `/api` proxy |
+| `deploy/windows/Install-AegisConsole-IIS.ps1` | Host the web console on IIS 10 with HTTPS, optionally with the API on the same origin through ARR |
+| `deploy/windows/iis/web.config` | IIS configuration: SPA routing, security headers, caching; the ARR `/api` rule is inserted by `-ApiProxyTarget` |
 
 ---
 
@@ -59,6 +59,7 @@ mitmdump is not SCM-aware and therefore runs under [WinSW](https://github.com/wi
 | Data-plane key (`dataplane.key`) | control-plane installer | control-plane + every worker | authenticates workers, signs block tokens; mismatch = HTTP 401 at the control-plane, 503 at the proxy |
 | JWT secret (`jwt.key`) | control-plane installer | control-plane replicas | console sessions; identical on all replicas |
 | Enterprise root CA (`mitmproxy-ca.pem` = key + cert) | `aegis-control-plane gen-ca` | workers (key), clients (cert only) | the key never leaves admin-only ACLs; the control-plane process itself cannot read it |
+| Proxy secret (`trusted-proxy-secret`) | control-plane installer (loopback in `-TrustedProxies`, or `-ProxySecret`) | control-plane + the trusted reverse proxy (IIS/ARR) | only a proxy that sends it in `X-Aegis-Proxy-Auth` may supply `X-Forwarded-For`; on loopback every local account could otherwise choose its client address |
 
 **Failure semantics.** A worker answers `503` until it has loaded its first policy bundle
 (`AEGIS_FAIL_MODE=closed`). Afterwards it keeps enforcing the last known policy if the control-plane becomes
@@ -184,8 +185,17 @@ What the script does (idempotent - re-running it upgrades the binary and keeps s
    environment lives in the registry (`HKLM\SYSTEM\CurrentControlSet\Services\AegisControlPlane\Environment`),
    which local users can read - therefore no secret values are stored there, and the script refuses plain
    secret variables in `-ExtraEnvironment` (`AEGIS_JWT_SECRET`, `AEGIS_DATAPLANE_KEY`, `AEGIS_ENCRYPTION_KEY`,
-   `AEGIS_ENCRYPTION_KEY_PREVIOUS`, `AEGIS_BOOTSTRAP_ADMIN_PASSWORD`, `AEGIS_METRICS_TOKEN`, `AEGIS_DATABASE_URL`)
-   and removes them if an earlier installation left them there.
+   `AEGIS_ENCRYPTION_KEY_PREVIOUS`, `AEGIS_BOOTSTRAP_ADMIN_PASSWORD`, `AEGIS_METRICS_TOKEN`, `AEGIS_DATABASE_URL`,
+   `AEGIS_TRUSTED_PROXY_SECRET`) and removes them if an earlier installation left them there.
+   **Proxy secret.** When `-TrustedProxies` covers a loopback address (`127.0.0.1/32` for IIS/ARR on the same host,
+   `::1/128`, or a wider range such as `0.0.0.0/0`), the script also creates `secrets\trusted-proxy-secret` and sets
+   `AEGIS_TRUSTED_PROXY_SECRET_FILE`: every local account can connect from loopback, so the control-plane accepts
+   `X-Forwarded-For` from there only together with `X-Aegis-Proxy-Auth: <secret>`, which IIS sends
+   (`Install-AegisConsole-IIS.ps1 -ApiProxyTarget`, section 7). Otherwise any local user could choose the client
+   address that CIDR-bound API keys, sign-in throttling and the audit trail see. `-ProxySecret` creates the
+   secret for a proxy on another host. An existing secret is kept on re-runs (replaced only if the control-plane
+   could not use it); clearing `AEGIS_TRUSTED_PROXY_SECRET_FILE` through `-ExtraEnvironment` while loopback is
+   trusted is refused.
 4. Runs `aegis-control-plane.exe gen-ca` if no CA exists and restricts `certs\mitmproxy-ca.pem` (the CA private
    key) to SYSTEM/Administrators. The control-plane only reads the public certificate.
 5. Registers the service (`Automatic`), runs it as the virtual account **`NT SERVICE\AegisControlPlane`**,
@@ -213,7 +223,8 @@ Important parameters:
 | `-UiDir` | – | serve the console from the control-plane (same origin, simplest option) |
 | `-Storage` / `-DatabaseUrl` | `file` / – | `postgres` for cluster mode (section 9) |
 | `-TlsCertFile` / `-TlsKeyFile` | – | native HTTPS (PEM, unencrypted key) |
-| `-TrustedProxies` / `-CorsOrigins` | – | `AEGIS_TRUSTED_PROXIES` / `AEGIS_CORS_ORIGINS` |
+| `-TrustedProxies` / `-CorsOrigins` | – | `AEGIS_TRUSTED_PROXIES` (exactly the proxy addresses; loopback creates the proxy secret, step 3) / `AEGIS_CORS_ORIGINS` |
+| `-ProxySecret` | – | create `secrets\trusted-proxy-secret` (`AEGIS_TRUSTED_PROXY_SECRET_FILE`) also for a proxy that does not connect from loopback |
 | `-ExtraEnvironment` | – | further non-secret variables, e.g. `@{ AEGIS_INTERNAL_DOMAINS = '.corp.example,.local' }` |
 | `-ImportSecretsDir` / `-CaSourceDir` | – | join an existing cluster (identical secrets and CA); SMB sources must be encrypted (section 9) |
 | `-AllowUnencryptedImport` | – | accept `-ImportSecretsDir` / `-CaSourceDir` over an unencrypted SMB connection |
@@ -235,7 +246,7 @@ re-run of the installer).
 | Option | Configuration |
 |---|---|
 | Native TLS on the control-plane | `-TlsCertFile`/`-TlsKeyFile` (stored as `secrets\tls-cert.pem` / `tls-key.pem`). TLS ≥ 1.2 |
-| IIS in front (console + API via ARR) | `-ListenAddress 127.0.0.1:8081`, `-TrustedProxies 127.0.0.1/32`, enable the ARR rule in `web.config` |
+| IIS in front (console + API via ARR) | control-plane `-ListenAddress 127.0.0.1:8081 -TrustedProxies 127.0.0.1/32` (creates the proxy secret), then `Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081` (section 7) |
 | Load balancer termination | `-TrustedProxies <LB addresses>`; `-PublicUrl` = the LB URL |
 
 Convert a PFX into PEM files (OpenSSL, e.g. from Git for Windows):
@@ -436,12 +447,46 @@ heartbeat, policy revision and ClamAV status.
 |---|---|---|
 | **Control-plane** (recommended) | `-UiDir ..\..\frontend\dist` | same origin, no CORS, CSP set by the control-plane |
 | **IIS, API on another origin** | `Install-AegisConsole-IIS.ps1 -ApiBaseUrl https://aegis-api.corp.example` | control-plane needs `-CorsOrigins https://<console host>`; the script adds the API origin to CSP `connect-src` |
-| **IIS, same origin via ARR** | enable the `AegisApiReverseProxy` rule in `web.config` | requires ARR 3.0, `responseBufferLimit=0` for the SSE stream; control-plane `-ListenAddress 127.0.0.1:8081 -TrustedProxies 127.0.0.1/32` |
+| **IIS, same origin via ARR** | `Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081` | requires ARR 3.0; control-plane `-ListenAddress 127.0.0.1:8081 -TrustedProxies 127.0.0.1/32` (creates the proxy secret that IIS sends) |
 
 ```powershell
 .\Install-AegisConsole-IIS.ps1 -HostName aegis-console.corp.example `
     -CertificateThumbprint 3F2A...C9 -ApiBaseUrl https://aegis.corp.example:8081 -AddHttpBinding
 ```
+
+**Same origin through ARR.** Install [Application Request Routing 3.0](https://www.iis.net/downloads/microsoft/application-request-routing),
+then install the control-plane behind IIS and the console with `-ApiProxyTarget`:
+
+```powershell
+.\Install-AegisControlPlane.ps1 -PublicUrl https://aegis.corp.example -ListenAddress 127.0.0.1:8081 `
+    -TrustedProxies 127.0.0.1/32 -SkipFirewall      # creates secrets\trusted-proxy-secret
+.\Install-AegisConsole-IIS.ps1 -HostName aegis.corp.example -CertificateThumbprint 3F2A...C9 `
+    -ApiProxyTarget http://127.0.0.1:8081 -AddHttpBinding
+```
+
+IIS connects to the control-plane from `127.0.0.1` - like every other local account. The control-plane therefore
+accepts the `X-Forwarded-For` that ARR appends only from a request that also carries `X-Aegis-Proxy-Auth` with the
+proxy secret (`AEGIS_TRUSTED_PROXY_SECRET_FILE`); without it a local user could send requests with any client
+address and so use a stolen CIDR-bound API key, escape the per-source sign-in lockout or lock out somebody else.
+With `-ApiProxyTarget` the IIS script:
+
+- reads the secret from `-ProxySecretFile` (default `C:\ProgramData\AegisProxy\secrets\trusted-proxy-secret`,
+  created by the control-plane installer; for a control-plane on another host copy the file over a protected
+  channel - and use an `https://` target there; without `-AllowHttpApi` plain `http://` is accepted only for a
+  loopback target),
+- inserts the rule `AegisApiReverseProxy` into the deployed `web.config` after the HTTPS redirect: `/api/*` is
+  rewritten to the target, `X-Forwarded-Proto: https` and `X-Aegis-Proxy-Auth: <secret>` are set (replacing headers
+  of these names sent by the client), and compression is turned off for the live-traffic stream
+  `/api/flows/stream`. The secret thus lives in `web.config`, which - like the whole site directory - only SYSTEM,
+  Administrators and the application pool identity can read (verified before the site starts),
+- enables the ARR proxy server-wide in `applicationHost.config` (`preserveHostHeader`, `responseBufferLimit=0`
+  for the Server-Sent Events stream, `includePortInXForwardedFor=false` so that the control-plane sees plain
+  addresses, `reverseRewriteHostInResponseHeaders=false`) and allows the server variables
+  `HTTP_X_FORWARDED_PROTO` and `HTTP_X_AEGIS_PROXY_AUTH` for this site only.
+
+Pass `-ApiProxyTarget` on every run: a run without it deploys `web.config` without the rule (the server-wide ARR
+settings stay). Use `127.0.0.1` rather than `localhost` (IIS may connect via `::1`, which `127.0.0.1/32` does not
+cover). If the control-plane's secret is replaced, re-run the IIS script.
 
 The IIS script installs the role services, requires the **URL Rewrite** module
 (<https://www.iis.net/downloads/microsoft/url-rewrite>; without it IIS returns HTTP 500.19), creates an
@@ -517,7 +562,8 @@ Limitations and recommendations:
   the CA private key cross the network: for UNC paths and mapped drives (in every spelling, see section 6) the
   script checks `Get-SmbConnection` and stops unless the connection is encrypted (`-RequirePrivacy $true` as above, or a share with
   `Set-SmbShare -EncryptData $true`). `-AllowUnencryptedImport` overrides the check; copying over another
-  protected channel to a local directory works as well.
+  protected channel to a local directory works as well. A `trusted-proxy-secret` of node 1 is imported too, so
+  that one proxy secret (`-ProxySecret` on node 1) serves a load balancer in front of all nodes.
 * **Control-plane load balancer:** round robin, no stickiness needed (sessions are signed JWTs, live updates are
   distributed through PostgreSQL `LISTEN/NOTIFY`), health check `GET /readyz` (includes database
   reachability), `X-Forwarded-For` + `AEGIS_TRUSTED_PROXIES`, idle timeout ≥ 1 h for the SSE stream
@@ -608,7 +654,8 @@ systemd drop-ins). Details: [`linux.md`](linux.md#10-rolling-out-the-ca-and-prox
 | Component | Procedure |
 |---|---|
 | Control-plane | Build the new `aegis-control-plane.exe`, re-run `Install-AegisControlPlane.ps1 -BinaryPath <new> -PublicUrl <same>`. The service stops, the binary is replaced, secrets/state/config are kept. Workers keep enforcing during the restart |
-| Console | Rebuild `frontend\dist`; re-run with `-UiDir` (control-plane) or re-run `Install-AegisConsole-IIS.ps1` |
+| Console | Rebuild `frontend\dist`; re-run with `-UiDir` (control-plane) or re-run `Install-AegisConsole-IIS.ps1` with the same parameters |
+| IIS/ARR set up by hand before 2.1 (rule uncommented in `web.config`, `-TrustedProxies 127.0.0.1/32`) | Re-running the control-plane installer creates the proxy secret; until IIS sends it every request counts as coming from `127.0.0.1` (shared sign-in throttling). Re-run `Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081` right after it |
 | Data-plane addon | Re-run `Install-AegisDataPlane.ps1` with the new `data-plane` folder |
 | mitmproxy / Python | Deploy a release with the updated `data-plane\requirements-lock.txt` (or pass your own `-RequirementsFile`), re-run with `-RecreateVenv`; a new Python minor version recreates the venv automatically |
 | Cluster | One node at a time; wait for `/readyz` on the upgraded node before the next one. Upgrade the control-plane before the workers |
@@ -625,7 +672,7 @@ Back up before every upgrade (section 12).
 | State (file mode) | `C:\ProgramData\AegisProxy\data\aegis_state.json` (+ `.bak`, the previous version) | written atomically; can be copied while the service runs |
 | Audit trail | `data\audit.jsonl` (+ `audit.jsonl-YYYYMMDDhhmmss[.gz]`) | append-only JSON Lines, rotated by the control-plane at `AEGIS_AUDIT_ROTATE_MB` (default 256 MB; Windows cannot rename the open file externally), older generations gzip-compressed, never deleted; also ship to your SIEM |
 | CA | `certs\` (incl. `mitmproxy-ca.pem` = **private key**) | losing it means re-distributing a new CA to every client |
-| Secrets | `secrets\` | `jwt.key`, `dataplane.key`, `database-url`, TLS key, ... |
+| Secrets | `secrets\` | `jwt.key`, `dataplane.key`, `database-url`, TLS key, `trusted-proxy-secret`, ... |
 | PostgreSQL | database `aegis` | `pg_dump -Fc -d aegis -f aegis-$(Get-Date -f yyyyMMdd).dump` |
 | Service configuration | registry `HKLM\SYSTEM\CurrentControlSet\Services\AegisControlPlane` | `reg export ... aegis-cp.reg` |
 
@@ -697,6 +744,9 @@ renamed files as usual. Set the sizes with `-ExtraEnvironment @{ AEGIS_AUDIT_ROT
 | `AegisDataPlane` does not start | per-user Python, missing venv packages, CA without private key, port in use | `...\data-plane\logs\*.err.log` / `*.wrapper.log`; `netstat -ano | findstr :8080` |
 | Console blank / CSP or CORS errors in the browser console | `config.js` points to another origin without matching CSP/CORS | Re-run the IIS script with `-ApiBaseUrl`; set `-CorsOrigins` on the control-plane |
 | IIS returns 500.19 | URL Rewrite (or ARR for the `/api` rule) missing | Install the module(s) |
+| Every sign-in and audit entry shows `127.0.0.1`; control-plane log: `forwarding headers from a trusted proxy address without the proxy secret are ignored` | the proxy secret exists (loopback trusted) but IIS does not send it: `web.config` deployed without `-ApiProxyTarget`, or the secret was replaced afterwards | Re-run `Install-AegisConsole-IIS.ps1 ... -ApiProxyTarget http://127.0.0.1:8081` |
+| IIS script: `Proxy secret ... not found` / `is not a valid proxy secret` | the control-plane installer has not created `secrets\trusted-proxy-secret` (no loopback in `-TrustedProxies`), or `-ProxySecretFile` points to the wrong file | Re-run `Install-AegisControlPlane.ps1 -TrustedProxies 127.0.0.1/32` (or `-ProxySecret`), or copy the control-plane's file and pass `-ProxySecretFile` |
+| IIS script: `-ApiProxyTarget needs Application Request Routing 3.0` | ARR not installed | Install `requestRouter_amd64.msi` (<https://www.iis.net/downloads/microsoft/application-request-routing>), re-run |
 | A new CA appeared after a restore | `certs\mitmproxy-ca-cert.pem` was missing, the control-plane generated a new CA | Restore the original `certs\` and restart; re-stage the CA on the workers |
 | Installer: `Refusing to adopt N file(s) that existed before this installation` | first installation (no service) or directories with an unexpected owner/ACL contain files | Check the listed files. Delete them if you do not know where they come from; re-run with `-AdoptExistingSecrets` for a restore, a reinstallation after `-Uninstall` or an interrupted first run |
 | Installer: `ACL verification failed` | an ACE or owner could not be changed (e.g. an inheritance-blocking policy, a tool that re-adds ACEs) | Fix the listed paths (`icacls <path>`), re-run; the service is not started until the check passes |
@@ -735,7 +785,8 @@ Remove-Item Env:AEGIS_LOG_FILE
       LocalSystem.
 - [ ] Firewall: proxy port only from server subnets; console/API only from admin networks, workers and load
       balancers; ops/metrics ports only from monitoring; Public profile closed.
-- [ ] `AEGIS_TRUSTED_PROXIES` lists exactly the reverse proxies/load balancers.
+- [ ] `AEGIS_TRUSTED_PROXIES` lists exactly the reverse proxies/load balancers; loopback (IIS on the same host)
+      only together with `AEGIS_TRUSTED_PROXY_SECRET_FILE`, which IIS sends (`-ApiProxyTarget`).
 - [ ] `/metrics` protected by `AEGIS_METRICS_TOKEN` or network ACLs.
 - [ ] Data-plane installed from the hash-pinned lock (default; no `-AllowUnpinnedPackages`), ideally from an internal
       wheel mirror; WinSW binary verified.

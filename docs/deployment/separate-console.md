@@ -20,8 +20,11 @@ The console host proxies `/api/` to the control-plane. No CORS, the session cook
   networking), with the same `AEGIS_TRUSTED_PROXY_SECRET` (`_FILE`) on both sides — see
   [trusted proxies](../configuration.md#trusted-proxies-and-sign-in-throttling).
 - Kubernetes: `console.enabled=true` (default proxies to the control-plane service).
-- nginx / IIS ARR: see `frontend/docker/nginx.conf` and `deploy/windows/iis/web.config` (disable response
-  buffering for `/api/flows/stream`).
+- nginx: see `frontend/docker/nginx.conf` and `deploy/nginx/aegis-console.conf` (disable response buffering for
+  `/api/flows/stream`; on the control-plane host send the proxy secret).
+- IIS: `Install-AegisConsole-IIS.ps1 -ApiProxyTarget http://127.0.0.1:8081` adds the ARR rule, disables response
+  buffering and sends the proxy secret that the control-plane installer creates for a loopback
+  `-TrustedProxies` ([Windows guide](windows.md#7-web-console-hosting)).
 
 ## Option B — API on its own origin
 
