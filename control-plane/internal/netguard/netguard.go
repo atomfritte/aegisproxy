@@ -21,7 +21,7 @@ var cloudMetadata = []netip.Prefix{
 }
 
 // CloudMetadata reports cloud platform metadata endpoints that are not link-local addresses, also embedded in
-// IPv6 (NAT64, 6to4, IPv4-compatible, IPv4-mapped).
+// IPv6 (NAT64, 6to4, IPv4-compatible, IPv4-translated, IPv4-mapped).
 func CloudMetadata(a netip.Addr) bool { return classify(a, cloudMetadata) }
 
 // Forbidden reports whether an outbound integration must never connect to a: the forbidden proxy destinations

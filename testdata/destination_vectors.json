@@ -1,5 +1,5 @@
 {
- "_comment": "Shared vectors for destination classification: netguard.IsInternal / IsForbiddenDestination (engine.IsInternalAddr, store.alwaysForbiddenAddr; control-plane, Go) and is_internal_addr / is_forbidden_addr (data-plane, Python). internal: blocked unless private destinations are allowed; forbidden: no rule may ever open it. Addresses embedding IPv4 (NAT64, 6to4, IPv4-compatible, IPv4-mapped) are classified by the embedded address too. Both test suites read this file; change it only together with both implementations.",
+ "_comment": "Shared vectors for destination classification: netguard.IsInternal / IsForbiddenDestination (engine.IsInternalAddr, store.alwaysForbiddenAddr; control-plane, Go) and is_internal_addr / is_forbidden_addr (data-plane, Python). internal: blocked unless private destinations are allowed; forbidden: no rule may ever open it. Addresses embedding IPv4 (NAT64, 6to4, IPv4-compatible, IPv4-translated, IPv4-mapped) are classified by the embedded address too. Both test suites read this file; change it only together with both implementations.",
  "addresses": [
   {"addr": "168.63.129.16", "internal": true, "forbidden": true, "note": "Azure WireServer"},
   {"addr": "::ffff:168.63.129.16", "internal": true, "forbidden": true, "note": "IPv4-mapped WireServer"},
@@ -67,6 +67,11 @@
   {"addr": "2002:a00:5::1", "internal": true, "forbidden": false, "note": "6to4 of 10.0.0.5"},
   {"addr": "2002:808:808::1", "internal": false, "forbidden": false, "note": "6to4 of 8.8.8.8"},
   {"addr": "::ffff:127.0.0.1", "internal": true, "forbidden": true, "note": "IPv4-mapped loopback"},
-  {"addr": "::ffff:8.8.8.8", "internal": false, "forbidden": false}
+  {"addr": "::ffff:8.8.8.8", "internal": false, "forbidden": false},
+  {"addr": "::ffff:0:a9fe:a9fe", "internal": true, "forbidden": true, "note": "IPv4-translated (SIIT) 169.254.169.254"},
+  {"addr": "::ffff:0:7f00:1", "internal": true, "forbidden": true, "note": "IPv4-translated (SIIT) loopback"},
+  {"addr": "::ffff:0:a83f:8110", "internal": true, "forbidden": true, "note": "IPv4-translated (SIIT) Azure WireServer"},
+  {"addr": "::ffff:0:a00:1", "internal": true, "forbidden": false, "note": "IPv4-translated (SIIT) 10.0.0.1"},
+  {"addr": "::ffff:0:808:808", "internal": true, "forbidden": false, "note": "IPv4-translated (SIIT, deprecated prefix)"}
  ]
 }

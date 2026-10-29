@@ -249,7 +249,7 @@ func (s *Snapshot) MatchURL(rawURL string) (Match, bool) {
 	return Match{}, false
 }
 
-// MatchIP matches the address and the IPv4 address it embeds (IPv4-mapped, NAT64, 6to4, IPv4-compatible): an
+// MatchIP matches the address and the IPv4 address it embeds (IPv4-mapped, NAT64, 6to4, IPv4-compatible, IPv4-translated): an
 // indicator for 198.51.100.23 also covers 64:ff9b::c633:6417 behind a NAT64 gateway. Same as match_ip in the
 // data-plane.
 func (s *Snapshot) MatchIP(a netip.Addr) (Match, bool) {

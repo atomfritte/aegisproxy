@@ -33,8 +33,9 @@ var internalPrefixes = append([]netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("198.51.100.0/24"),
 	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("240.0.0.0/4"), // reserved, incl. 255.255.255.255
-	netip.MustParsePrefix("::/96"),       // IPv4-compatible (deprecated)
+	netip.MustParsePrefix("240.0.0.0/4"),     // reserved, incl. 255.255.255.255
+	netip.MustParsePrefix("::/96"),           // IPv4-compatible (deprecated)
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // IPv4-translated, SIIT (deprecated)
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("100::/64"),
 	netip.MustParsePrefix("2001::/23"), // IETF protocol assignments, incl. Teredo 2001::/32
@@ -48,12 +49,13 @@ var (
 	nat64Prefix      = netip.MustParsePrefix("64:ff9b::/96")
 	nat64LocalPrefix = netip.MustParsePrefix("64:ff9b:1::/48")
 	compatPrefix     = netip.MustParsePrefix("::/96")
+	siitPrefix       = netip.MustParsePrefix("::ffff:0:0:0/96")
 	sixToFourPrefix  = netip.MustParsePrefix("2002::/16")
 )
 
 // EmbeddedIPv4 returns the IPv4 address carried by an IPv6 address that a gateway or relay translates to IPv4:
 // IPv4-mapped (::ffff:0:0/96), NAT64 (64:ff9b::/96, and the local-use 64:ff9b:1::/48 in its /96 layout),
-// IPv4-compatible (::/96) and 6to4 (2002::/16).
+// IPv4-compatible (::/96), IPv4-translated (SIIT, ::ffff:0:0:0/96) and 6to4 (2002::/16).
 func EmbeddedIPv4(a netip.Addr) (netip.Addr, bool) {
 	if a.Is4In6() {
 		return a.Unmap(), true
@@ -63,7 +65,7 @@ func EmbeddedIPv4(a netip.Addr) (netip.Addr, bool) {
 	}
 	b := a.As16()
 	switch {
-	case nat64Prefix.Contains(a), nat64LocalPrefix.Contains(a), compatPrefix.Contains(a):
+	case nat64Prefix.Contains(a), nat64LocalPrefix.Contains(a), compatPrefix.Contains(a), siitPrefix.Contains(a):
 		return netip.AddrFrom4([4]byte(b[12:16])), true
 	case sixToFourPrefix.Contains(a):
 		return netip.AddrFrom4([4]byte(b[2:6])), true

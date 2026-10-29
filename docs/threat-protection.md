@@ -311,11 +311,11 @@ then switch to `block`. An enterprise DLP engine can additionally inspect upload
   | Class | Ranges |
   |---|---|
   | Always blocked (`forbidden_destination`) | `0.0.0.0`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `::`, `::1`, `fe80::/10`, `ff00::/8`, `168.63.129.16`, `100.100.100.200`, `fd00:ec2::254` |
-  | Internal (`internal_destination` with `block_private_destinations`) | the above plus `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `240.0.0.0/4` (incl. `255.255.255.255`), `::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23` (incl. Teredo), `2001:db8::/32`, `3fff::/20`, `fc00::/7`, `fec0::/10` |
+  | Internal (`internal_destination` with `block_private_destinations`) | the above plus `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `240.0.0.0/4` (incl. `255.255.255.255`), `::/96`, `::ffff:0:0:0/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23` (incl. Teredo), `2001:db8::/32`, `3fff::/20`, `fc00::/7`, `fec0::/10` |
 
   IPv6 addresses that carry an IPv4 address a gateway translates — IPv4-mapped `::ffff:0:0/96`, NAT64
-  `64:ff9b::/96` (and the local-use `64:ff9b:1::/48` in its /96 layout), IPv4-compatible `::/96` and 6to4
-  `2002::/16` — are also classified by that IPv4 address: `64:ff9b::a9fe:a9fe` is `169.254.169.254` behind a
+  `64:ff9b::/96` (and the local-use `64:ff9b:1::/48` in its /96 layout), IPv4-compatible `::/96`, IPv4-translated (SIIT)
+  `::ffff:0:0:0/96` and 6to4 `2002::/16` — are also classified by that IPv4 address: `64:ff9b::a9fe:a9fe` is `169.254.169.254` behind a
   NAT64 gateway and always blocked, `64:ff9b::a00:5` is internal. Threat-intelligence IP indicators match these
   encodings too.
 - `punycode_mode`: monitor or block IDN host names.

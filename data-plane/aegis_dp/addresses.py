@@ -22,18 +22,21 @@ _INTERNAL_NETS = tuple(ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
     "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
     "::/96",  # IPv4-compatible (deprecated)
+    "::ffff:0:0:0/96",  # IPv4-translated, SIIT (deprecated)
     "64:ff9b:1::/48", "100::/64",
     "2001::/23",  # IETF protocol assignments, incl. Teredo 2001::/32
     "2001:db8::/32", "3fff::/20", "fc00::/7",
     "fec0::/10",  # site-local (deprecated)
 )) + _FORBIDDEN_NETS
-_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"), ipaddress.ip_network("::/96"))
+_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"), ipaddress.ip_network("::/96"),
+          ipaddress.ip_network("::ffff:0:0:0/96"))
 _6TO4 = ipaddress.ip_network("2002::/16")
 
 
 def embedded_ipv4(addr):
     """The IPv4 address carried by an IPv6 address that a gateway or relay translates to IPv4: IPv4-mapped, NAT64
-    (64:ff9b::/96, and the local-use 64:ff9b:1::/48 in its /96 layout), IPv4-compatible (::/96) and 6to4 (2002::/16)."""
+    (64:ff9b::/96, and the local-use 64:ff9b:1::/48 in its /96 layout), IPv4-compatible (::/96), IPv4-translated (SIIT,
+    ::ffff:0:0:0/96) and 6to4 (2002::/16)."""
     if addr.version != 6:
         return None
     if addr.ipv4_mapped is not None:

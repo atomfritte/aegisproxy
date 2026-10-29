@@ -347,7 +347,7 @@ func SetInternalSuffixes(suffixes []string) {
 
 // IsInternalAddr reports addresses that are not globally reachable: loopback, private, link-local (incl.
 // 169.254.169.254 cloud metadata), other cloud metadata endpoints, CGNAT, documentation, reserved, multicast and
-// unspecified ranges, also embedded in IPv6 (NAT64, 6to4, IPv4-compatible). The table is netguard.IsInternal,
+// unspecified ranges, also embedded in IPv6 (NAT64, 6to4, IPv4-compatible, IPv4-translated). The table is netguard.IsInternal,
 // mirrored by is_internal_addr in the data-plane.
 func IsInternalAddr(addr netip.Addr) bool { return netguard.IsInternal(addr) }
 
