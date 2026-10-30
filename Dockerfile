@@ -11,7 +11,7 @@ RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build
+FROM golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS build
 # Only the go.sum-verified modules: a vendor/ directory or a go.work in the context (excluded by .dockerignore
 # anyway) would otherwise replace them without any checksum check.
 ENV GOFLAGS=-mod=readonly GOWORK=off
