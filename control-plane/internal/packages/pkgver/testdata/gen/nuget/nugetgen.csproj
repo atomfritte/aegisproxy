@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The NuGet.Versioning the SDK itself uses for restore. -->
+    <NuGetVersioningDll Condition="'$(NuGetVersioningDll)' == ''">$(NetCoreRoot)sdk/$(NETCoreSdkVersion)/NuGet.Versioning.dll</NuGetVersioningDll>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="NuGet.Versioning">
+      <HintPath>$(NuGetVersioningDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
