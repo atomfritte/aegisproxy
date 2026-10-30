@@ -168,13 +168,39 @@ type dpSession struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// dpBundleCache is the memoized data-plane bundle (see Server.dpBundle). Its payload is treated as
+// immutable once stored, so concurrent polls can read it without copying or locking.
+type dpBundleCache struct {
+	gen        uint64    // store bundle generation this was built from
+	threatVer  string    // threat-intel snapshot version this was built from
+	validUntil time.Time // earliest expiry of an included rule/session/bypass (zero = none)
+	etag       string
+	payload    map[string]any
+}
+
 func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
+	gen := s.store.BundleGeneration()
 	rev := s.store.GetRevision()
 	threatVer := ""
 	if ti := s.store.ThreatIntel(); ti != nil {
 		threatVer = ti.Snapshot().Version
 	}
 	s.recordHeartbeat(r, fmt.Sprint(rev), r.Header.Get("X-Aegis-Threat-Version"))
+	now := time.Now()
+
+	// Fast path: nothing data-plane-relevant changed (same bundle generation + threat version) and
+	// nothing included has expired since the bundle was built. Serve the cached bundle / a 304 without
+	// snapshotting or rebuilding — this is the common case on every worker poll.
+	s.dpBundleMu.Lock()
+	if c := s.dpBundle; c != nil && c.gen == gen && c.threatVer == threatVer && (c.validUntil.IsZero() || now.Before(c.validUntil)) {
+		etag, payload := c.etag, c.payload
+		s.dpBundleMu.Unlock()
+		s.writeDataPlaneBundle(w, r, etag, payload, rev, now)
+		return
+	}
+	s.dpBundleMu.Unlock()
+
+	// Rebuild (the expensive path, now only on a real change): snapshot the state and assemble the bundle.
 	snap := s.store.GetSnapshot()
 	policy := snap.SecurityPolicy
 	policy.TelemetryQueryRedaction = store.NormalizeRedactionMode(policy.TelemetryQueryRedaction)
@@ -191,17 +217,28 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 			Quarantined: srv.Quarantined,
 		})
 	}
-	now := time.Now()
+	// Track the earliest future expiry among the entries we include, so the cache is invalidated exactly
+	// when the bundle content would next change due to a rule/session/bypass expiring.
+	var validUntil time.Time
+	trackExpiry := func(t time.Time) {
+		if !t.IsZero() && (validUntil.IsZero() || t.Before(validUntil)) {
+			validUntil = t
+		}
+	}
 	sessions := make([]dpSession, 0)
 	for _, sess := range snap.Sessions {
 		if sess.Status == "active" && now.Before(sess.ExpiresAt) {
 			sessions = append(sessions, dpSession{ID: sess.ID, Name: sess.Name, ServerID: sess.ServerID, ServerIP: sess.ServerIP,
 				Mode: sess.Mode, Status: sess.Status, ExpiresAt: sess.ExpiresAt})
+			trackExpiry(sess.ExpiresAt)
 		}
 	}
 	rules := make([]models.PolicyRule, 0, len(snap.Rules))
 	for _, rule := range snap.Rules {
 		if rule.Enabled && (rule.ExpiresAt == nil || now.Before(*rule.ExpiresAt)) {
+			if rule.ExpiresAt != nil {
+				trackExpiry(*rule.ExpiresAt)
+			}
 			rule.Description = ""
 			rules = append(rules, rule)
 		}
@@ -209,6 +246,9 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 	tls := make([]models.TLSBypassRule, 0, len(snap.TLSBypass))
 	for _, b := range snap.TLSBypass {
 		if b.Enabled && (b.ExpiresAt == nil || now.Before(*b.ExpiresAt)) {
+			if b.ExpiresAt != nil {
+				trackExpiry(*b.ExpiresAt)
+			}
 			tls = append(tls, b)
 		}
 	}
@@ -236,15 +276,33 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	// The ETag is the hash of the bundle content, not the configuration revision: changes that do not
 	// affect the data-plane (for example package requests or analysis jobs advancing) bump the revision
-	// for cluster replication but leave this ETag unchanged, so workers keep their bundle (304).
+	// for cluster replication but leave this ETag — and the bundle generation — unchanged, so workers
+	// keep their bundle (304).
 	etag := bundleETag(payload)
+
+	s.dpBundleMu.Lock()
+	s.dpBundle = &dpBundleCache{gen: gen, threatVer: threatVer, validUntil: validUntil, etag: etag, payload: payload}
+	s.dpBundleMu.Unlock()
+
+	s.writeDataPlaneBundle(w, r, etag, payload, rev, now)
+}
+
+// writeDataPlaneBundle answers with a 304 when the worker's ETag matches, otherwise the bundle with a
+// fresh synced_at and the current revision. The cached payload is never mutated — these volatile fields
+// go onto a shallow copy, and neither is part of the ETag.
+func (s *Server) writeDataPlaneBundle(w http.ResponseWriter, r *http.Request, etag string, payload map[string]any, rev uint64, now time.Time) {
 	w.Header().Set("ETag", etag)
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	payload["synced_at"] = time.Now().UTC()
-	writeJSON(w, http.StatusOK, payload)
+	out := make(map[string]any, len(payload)+2)
+	for k, v := range payload {
+		out[k] = v
+	}
+	out["revision"] = rev
+	out["synced_at"] = now.UTC()
+	writeJSON(w, http.StatusOK, out)
 }
 
 // bundleETag is a stable hash of the data-plane-relevant bundle content. The configuration revision is

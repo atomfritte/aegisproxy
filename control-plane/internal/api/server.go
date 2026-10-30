@@ -71,6 +71,12 @@ type Server struct {
 
 	draining atomic.Bool
 
+	// dpBundle caches the compiled data-plane bundle so an unchanged worker poll serves a 304 (or the
+	// cached body) without a full state snapshot + rebuild. Invalidated by the store's bundle generation,
+	// the threat-intel version and time-based rule/session expiry.
+	dpBundleMu sync.Mutex
+	dpBundle   *dpBundleCache
+
 	dpMu       sync.Mutex
 	dataPlanes map[string]*DataPlaneStatus
 

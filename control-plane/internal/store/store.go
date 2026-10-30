@@ -151,6 +151,9 @@ type Store struct {
 	filePath    string
 	state       StateSnapshot
 	compiledIdx *engine.CompiledPolicyIndex
+	// bundleGen increments whenever a data-plane-bundle input is recompiled (buildIndexLocked); it does
+	// NOT move on work-store churn (bumpConfigLocked), so the bundle handler can cache the built bundle.
+	bundleGen   uint64
 	ruleIndex   map[string]int
 	quarantined map[string]bool
 	saByHash    map[string]int
@@ -400,6 +403,7 @@ func (s *Store) rebuildIndexLocked() {
 // buildIndexLocked derives everything that is computed from the configuration: effective group
 // membership, the compiled rule list and the matching index.
 func (s *Store) buildIndexLocked(rev uint64) {
+	s.bundleGen++ // a data-plane-relevant input changed; the cached bundle is now stale
 	s.computeEffectiveGroupsLocked()
 	s.compileRulesLocked()
 	s.compiledIdx = engine.BuildCompiledIndex(rev, s.state.Groups, s.effectiveServersLocked(), s.state.Rules)
@@ -892,6 +896,16 @@ func (s *Store) GetRevision() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.Revision
+}
+
+// BundleGeneration increments whenever a data-plane-bundle input changes (policy, groups, servers,
+// sessions, YARA, block pages, package config) but not on work-store churn (requests / assessments /
+// jobs). The data-plane bundle handler caches the compiled bundle keyed on this, so an unchanged poll
+// skips the full snapshot + rebuild. Time-based rule/session expiry is handled separately by the cache.
+func (s *Store) BundleGeneration() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bundleGen
 }
 
 func (s *Store) GetUserByID(userID string) (*models.User, bool) {
