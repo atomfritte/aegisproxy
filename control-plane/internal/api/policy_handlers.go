@@ -775,9 +775,11 @@ no_proxy=%[3]s
 NO_PROXY=%[3]s
 EOF
 
-# 3. Package managers
-echo 'Acquire::http::Proxy "%[2]s"; Acquire::https::Proxy "%[2]s";' | sudo tee /etc/apt/apt.conf.d/95aegis-proxy >/dev/null   # Debian/Ubuntu
-printf 'proxy=http://%[4]s\nproxy_username=%[5]s\nproxy_password=%[6]s\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null   # RHEL/Rocky/Alma
+# 3. Package managers (only the ones present on this host; pacman/zypper read the env from step 2)
+[ -d /etc/apt/apt.conf.d ] && echo 'Acquire::http::Proxy "%[2]s"; Acquire::https::Proxy "%[2]s";' | sudo tee /etc/apt/apt.conf.d/95aegis-proxy >/dev/null   # Debian/Ubuntu
+[ -f /etc/dnf/dnf.conf ] && printf 'proxy=http://%[4]s\nproxy_username=%[5]s\nproxy_password=%[6]s\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null   # RHEL/Rocky/Alma
+# pacman (Arch/CachyOS) and zypper (SUSE) honour the http_proxy/https_proxy from /etc/aegis-proxy.env; for pacman
+# run it so the environment is loaded, e.g.:  sudo env $(grep -v '^#' /etc/aegis-proxy.env | xargs) pacman -Sy
 
 # 4. Verify (expect 403 + block page text for a non-whitelisted host)
 set -a; . /etc/aegis-proxy.env; set +a; curl -sS -o /dev/null -w '%%{http_code}\n' https://example.org/

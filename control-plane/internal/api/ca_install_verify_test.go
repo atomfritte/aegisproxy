@@ -40,7 +40,10 @@ func TestLinuxInstallScriptInstallsOnlyTheVerifiedCertificate(t *testing.T) {
 	if start < 0 || end < start {
 		t.Fatalf("verification block not found:\n%s", script)
 	}
-	if strings.Count(script, `install -m 0644 "$TMP_CA"`) != 3 || strings.Contains(script, `install -m 0644 "$DOWNLOAD"`) {
+	// Debian/Ubuntu, RHEL/Fedora, SLES and Arch install the re-encoded verified certificate directly;
+	// the p11-kit fallback stores the same "$TMP_CA". None may install the raw "$DOWNLOAD".
+	if strings.Count(script, `install -m 0644 "$TMP_CA"`) != 4 || strings.Contains(script, `install -m 0644 "$DOWNLOAD"`) ||
+		!strings.Contains(script, `trust anchor --store "$TMP_CA"`) {
 		t.Fatal("every trust store must receive the re-encoded, verified certificate only")
 	}
 	check := func(download []byte) (string, string, error) {

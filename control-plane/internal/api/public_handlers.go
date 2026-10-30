@@ -235,8 +235,20 @@ elif [ -d /etc/pki/trust/anchors ]; then
     update-ca-certificates
     BUNDLE_PATH="/var/lib/ca-certificates/ca-bundle.pem"
     echo "[+] Installed into SLES trust store."
+elif [ -d /etc/ca-certificates/trust-source/anchors ]; then
+    # Arch Linux / CachyOS / Manjaro
+    install -m 0644 "$TMP_CA" /etc/ca-certificates/trust-source/anchors/aegis-enterprise-ca.crt
+    update-ca-trust
+    BUNDLE_PATH="/etc/ssl/certs/ca-certificates.crt"
+    echo "[+] Installed into Arch Linux trust store."
+elif command -v trust >/dev/null 2>&1 && [ -d /etc/ssl/certs ]; then
+    # Fallback for any p11-kit based distribution (reads and stores the verified certificate).
+    trust anchor --store "$TMP_CA"
+    BUNDLE_PATH="/etc/ssl/certs/ca-certificates.crt"
+    echo "[+] Installed via p11-kit trust anchor."
 else
     echo "[!] Unsupported distribution: no known CA trust store directory found." >&2
+    echo "    Install $TMP_CA into your distribution's trust store manually, then re-run with its path." >&2
     exit 1
 fi
 
