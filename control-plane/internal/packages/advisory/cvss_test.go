@@ -14,7 +14,7 @@ func TestCVSSBaseScore(t *testing.T) {
 		{"CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", 5.3},
 		{"CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N", 3.7},
 		{"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0},
-		{"CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P", 0},   // unsupported version
+		{"CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P", 0}, // unsupported version
 		{"garbage", 0},
 	}
 	for _, c := range cases {

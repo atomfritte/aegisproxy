@@ -154,6 +154,16 @@ Publicly known default secrets of earlier releases are rejected at start-up.
 | `AEGIS_THREATINTEL_AUTOUPDATE` | `true` | Download feeds automatically. Set `false` in air-gapped environments (cached feeds + custom IOCs only). |
 | `AEGIS_FEED_HTTP_PROXY` | – | Explicit proxy for feed downloads (otherwise `HTTPS_PROXY`/`NO_PROXY` from the environment). |
 
+### Package firewall (3.0)
+
+The package firewall is off until an ecosystem is switched to `monitor` or `enforce` in the console
+(Packages → Settings). See [package-firewall.md](package-firewall.md).
+
+| Variable | Default | Description |
+|---|---|---|
+| `AEGIS_PACKAGE_HTTP_PROXY` | `AEGIS_FEED_HTTP_PROXY` | Explicit egress proxy for registry metadata and advisory lookups (otherwise `HTTPS_PROXY`/`NO_PROXY`). The control-plane fetches metadata only; artifacts are served by the data-plane and fetched for analysis by the sandbox workers. |
+| `AEGIS_SANDBOX_KEY` | – | Shared secret authenticating sandbox analysis workers (`X-Aegis-Sandbox-Key`). Without it the sandbox job API is closed and behavior analysis is disabled; approvals then rely on advisories, signatures and provenance only. |
+
 ### Operations
 
 | Variable | Default | Description |

@@ -94,6 +94,10 @@ type Config struct {
 
 	ThreatIntelAutoUpdate bool
 	FeedHTTPProxy         string
+	// PackageHTTPProxy routes the package firewall's registry and advisory traffic through an egress
+	// proxy (empty = environment proxy settings). SandboxKey authenticates sandbox analysis workers.
+	PackageHTTPProxy string
+	SandboxKey       string
 
 	AuditLogPath string
 	// AuditRotateBytes rotates audit.jsonl by size inside the process (0 = external rotation only).
@@ -191,6 +195,8 @@ func Load() (*Config, error) {
 		DemoMode:              envBool("AEGIS_DEMO_MODE", false),
 		ThreatIntelAutoUpdate: envBool("AEGIS_THREATINTEL_AUTOUPDATE", true),
 		FeedHTTPProxy:         env("AEGIS_FEED_HTTP_PROXY", ""),
+		PackageHTTPProxy:      env("AEGIS_PACKAGE_HTTP_PROXY", env("AEGIS_FEED_HTTP_PROXY", "")),
+		SandboxKey:            env("AEGIS_SANDBOX_KEY", ""),
 		LogFormat:             env("AEGIS_LOG_FORMAT", "json"),
 		LogFile:               env("AEGIS_LOG_FILE", ""),
 	}

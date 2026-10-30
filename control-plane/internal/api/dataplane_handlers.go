@@ -5,6 +5,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -171,13 +174,7 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 	if ti := s.store.ThreatIntel(); ti != nil {
 		threatVer = ti.Snapshot().Version
 	}
-	etag := fmt.Sprintf(`"rev-%d-%s"`, rev, threatVer)
 	s.recordHeartbeat(r, fmt.Sprint(rev), r.Header.Get("X-Aegis-Threat-Version"))
-	w.Header().Set("ETag", etag)
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
 	snap := s.store.GetSnapshot()
 	policy := snap.SecurityPolicy
 	policy.TelemetryQueryRedaction = store.NormalizeRedactionMode(policy.TelemetryQueryRedaction)
@@ -221,7 +218,7 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 			yaraSets = append(yaraSets, map[string]string{"id": rs.ID, "name": rs.Name, "source": rs.Source})
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"revision":             snap.Revision,
 		"yara_rule_sets":       yaraSets,
 		"rules":                rules,
@@ -235,8 +232,39 @@ func (s *Server) handleDataPlaneBundle(w http.ResponseWriter, r *http.Request) {
 		"internal_domains":     s.cfg.InternalSuffix,
 		"public_url":           s.cfg.PublicURL,
 		"dashboard_url":        s.cfg.DashboardURL,
-		"synced_at":            time.Now().UTC(),
-	})
+		"packages":             s.store.PackageBundle(s.consoleURL("")),
+	}
+	// The ETag is the hash of the bundle content, not the configuration revision: changes that do not
+	// affect the data-plane (for example package requests or analysis jobs advancing) bump the revision
+	// for cluster replication but leave this ETag unchanged, so workers keep their bundle (304).
+	etag := bundleETag(payload)
+	w.Header().Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	payload["synced_at"] = time.Now().UTC()
+	writeJSON(w, http.StatusOK, payload)
+}
+
+// bundleETag is a stable hash of the data-plane-relevant bundle content. The configuration revision is
+// excluded, so a revision bump that did not change the bundle (for example a package request or an
+// analysis job advancing) does not invalidate the workers' cached bundle. Go's json.Marshal sorts map
+// keys, so the encoding is deterministic.
+func bundleETag(payload map[string]any) string {
+	hashed := make(map[string]any, len(payload))
+	for k, v := range payload {
+		if k == "revision" || k == "synced_at" {
+			continue
+		}
+		hashed[k] = v
+	}
+	b, err := json.Marshal(hashed)
+	if err != nil {
+		return fmt.Sprintf(`"rev-%v"`, payload["revision"])
+	}
+	sum := sha256.Sum256(b)
+	return `"b-` + hex.EncodeToString(sum[:16]) + `"`
 }
 
 func (s *Server) handleDataPlaneThreatIntel(w http.ResponseWriter, r *http.Request) {

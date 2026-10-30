@@ -20,9 +20,11 @@ import (
 	"aegisproxy/control-plane/internal/auth"
 	"aegisproxy/control-plane/internal/ca"
 	"aegisproxy/control-plane/internal/config"
+	"aegisproxy/control-plane/internal/coordinator"
 	"aegisproxy/control-plane/internal/engine"
 	"aegisproxy/control-plane/internal/export"
 	"aegisproxy/control-plane/internal/models"
+	"aegisproxy/control-plane/internal/packages"
 	"aegisproxy/control-plane/internal/notify"
 	"aegisproxy/control-plane/internal/sealed"
 	"aegisproxy/control-plane/internal/store"
@@ -50,6 +52,8 @@ func main() {
 			os.Exit(genCSR(os.Args[2:]))
 		case "import-ca":
 			os.Exit(importCA(os.Args[2:]))
+		case "sandbox-worker":
+			os.Exit(runSandboxWorker())
 		case "service":
 			// Windows service entry point (ImagePath "aegis-control-plane.exe service").
 			if _, err := runAsWindowsService(run, true); err != nil {
@@ -58,7 +62,7 @@ func main() {
 			}
 			return
 		case "-h", "--help", "help":
-			fmt.Println("usage: aegis-control-plane [service | healthcheck [healthz|readyz] | version | gen-ca <certs-dir> [public-cert-dir] | gen-csr <certs-dir> <subject> | import-ca <certs-dir> <cert.pem> [chain.pem]]\n\nConfiguration is read from AEGIS_* environment variables (see docs/configuration.md).")
+			fmt.Println("usage: aegis-control-plane [service | sandbox-worker | healthcheck [healthz|readyz] | version | gen-ca <certs-dir> [public-cert-dir] | gen-csr <certs-dir> <subject> | import-ca <certs-dir> <cert.pem> [chain.pem]]\n\nConfiguration is read from AEGIS_* environment variables (see docs/configuration.md).")
 			return
 		}
 	}
@@ -260,8 +264,25 @@ func run(ctx context.Context) error {
 	authMgr := auth.NewAuthManager(cfg.JWTSecret, cfg.SessionTTL)
 	authMgr.SetRevocationChecker(st)
 
+	// Package firewall (3.0): the registry/resolution/assessment service, the raw-report store and the
+	// coordinator that drives request resolution, analysis and the re-audit / watch loops.
+	pkgSvc := packages.NewService(packages.Options{
+		HTTPProxy: cfg.PackageHTTPProxy,
+		Settings:  func() models.PackageSettings { return st.PackageFirewall().Settings },
+		Verifier:  packages.NewRegistryVerifier(cfg.PackageHTTPProxy, logger),
+		Logger:    logger,
+	})
+	reportStore, err := packages.NewReportStore(filepath.Join(cfg.DataDir, "packages", "reports"))
+	if err != nil {
+		return fmt.Errorf("package report store: %w", err)
+	}
+	pkgCoord := coordinator.New(st, pkgSvc, reportStore, logger)
+	pkgCoord.Start()
+	defer pkgCoord.Close()
+
 	srv := api.NewServer(api.Deps{
 		Store: st, Auth: authMgr, CA: caMgr, Notifier: notifier, Config: cfg, Logger: logger, Version: Version, Exporter: exporter,
+		Packages: pkgCoord, PackageSvc: pkgSvc, PackageRepo: reportStore,
 	})
 
 	go ti.Run(ctx)

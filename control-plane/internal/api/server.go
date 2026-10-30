@@ -16,21 +16,26 @@ import (
 	"aegisproxy/control-plane/internal/auth"
 	"aegisproxy/control-plane/internal/ca"
 	"aegisproxy/control-plane/internal/config"
+	"aegisproxy/control-plane/internal/coordinator"
 	"aegisproxy/control-plane/internal/export"
 	"aegisproxy/control-plane/internal/notify"
+	"aegisproxy/control-plane/internal/packages"
 	"aegisproxy/control-plane/internal/sealed"
 	"aegisproxy/control-plane/internal/store"
 )
 
 type Deps struct {
-	Store    *store.Store
-	Auth     *auth.AuthManager
-	CA       *ca.CAManager
-	Notifier *notify.Dispatcher
-	Config   *config.Config
-	Logger   *slog.Logger
-	Version  string
-	Exporter *export.Manager
+	Store       *store.Store
+	Auth        *auth.AuthManager
+	CA          *ca.CAManager
+	Notifier    *notify.Dispatcher
+	Config      *config.Config
+	Logger      *slog.Logger
+	Version     string
+	Exporter    *export.Manager
+	Packages    *coordinator.Coordinator
+	PackageSvc  *packages.Service
+	PackageRepo *packages.ReportStore
 }
 
 type Server struct {
@@ -43,6 +48,9 @@ type Server struct {
 	log      *slog.Logger
 	version  string
 	started  time.Time
+	pkgs     *coordinator.Coordinator
+	pkgSvc   *packages.Service
+	pkgRepo  *packages.ReportStore
 
 	mux          *http.ServeMux
 	handler      http.Handler
@@ -114,6 +122,9 @@ func NewServer(d Deps) *Server {
 		caLimit:      newRateLimiter(120, time.Minute),
 		dataPlanes:   make(map[string]*DataPlaneStatus),
 		ssePerUser:   make(map[string]int),
+		pkgs:         d.Packages,
+		pkgSvc:       d.PackageSvc,
+		pkgRepo:      d.PackageRepo,
 	}
 	if d.Config != nil {
 		s.proxyHosts = newProxyHostSet(d.Config.TrustedProxyHosts, s.log, s.metrics)
@@ -249,6 +260,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/security/yara/{id}", s.authed(s.handleSaveYara))
 	s.mux.HandleFunc("DELETE /api/security/yara/{id}", s.authed(s.handleDeleteYara))
 
+	s.packageRoutes()
 	s.policyRoutes()
 	s.serviceAccountRoutes()
 	s.ssoRoutes()

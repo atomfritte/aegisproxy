@@ -38,6 +38,13 @@ const (
 	PackageModeEnforce = "enforce" // metadata filtered to approved versions, only approved artifacts delivered
 )
 
+// Kinds of a classified registry request (FlowPackage.Kind).
+const (
+	FlowPkgMetadata = "metadata"
+	FlowPkgArtifact = "artifact"
+	FlowPkgService  = "service"
+)
+
 // Decisions of the data-plane package gate (FlowPackage.Decision).
 const (
 	PackageDecisionApproved     = "approved"      // approved artifact delivered (hash verified)

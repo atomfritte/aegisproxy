@@ -107,6 +107,21 @@ type StateSnapshot struct {
 	// SCIM configures inbound provisioning (token digests only); SCIMGroups are the pushed groups.
 	SCIM       models.SCIMConfig  `json:"scim"`
 	SCIMGroups []models.SCIMGroup `json:"scim_groups,omitempty"`
+	// Packages is the package firewall (3.0): settings, rules, approvals and blocks. These travel in the
+	// data-plane bundle, so a change to them is a policy change (the bundle ETag covers them).
+	Packages models.PackageFirewall `json:"packages"`
+	// PackageWork is the firewall's work-store: open/closed requests with their resolved graphs, the
+	// assessment cache and the sandbox analysis queue. It is persisted and cluster-replicated in this
+	// configuration document but is NOT part of the data-plane bundle (the bundle ETag ignores it), so
+	// analysis churn does not resync the workers. Raw sandbox reports are kept out-of-band by ReportKey.
+	PackageWork PackageWorkState `json:"package_work"`
+}
+
+// PackageWorkState holds the firewall's request/assessment/job records.
+type PackageWorkState struct {
+	Requests    []models.PackageRequest             `json:"requests,omitempty"`
+	Assessments map[string]models.PackageAssessment `json:"assessments,omitempty"` // key: ecosystem:name@version
+	Jobs        []models.AnalysisJob                `json:"jobs,omitempty"`
 }
 
 type Options struct {
@@ -421,6 +436,15 @@ func (s *Store) markDirtyLocked() {
 	}
 }
 
+// bumpConfigLocked persists a configuration change that does not affect the data-plane bundle or the
+// policy index (the package firewall's work-store: requests, assessments, analysis jobs). It bumps the
+// revision so cluster peers reload the document, but skips the rule/index recompile. The data-plane
+// bundle ETag ignores the revision, so the workers are not resynced. Callers hold s.mu.
+func (s *Store) bumpConfigLocked() {
+	s.state.Revision++
+	s.markDirtyLocked()
+}
+
 const telemetryPersistInterval = 15 * time.Second
 
 func (s *Store) markTelemetryDirtyLocked() { s.telemetryDirty = true }
@@ -653,6 +677,7 @@ func (s *Store) seedProduction() {
 	s.state.Governance = DefaultGovernance()
 	s.state.BlockPages = []models.BlockPageTemplate{DefaultBlockPageTemplate()}
 	s.state.PolicySets = []models.PolicySet{}
+	s.state.Packages = DefaultPackageFirewall()
 	s.appendAuditLocked(models.AuditEvent{
 		Actor: "system", ActorRole: "SYSTEM", Action: "SYSTEM_INITIALIZED", Category: "SYSTEM",
 		EntityType: "control_plane", EntityID: "aegis", EntityName: "AegisProxy Control-Plane",
@@ -725,6 +750,14 @@ func (s *Store) migrateLocked() {
 	}
 	if !slices.ContainsFunc(s.state.BlockPages, func(t models.BlockPageTemplate) bool { return t.IsDefault }) {
 		s.state.BlockPages = append([]models.BlockPageTemplate{DefaultBlockPageTemplate()}, s.state.BlockPages...)
+	}
+	// 3.0: the package firewall. A state written before 3.0 has no ecosystems configured; seed the
+	// defaults (every ecosystem off, so an upgrade changes no traffic until an operator enables one),
+	// and add newly shipped default advisory sources while keeping the operator's choices.
+	if s.state.Packages.Settings.Ecosystems == nil {
+		s.state.Packages = DefaultPackageFirewall()
+	} else {
+		mergePackageAuditDefaultsLocked(&s.state.Packages.Settings)
 	}
 	s.state.SchemaVersion = currentSchemaVersion
 }
@@ -972,6 +1005,7 @@ func (s *Store) GetSnapshot() StateSnapshot {
 		ChangeRequests:   append([]models.ChangeRequest(nil), s.state.ChangeRequests...),
 		Governance:       s.state.Governance,
 		BlockPages:       pages,
+		Packages:         clonePackageFirewall(s.state.Packages, true),
 	}
 }
 
