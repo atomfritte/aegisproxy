@@ -4,6 +4,7 @@
 # Allowlist: only the tracked files listed below are sent to the builder. A file that is not tracked (planted
 # in the checkout and hidden from 'git status' by .gitignore or .git/info/exclude) never reaches the image.
 *
+!cmd/aegis-sandbox-runner/main.go
 !go.mod
 !go.sum
 !internal/api/admin_handlers.go
@@ -50,6 +51,7 @@
 !internal/export/validate.go
 !internal/models/identity.go
 !internal/models/models.go
+!internal/models/packages.go
 !internal/netguard/addrclass.go
 !internal/netguard/hosts.go
 !internal/netguard/netguard.go
@@ -58,6 +60,30 @@
 !internal/oidc/clientauth.go
 !internal/oidc/oidc.go
 !internal/oidc/oidctest/idp.go
+!internal/sandbox/report.go
+!internal/sandbox/runner/analyze.go
+!internal/sandbox/runner/archive.go
+!internal/sandbox/runner/bound.go
+!internal/sandbox/runner/canary.go
+!internal/sandbox/runner/collector.go
+!internal/sandbox/runner/dns.go
+!internal/sandbox/runner/exec_linux.go
+!internal/sandbox/runner/findings.go
+!internal/sandbox/runner/indicators.go
+!internal/sandbox/runner/init_linux.go
+!internal/sandbox/runner/input.go
+!internal/sandbox/runner/kinds.go
+!internal/sandbox/runner/loaders.go
+!internal/sandbox/runner/manifest.go
+!internal/sandbox/runner/phases.go
+!internal/sandbox/runner/runner.go
+!internal/sandbox/runner/sandboxca.go
+!internal/sandbox/runner/signature.go
+!internal/sandbox/runner/sinks.go
+!internal/sandbox/runner/strace.go
+!internal/sandbox/runner/syscalls.go
+!internal/sandbox/runner/util.go
+!internal/sandbox/runner/version.go
 !internal/scim/filter.go
 !internal/scim/patch.go
 !internal/scim/resources.go

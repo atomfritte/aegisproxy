@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>ObserverDemo</id>
+    <version>1.0.0</version>
+    <authors>AegisProxy Sandbox Fixture</authors>
+    <description>AegisProxy sandbox test fixture (harmless). Its MSBuild .targets runs during a consuming project's build and exercises the sandbox observers.</description>
+    <license type="expression">MIT</license>
+  </metadata>
+</package>

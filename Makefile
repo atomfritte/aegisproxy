@@ -76,3 +76,10 @@ dockerignore:
 
 clean:
 	rm -rf dist frontend/dist
+
+# Package-firewall behavior-analysis sandbox images, one per ecosystem (aegisproxy-sandbox-<eco>:$(SANDBOX_TAG)).
+# The runner is compiled from the Go module in a multi-stage build; base images are pinned by tag + digest.
+SANDBOX_TAG ?= $(VERSION)
+.PHONY: sandbox-images
+sandbox-images:
+	scripts/sandbox/build-images.sh "$(SANDBOX_TAG)" "$(VERSION)"

