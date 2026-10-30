@@ -4,10 +4,10 @@ import (
 	"errors"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
-// NuGetRange is a NuGet version range: interval notation, a bare minimum version or a floating version.
+// NuGetRange is a NuGet version range: interval notation, a bare minimum version or a floating version. The zero
+// value is the range of all versions.
 type NuGetRange struct {
 	min, max       NuGetVersion
 	hasMin, hasMax bool
@@ -29,7 +29,7 @@ const (
 	floatPrereleaseRevision               // 1.0.0.*-*
 	floatPrereleasePatch                  // 1.0.*-*
 	floatPrereleaseMinor                  // 1.*-*
-	floatPrereleaseMajor                  // *-*-like with a label prefix: *-beta*
+	floatPrereleaseMajor                  // *-beta*
 )
 
 type nugetFloat struct {
@@ -44,7 +44,7 @@ var errNuGetRange = errors.New("invalid NuGet version range")
 // "(,2.0]", "[1.0]", "1.0" (at least 1.0), and floating minimums such as "1.*", "1.2.*", "*", "1.0.0-*",
 // "1.0.0-beta*" or "1.*-*". An empty string is the range of all versions (an omitted nuspec version).
 func ParseNuGetRange(s string) (NuGetRange, error) {
-	t := strings.TrimFunc(s, unicode.IsSpace)
+	t := trimSpace(s)
 	var r NuGetRange
 	switch {
 	case t == "":
@@ -73,7 +73,7 @@ func ParseNuGetRange(s string) (NuGetRange, error) {
 		}
 		minS, maxS = parts[0], parts[len(parts)-1]
 	}
-	if strings.TrimFunc(minS, unicode.IsSpace) != "" {
+	if trimSpace(minS) != "" {
 		if strings.Contains(minS, "*") {
 			f, ok := parseNuGetFloat(minS)
 			if !ok {
@@ -89,7 +89,7 @@ func ParseNuGetRange(s string) (NuGetRange, error) {
 		}
 		r.hasMin = true
 	}
-	if strings.TrimFunc(maxS, unicode.IsSpace) != "" {
+	if trimSpace(maxS) != "" {
 		v, err := ParseNuGet(maxS)
 		if err != nil {
 			return NuGetRange{}, errNuGetRange
@@ -108,7 +108,7 @@ func ParseNuGetRange(s string) (NuGetRange, error) {
 
 // parseNuGetFloat is FloatRange.TryParse.
 func parseNuGetFloat(s string) (nugetFloat, bool) {
-	if strings.TrimFunc(s, unicode.IsSpace) == "" {
+	if trimSpace(s) == "" {
 		return nugetFloat{}, false
 	}
 	first, last := strings.IndexByte(s, '*'), strings.LastIndexByte(s, '*')

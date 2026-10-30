@@ -13,7 +13,7 @@ import (
 // The testdata/*.json vectors are generated from the reference implementations by the programs in
 // testdata/gen (node-semver and npm-package-arg, pypa/packaging, NuGet.Versioning).
 
-func loadVectors(t *testing.T, name string, v any) {
+func loadVectors(t testing.TB, name string, v any) {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {

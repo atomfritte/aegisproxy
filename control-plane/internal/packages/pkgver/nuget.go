@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // NuGetVersion is a NuGet package version (SemVer 2.0 with an optional fourth "revision" part) as
@@ -21,7 +22,7 @@ var errNuGet = errors.New("invalid NuGet version")
 // parts (leading zeros and whitespace around a part are allowed), dot-separated pre-release labels of
 // [0-9A-Za-z-] without leading zeros in numeric labels, and build metadata after "+".
 func ParseNuGet(s string) (NuGetVersion, error) {
-	s = strings.TrimFunc(s, unicode.IsSpace)
+	s = trimSpace(s)
 	var v NuGetVersion
 	core, labels, meta := s, "", ""
 	hasLabels, hasMeta := false, false
@@ -41,8 +42,8 @@ func ParseNuGet(s string) (NuGetVersion, error) {
 	}
 	n := 0
 	for part := range strings.SplitSeq(core, ".") {
-		part = strings.TrimFunc(part, unicode.IsSpace)
-		if n == 4 || part == "" || strings.Trim(part, "0123456789") != "" {
+		part = trimSpace(part)
+		if n == 4 || part == "" || !allDigits(part) {
 			return v, errNuGet
 		}
 		x, err := strconv.ParseInt(part, 10, 32)
@@ -81,7 +82,25 @@ func nugetValidPart(s string, allowLeadingZeros bool) bool {
 			return false
 		}
 	}
-	return allowLeadingZeros || len(s) == 1 || s[0] != '0' || strings.Trim(s, "0123456789") != ""
+	return allowLeadingZeros || len(s) == 1 || s[0] != '0' || !allDigits(s)
+}
+
+// allDigits reports whether s has only ASCII digits (true for "").
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isDigit(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// trimSpace is .NET's String.Trim (Unicode white space), with a fast path for the usual untrimmed input.
+func trimSpace(s string) string {
+	if s != "" && s[0] > ' ' && s[0] < utf8.RuneSelf && s[len(s)-1] > ' ' && s[len(s)-1] < utf8.RuneSelf {
+		return s
+	}
+	return strings.TrimFunc(s, unicode.IsSpace)
 }
 
 // Major returns the first version part.
@@ -179,7 +198,7 @@ func compareNuGetLabel(a, b string) int {
 // nugetInt32 is Int32.TryParse for a label: an optional "-" and digits within the int32 range.
 func nugetInt32(s string) (int, bool) {
 	digits := strings.TrimPrefix(s, "-")
-	if digits == "" || strings.Trim(digits, "0123456789") != "" {
+	if digits == "" || !allDigits(digits) {
 		return 0, false
 	}
 	n, err := strconv.ParseInt(s, 10, 32)

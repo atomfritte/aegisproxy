@@ -115,7 +115,7 @@ func scanPEP440(s string, allowLocal bool) (PEP440Version, string, bool) {
 				e++
 			}
 			seg := strings.ToLower(s[j:e])
-			v.local = append(v.local, pepLocal{s: seg, num: strings.Trim(seg, "0123456789") == ""})
+			v.local = append(v.local, pepLocal{s: seg, num: allDigits(seg)})
 			i = e
 			if e+1 < len(s) && isSep(s[e]) && isAlnum(s[e+1]) {
 				j = e + 1

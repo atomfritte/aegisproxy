@@ -186,7 +186,7 @@ func npmHostedGit(s string) bool {
 	if c := strings.IndexByte(authority, ':'); c >= 0 {
 		port := authority[c+1:]
 		authority = authority[:c]
-		if strings.Trim(port, "0123456789") != "" {
+		if !allDigits(port) {
 			path = "/" + port + path // git+ssh://git@github.com:user/repo
 		}
 	}
