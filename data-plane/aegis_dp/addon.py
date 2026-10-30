@@ -38,7 +38,7 @@ import socket
 import time
 import urllib.parse
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from mitmproxy import connection, ctx, http, tcp, tls, udp
 from mitmproxy.proxy import server_hooks
@@ -947,10 +947,12 @@ class AegisAddon:
         if not res.allowed:
             self._block(flow, res, peer, auth, status=407 if res.verdict == VERDICT_AUTH_FAILED else 403)
             return
-        inspect_on = self._inspection_enabled(policy, res.group_ids)
+        blocked_types = self._blocked_types(policy, res.group_ids)
+        inspect_on = self._inspection_enabled(policy, res.group_ids, blocked=blocked_types)
         if inspect_on:
             self._prepare_inspection(flow, res)
-        meta = flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on}
+        meta = flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on,
+                                         "blocked_types": blocked_types, "_insp_policy": policy, "_insp_threat": self.cp.threat}
         # Package firewall gate: acts only on otherwise-ALLOWED requests to the registry hosts (quarantine, threat,
         # explicit BLOCK and auth decisions keep precedence and have already returned above). A gate block answers
         # locally (403), never upstream.
@@ -1283,13 +1285,28 @@ class AegisAddon:
             data.server.address = (str(addrs[0]), port)
 
     # ------------------------------------------------------------------ responses
-    def _inspection_enabled(self, policy: Policy, groups: List[str]) -> bool:
+    def _inspection_state(self, policy: Policy, meta: Dict[str, Any]) -> Tuple[bool, set]:
+        """``inspect_on`` and the blocked-file-type set for this flow's response phase, computed once and cached on
+        ``meta``. Recomputed only when the policy or threat snapshot that fed them actually changed, so the value is
+        always identical to computing it fresh at each call site (no behaviour change, just no repeated work)."""
+        if meta.get("_insp_policy") is not policy or meta.get("_insp_threat") is not self.cp.threat:
+            blocked = self._blocked_types(policy, meta["res"].group_ids)
+            meta["blocked_types"] = blocked
+            meta["inspect"] = self._inspection_enabled(policy, meta["res"].group_ids, blocked=blocked)
+            meta["_insp_policy"] = policy
+            meta["_insp_threat"] = self.cp.threat
+        return meta["inspect"], meta["blocked_types"]
+
+    def _inspection_enabled(self, policy: Policy, groups: List[str], blocked: Optional[set] = None) -> bool:
         yara_on = policy.policy_value("yara_mode", "off") != "off" and bool(policy.yara_rule_sets)
-        return bool((policy.policy_value("av_enabled", False) and self.clamd) or self._blocked_types(policy, groups)
+        if blocked is None:
+            blocked = self._blocked_types(policy, groups)
+        return bool((policy.policy_value("av_enabled", False) and self.clamd) or blocked
                     or (self.cp.threat.hashes and policy.policy_value("threat_intel_mode", "block") != "off")
                     or yara_on or policy.policy_value("icap_respmod_url", ""))
 
-    def _download_enforcing(self, policy: Policy, groups: List[str], scanners_only: bool = False) -> bool:
+    def _download_enforcing(self, policy: Policy, groups: List[str], scanners_only: bool = False,
+                            blocked: Optional[set] = None) -> bool:
         """A download inspection that can block. ``scanners_only``: only the engines that need the decoded copy
         (ClamAV, YARA, ICAP RESPMOD); file type and hash IOCs run on the buffered body without it."""
         scanners = bool((policy.policy_value("av_enabled", False) and self.clamd and policy.policy_value("av_mode", "block") == "block")
@@ -1297,7 +1314,9 @@ class AegisAddon:
                         or (policy.policy_value("icap_respmod_url", "") and policy.policy_value("icap_mode", "block") == "block"))
         if scanners or scanners_only:
             return scanners
-        return bool(self._blocked_types(policy, groups)
+        if blocked is None:
+            blocked = self._blocked_types(policy, groups)
+        return bool(blocked
                     or (self.cp.threat.hashes and policy.policy_value("threat_intel_mode", "block") == "block"))
 
     @staticmethod
@@ -1426,8 +1445,7 @@ class AegisAddon:
                 return
             if meta.get("pkg_filter") and self._setup_metadata_filter(flow, policy, res, meta):
                 return
-        inspect_on = self._inspection_enabled(policy, res.group_ids)
-        meta["inspect"] = inspect_on
+        inspect_on, blocked_types = self._inspection_state(policy, meta)
         resp = flow.response
         if inspect_on and self._has_body(flow):
             if resp.status_code == 206:
@@ -1450,7 +1468,7 @@ class AegisAddon:
         clen_raw = resp.headers.get("Content-Length", "")
         clen = int(clen_raw) if clen_raw.isdigit() else None
         if clen is not None and clen > max_scan and inspect_on:
-            peek = self._type_peek(policy, res.group_ids, max_scan) if self._has_body(flow) else 0
+            peek = self._type_peek(blocked_types, max_scan) if self._has_body(flow) else 0
             if policy.policy_value("av_oversize_action", "allow") == "block":
                 self._block_streamed(flow, meta, "av_oversize", f"Antivirus: download of {clen} bytes exceeds the {max_scan}-byte scan limit",
                                      f"AegisProxy blocked this download: {clen} bytes exceed the antivirus scan limit ({max_scan} bytes).\n"
@@ -1483,7 +1501,7 @@ class AegisAddon:
             # by chunk as the body arrives (with or without Content-Length).
             guard = buffering.attach(flow, "response", BodyGuard(self.budget, max_scan,
                                                                  lambda reason, _size: self._download_exceeded(flow, policy, meta, max_scan, reason),
-                                                                 self._buffer_client(meta), peek=self._type_peek(policy, res.group_ids, max_scan)))
+                                                                 self._buffer_client(meta), peek=self._type_peek(blocked_types, max_scan)))
             if clen is not None:
                 reason = guard.declared(clen)
                 if reason:
@@ -1494,16 +1512,16 @@ class AegisAddon:
         meta["unscanned"] = "not_required"
         return STREAM
 
-    def _type_peek(self, policy: Policy, groups: List[str], max_scan: int) -> int:
+    def _type_peek(self, blocked: set, max_scan: int) -> int:
         """Bytes of an oversize download's head that are buffered for its file type (0: no file type is blocked)."""
-        return min(FILE_TYPE_SAMPLE, max_scan) if self._blocked_types(policy, groups) else 0
+        return min(FILE_TYPE_SAMPLE, max_scan) if blocked else 0
 
     def _download_exceeded(self, flow: http.HTTPFlow, policy: Policy, meta: Dict[str, Any], cap: int, reason: str) -> str:
         """A download outgrew the scan limit ("oversize": av_oversize_action decides) or the worker budget or the
         client's share of it ("busy": a transient capacity shortage never skips an enforcing inspection). An oversize
         download that is relayed unscanned still gets its file type checked on the head of its body."""
         self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", reason)))
-        if reason == "busy" and self._download_enforcing(policy, meta["res"].group_ids):
+        if reason == "busy" and self._download_enforcing(policy, meta["res"].group_ids, blocked=self._inspection_state(policy, meta)[1]):
             self._block_streamed(flow, meta, "inspection_busy", "Content inspection: the scan capacity of this worker is exhausted",
                                  "AegisProxy could not inspect this download: scan capacity exhausted. Retry shortly.\n", status=503)
             return BLOCK
@@ -1523,7 +1541,7 @@ class AegisAddon:
         """File type control for a download that is relayed unscanned (av_oversize_action=allow): the type is read from
         the head of the body, decoded through its content codings like a full body. Hash IOCs and the scan engines need
         the whole entity and do not run. True when the download was blocked."""
-        types = self._blocked_types(policy, meta["res"].group_ids)
+        types = self._inspection_state(policy, meta)[1]
         if not types or not head:
             return False
         try:
@@ -1711,7 +1729,7 @@ class AegisAddon:
         raw = resp.raw_content or b""
         if not raw or not self._has_body(flow):
             return None
-        inspect_on = self._inspection_enabled(policy, res.group_ids)
+        inspect_on = self._inspection_state(policy, meta)[0]
         if inspect_on and resp.status_code == 206:
             res.block(VERDICT_POLICY, "partial_content", "Content inspection: partial content (HTTP 206) cannot be scanned")
             return VERDICT_POLICY, 403
@@ -1769,7 +1787,9 @@ class AegisAddon:
         ftype = detect_file_type(body, flow.request.pretty_url, flow.response.headers.get("Content-Type", ""))
         if ftype:
             extra["file_type"] = ftype
-            if ftype in self._blocked_types(policy, res.group_ids):
+            meta = flow.metadata.get("aegis")
+            blocked = self._inspection_state(policy, meta)[1] if meta else self._blocked_types(policy, res.group_ids)
+            if ftype in blocked:
                 res.block(VERDICT_FILETYPE, "file_type", f"Download control: file type '{ftype}' is not permitted for this server group")
                 return VERDICT_FILETYPE, 403
         if not scanners:

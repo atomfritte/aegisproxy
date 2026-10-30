@@ -960,8 +960,11 @@ class ArtifactVerifier:
         self.expected_sha512 = _strip_b64(expected_sha512)
         self.on_fail = on_fail
         self.tail = max(1, int(tail))
-        self._h256 = hashlib.sha256()
-        self._h512 = hashlib.sha512()
+        # Only hash the pinned algorithm(s): hashing both when a single digest is pinned wastes CPU on every
+        # streamed chunk. The unpinned algorithm's digest stays "" (see .sha256/.sha512 below); _compare still
+        # fails closed when neither is pinned.
+        self._h256 = hashlib.sha256() if self.expected_sha256 else None
+        self._h512 = hashlib.sha512() if self.expected_sha512 else None
         self._pending = bytearray()
         self.total = 0
         self.finished = False
@@ -975,8 +978,10 @@ class ArtifactVerifier:
 
     def __call__(self, chunk: bytes) -> bytes:
         if chunk:
-            self._h256.update(chunk)
-            self._h512.update(chunk)
+            if self._h256 is not None:
+                self._h256.update(chunk)
+            if self._h512 is not None:
+                self._h512.update(chunk)
             self.total += len(chunk)
             self._pending += chunk
             if len(self._pending) > self.tail:
@@ -988,8 +993,8 @@ class ArtifactVerifier:
         if self.finished:
             return b""
         self.finished = True
-        self.sha256 = self._h256.hexdigest()
-        self.sha512 = base64.b64encode(self._h512.digest()).decode("ascii")
+        self.sha256 = self._h256.hexdigest() if self._h256 is not None else ""
+        self.sha512 = base64.b64encode(self._h512.digest()).decode("ascii") if self._h512 is not None else ""
         self.matched = self._compare()
         if self.matched:
             tail = bytes(self._pending)

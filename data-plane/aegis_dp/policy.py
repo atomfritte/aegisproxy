@@ -290,6 +290,122 @@ def match_rule(rule: Dict[str, Any], host: str, path: str, method: str, now: flo
     return any(match_host(ch, host) and match_path(cp, path) for ch, cp in comps)
 
 
+# ---------------------------------------------------------------------------
+# Precompiled rules (items 3 & 4): the matching fields of every rule are computed once per bundle so that a
+# request neither re-normalizes host patterns nor re-canonicalizes path patterns, and rules are indexed by host so
+# a request evaluates only the rules whose host could match it. Both are semantically identical to match_rule over
+# the full rule list (guarded by the shared normalization/path vectors and the evaluation-order tests).
+# ---------------------------------------------------------------------------
+_PP_ANY, _PP_NONE, _PP_EXACT, _PP_TOKENS = range(4)
+
+
+def _compile_path(pp: str) -> Tuple[int, Any]:
+    """Precompiled rule path pattern. Mirrors match_path's treatment of the *pattern* (strip, is_domain_wide,
+    canonicalize, '*' detection, token automaton); the request path is canonicalized once in evaluate and matched
+    by _match_compiled_path without re-canonicalizing."""
+    pat = (pp or "").strip()
+    if is_domain_wide(pat):
+        return _PP_ANY, None
+    clean_pat, ok_pat = canonicalize_path(pat)
+    if not ok_pat:
+        return _PP_NONE, None
+    if "*" not in clean_pat:
+        return _PP_EXACT, clean_pat
+    return _PP_TOKENS, _compile_path_pattern(clean_pat)
+
+
+def _match_compiled_path(compiled: Tuple[int, Any], clean_path: str) -> bool:
+    kind, data = compiled
+    if kind == _PP_ANY:
+        return True
+    if kind == _PP_NONE:
+        return False
+    if kind == _PP_EXACT:
+        return clean_path == data
+    return _match_path_tokens(data, clean_path)
+
+
+def _match_host_pat(pat: str, host: str) -> bool:
+    """match_host with the pattern already normalized and the request host already normalized (both done once)."""
+    if not host:
+        return False
+    if pat == "*" or pat == host:
+        return True
+    if pat.startswith("*."):
+        return host == pat[2:] or host.endswith(pat[1:])
+    return False
+
+
+class _CompiledRule:
+    """One rule with its matching fields precomputed once per bundle. ``matches`` is byte-for-byte equivalent to
+    match_rule(rule, host, clean_path, method, now) for an already-normalized host and already-canonicalized path."""
+
+    __slots__ = ("rule", "index", "enabled", "expires_at", "methods", "is_block", "host_pat", "host_has_star",
+                 "path", "path_dw", "companions")
+
+    def __init__(self, rule: Dict[str, Any], index: int) -> None:
+        self.rule = rule
+        self.index = index
+        self.enabled = rule.get("enabled", True)
+        self.expires_at = parse_iso(rule.get("expires_at"))
+        self.methods = frozenset(str(m).upper() for m in (rule.get("methods") or []))
+        self.is_block = str(rule.get("action", "ALLOW")).upper() == "BLOCK"
+        self.host_pat = normalize_host(rule.get("host_pattern", ""))
+        self.host_has_star = "*" in (rule.get("host_pattern") or "")
+        self.path = _compile_path(rule.get("path_pattern", ""))
+        self.path_dw = self.path[0] == _PP_ANY  # is_domain_wide of the raw path pattern (CONNECT uses this)
+        self.companions: List[Tuple[str, bool, Tuple[int, Any]]] = []
+        for comp in rule.get("companion_rules") or []:
+            ch, cp = _split_companion(comp)
+            cpath = _compile_path(cp)
+            self.companions.append((normalize_host(ch), cpath[0] == _PP_ANY, cpath))
+
+    def matches(self, host: str, clean_path: str, method: str, now: float) -> bool:
+        if not self.enabled or (self.expires_at is not None and now > self.expires_at):
+            return False
+        if self.methods and method != "CONNECT" and "*" not in self.methods and method not in self.methods:
+            return False
+        if method == "CONNECT":
+            if _match_host_pat(self.host_pat, host) and (not self.is_block or self.path_dw):
+                return True
+            for chost, cdw, _cpath in self.companions:
+                if _match_host_pat(chost, host) and (not self.is_block or cdw):
+                    return True
+            return False
+        if _match_host_pat(self.host_pat, host) and _match_compiled_path(self.path, clean_path):
+            return True
+        for chost, _cdw, cpath in self.companions:
+            if _match_host_pat(chost, host) and _match_compiled_path(cpath, clean_path):
+                return True
+        return False
+
+
+def _index_rules(rules: List[Dict[str, Any]]) -> Tuple[Dict[str, List["_CompiledRule"]], List["_CompiledRule"]]:
+    """Bucket compiled rules by exact normalized host, plus a wildcard bucket for '*'/'*.x' host patterns (and any
+    rule whose companion hosts include a wildcard). A rule lands in exactly one of the two structures, so merging
+    exact[host] + wildcard by original index reproduces the full-scan order precisely (first-match preserved)."""
+    exact: Dict[str, List[_CompiledRule]] = {}
+    wild: List[_CompiledRule] = []
+    for idx, rule in enumerate(rules):
+        cr = _CompiledRule(rule, idx)
+        host_pats = [cr.host_pat] + [c[0] for c in cr.companions]
+        if any(hp == "*" or hp.startswith("*.") for hp in host_pats):
+            wild.append(cr)
+        else:
+            for hp in dict.fromkeys(host_pats):  # each distinct exact host key, once
+                exact.setdefault(hp, []).append(cr)
+    return exact, wild
+
+
+def _host_candidates(exact: Dict[str, List["_CompiledRule"]], wild: List["_CompiledRule"], host: str) -> List["_CompiledRule"]:
+    ex = exact.get(host)
+    if not ex:
+        return wild  # read-only use; wild is already in original order
+    merged = ex + wild
+    merged.sort(key=lambda cr: cr.index)  # unique indices -> exact original (first-match) order
+    return merged
+
+
 def rule_applies(rule: Dict[str, Any], srv_id: str, groups: List[str]) -> bool:
     """'*' scopes cover sources with a group membership ('*' group) or registered servers ('*'
     server) — never unknown sources (mirrors engine.IndexedRule.AppliesTo)."""
@@ -406,6 +522,9 @@ class Policy:
         rules = bundle.get("rules") or []
         self.block_rules = [r for r in rules if str(r.get("action", "ALLOW")).upper() == "BLOCK"]
         self.allow_rules = [r for r in rules if str(r.get("action", "ALLOW")).upper() != "BLOCK"]
+        # Compile the matching fields once per bundle and index both sets by host (items 3 & 4).
+        self._block_exact, self._block_wild = _index_rules(self.block_rules)
+        self._allow_exact, self._allow_wild = _index_rules(self.allow_rules)
         self.strict_groups = {g.get("id") for g in (bundle.get("groups") or []) if g.get("strict_isolation")}
         self.token_groups = {g.get("id") for g in (bundle.get("groups") or []) if g.get("require_proxy_token")}
         self.cidrs: List[Tuple[str, Any]] = []
@@ -572,9 +691,9 @@ class Policy:
                 res.security_flags.append("PUNYCODE")
 
         # 3. BLOCK guardrails
-        for rule in self.block_rules:
-            if rule_applies(rule, srv_id, groups) and match_rule(rule, host, clean_path, method, now):
-                res.matched_rule_id, res.matched_rule_name, res.block_reason = rule.get("id", ""), rule.get("name", ""), "block_rule"
+        for cr in _host_candidates(self._block_exact, self._block_wild, host):
+            if rule_applies(cr.rule, srv_id, groups) and cr.matches(host, clean_path, method, now):
+                res.matched_rule_id, res.matched_rule_name, res.block_reason = cr.rule.get("id", ""), cr.rule.get("name", ""), "block_rule"
                 return res
 
         # 4. TLS passthrough
@@ -615,10 +734,11 @@ class Policy:
                 return res
 
         # 7. ALLOW rules (internal / IP-literal destinations need an explicit, non-wildcard rule)
-        for rule in self.allow_rules:
-            if not implicit_ok and "*" in (rule.get("host_pattern") or ""):
+        for cr in _host_candidates(self._allow_exact, self._allow_wild, host):
+            if not implicit_ok and cr.host_has_star:
                 continue
-            if rule_applies(rule, srv_id, groups) and match_rule(rule, host, clean_path, method, now):
+            if rule_applies(cr.rule, srv_id, groups) and cr.matches(host, clean_path, method, now):
+                rule = cr.rule
                 res.allowed, res.verdict = True, VERDICT_ALLOWED
                 res.matched_rule_id, res.matched_rule_name = rule.get("id", ""), rule.get("name", "")
                 res.follow_redirects = bool(rule.get("follow_redirects"))

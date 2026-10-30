@@ -110,21 +110,19 @@ class IcapClient:
         self.istag = ""
         self.available: Optional[bool] = None
         self.last_options = 0.0
+        # Small per-service keep-alive pool: idle (reader, writer) pairs reusable for the next transaction. Pooled
+        # only after a fully-framed response that did not ask to close; a stale pooled connection is dropped and the
+        # transaction retried once on a fresh one-shot connection, so reuse never changes a scan result.
+        self._pool: List[Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+        self._pool_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pool_max = 4
 
     def _icap_uri(self) -> str:
         scheme = "icaps" if self.tls else "icap"
         return f"{scheme}://{self.host}:{self.port}{self.path}"
 
-    async def _exchange(self, payload: bytes, conn: Dict[str, asyncio.StreamWriter]
-                        ) -> Tuple[str, Dict[str, str], Dict[str, int], asyncio.StreamReader]:
-        """Connects, sends the request and reads the ICAP response head. Callers run it under one deadline
-        (connect + send + receive) and close ``conn["writer"]`` on every path."""
-        reader, writer = await asyncio.open_connection(self.host, self.port, ssl=self.ssl_ctx)
-        conn["writer"] = writer
-        writer.write(payload)
-        await writer.drain()  # a service that stops reading must not stall the request beyond the deadline
-        raw = await _read_headers(reader)
-        status_line, hdrs = _parse_header_block(raw)
+    @staticmethod
+    def _parse_encapsulated(hdrs: Dict[str, str]) -> Dict[str, int]:
         enc: Dict[str, int] = {}
         for part in hdrs.get("encapsulated", "").split(","):
             if "=" in part:
@@ -133,6 +131,24 @@ class IcapClient:
                     enc[k.strip()] = int(v.strip())
                 except ValueError:
                     pass
+        return enc
+
+    async def _send_and_head(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, payload: bytes
+                             ) -> Tuple[str, Dict[str, str], Dict[str, int]]:
+        """Send one request and read the ICAP response head on an already-open connection (fresh or pooled)."""
+        writer.write(payload)
+        await writer.drain()  # a service that stops reading must not stall the request beyond the deadline
+        raw = await _read_headers(reader)
+        status_line, hdrs = _parse_header_block(raw)
+        return status_line, hdrs, self._parse_encapsulated(hdrs)
+
+    async def _exchange(self, payload: bytes, conn: Dict[str, asyncio.StreamWriter]
+                        ) -> Tuple[str, Dict[str, str], Dict[str, int], asyncio.StreamReader]:
+        """Open a fresh connection, send the request and read the response head (OPTIONS probe path). Callers run
+        it under one deadline (connect + send + receive) and close ``conn["writer"]`` on every path."""
+        reader, writer = await asyncio.open_connection(self.host, self.port, ssl=self.ssl_ctx)
+        conn["writer"] = writer
+        status_line, hdrs, enc = await self._send_and_head(reader, writer, payload)
         return status_line, hdrs, enc, reader
 
     @staticmethod
@@ -143,6 +159,43 @@ class IcapClient:
                 writer.close()
             except Exception:  # noqa: BLE001 - already broken transport
                 pass
+
+    @staticmethod
+    def _safe_close(writer: asyncio.StreamWriter) -> None:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001 - already broken transport
+            pass
+
+    def _drop_pool(self) -> None:
+        for _reader, writer in self._pool:
+            self._safe_close(writer)
+        self._pool.clear()
+
+    def _acquire_pooled(self) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """A live pooled connection for the running loop, or None. Connections created on another event loop (a
+        fresh asyncio.run) are discarded: a pooled transport belongs to the loop that opened it."""
+        loop = asyncio.get_running_loop()
+        if self._pool_loop is not loop:
+            self._drop_pool()
+            self._pool_loop = loop
+        while self._pool:
+            reader, writer = self._pool.pop()
+            if writer.is_closing() or reader.at_eof():
+                self._safe_close(writer)
+                continue
+            return reader, writer
+        return None
+
+    def _release(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if writer.is_closing() or len(self._pool) >= self._pool_max:
+            self._safe_close(writer)
+            return
+        self._pool.append((reader, writer))
+
+    @staticmethod
+    def _wants_close(hdrs: Dict[str, str]) -> bool:
+        return "close" in hdrs.get("connection", "").lower()
 
     async def options(self) -> bool:
         req = (f"OPTIONS {self._icap_uri()} ICAP/1.0\r\nHost: {self.host}\r\nUser-Agent: AegisProxy-ICAP/2.1\r\n"
@@ -160,18 +213,20 @@ class IcapClient:
         self.last_options = time.time()
         return bool(self.available)
 
-    async def _transact(self, method: str, payload: bytes, body: bytes, started: float,
-                        conn: Dict[str, asyncio.StreamWriter]) -> IcapResult:
-        status, hdrs, enc, reader = await self._exchange(payload, conn)
+    async def _consume(self, method: str, body: bytes, started: float, status: str, hdrs: Dict[str, str],
+                       enc: Dict[str, int], reader: asyncio.StreamReader) -> Tuple[IcapResult, bool]:
+        """Read the body of a response whose head is already parsed and build the result. Returns
+        ``(result, drained)``: ``drained`` is True only when the whole message was consumed deterministically, so
+        the connection is safe to return to the keep-alive pool."""
         parts = status.split(" ")
         if len(parts) < 2 or not parts[0].startswith("ICAP/") or not parts[1].isdigit():
             raise ValueError(f"malformed ICAP status line {status[:60]!r}")
         code = int(parts[1])
         self.available = True  # the service answered (status of real traffic beats the last probe)
         if code == 204:
-            return IcapResult("clean", detail=f"204 in {time.time() - started:.2f}s")
+            return IcapResult("clean", detail=f"204 in {time.time() - started:.2f}s"), True
         if code != 200:
-            return IcapResult("error", detail=f"ICAP status {code}")
+            return IcapResult("error", detail=f"ICAP status {code}"), False  # unread body of unknown framing: no reuse
         threat = _threat_name(hdrs)
         # Read the encapsulated sections strictly by their offsets (RFC 3507 section 4.4.1).
         http_status, http_hdrs, new_body = 0, {}, None
@@ -194,12 +249,52 @@ class IcapClient:
         elif "req-hdr" in sections:
             _, http_hdrs = _parse_header_block(sections["req-hdr"])
         threat = threat or _threat_name(http_hdrs)
+        # Reusable only when the final declared section was a body terminator we fully consumed; a trailing -hdr
+        # read to a blank line could leave undeclared bytes on the wire and corrupt the next transaction.
+        drained = not order or not order[-1][0].endswith("-hdr")
         if threat or http_status >= 400 or (method == "REQMOD" and http_status):
             return IcapResult("infected", threat=threat or f"blocked by ICAP service (HTTP {http_status})", body=new_body,
-                              http_status=http_status, headers=http_hdrs)
+                              http_status=http_status, headers=http_hdrs), drained
         if new_body is not None and new_body != body:
-            return IcapResult("modified", body=new_body, http_status=http_status, headers=http_hdrs, detail="content sanitized")
-        return IcapResult("clean", detail="200 unmodified")
+            return IcapResult("modified", body=new_body, http_status=http_status, headers=http_hdrs, detail="content sanitized"), drained
+        return IcapResult("clean", detail="200 unmodified"), drained
+
+    async def _run(self, method: str, payload: bytes, body: bytes, started: float,
+                   conn: Dict[str, asyncio.StreamWriter]) -> IcapResult:
+        """One ICAP transaction with keep-alive reuse. A pooled connection is tried first; if it breaks before a
+        response head is read (a stale keep-alive socket) it is dropped and the transaction retried once on a fresh
+        one-shot connection, so reuse never changes the result."""
+        pooled = self._acquire_pooled()
+        if pooled is not None:
+            reader, writer = pooled
+            conn["writer"] = writer
+            try:
+                status, hdrs, enc = await self._send_and_head(reader, writer, payload)
+            except Exception:  # noqa: BLE001 - stale pooled connection: drop it and fall through to a fresh one
+                conn.pop("writer", None)
+                self._safe_close(writer)
+            else:
+                return await self._finish(method, body, started, status, hdrs, enc, reader, writer, conn)
+        reader, writer = await asyncio.open_connection(self.host, self.port, ssl=self.ssl_ctx)
+        conn["writer"] = writer
+        status, hdrs, enc = await self._send_and_head(reader, writer, payload)
+        return await self._finish(method, body, started, status, hdrs, enc, reader, writer, conn)
+
+    async def _finish(self, method: str, body: bytes, started: float, status: str, hdrs: Dict[str, str],
+                      enc: Dict[str, int], reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                      conn: Dict[str, asyncio.StreamWriter]) -> IcapResult:
+        result, drained = await self._consume(method, body, started, status, hdrs, enc, reader)
+        if drained and not self._wants_close(hdrs) and not reader.at_eof():
+            conn.pop("writer", None)  # hand off to the pool; the caller's finally must not close it
+            self._release(reader, writer)
+        else:
+            conn.pop("writer", None)
+            self._safe_close(writer)
+        return result
+
+    def close(self) -> None:
+        """Close every idle pooled connection (worker shutdown)."""
+        self._drop_pool()
 
     async def _modify(self, method: str, req_hdr: bytes, res_hdr: Optional[bytes], body: bytes) -> IcapResult:
         """One ICAP transaction. Every failure (network, timeout, protocol, parsing) is an "error" result, so
@@ -221,9 +316,9 @@ class IcapClient:
             body_key = "res-body" if method == "RESPMOD" else "req-body"
             offsets.append(f"{body_key}={pos}" if body else f"null-body={pos}")
             head = (f"{method} {self._icap_uri()} ICAP/1.0\r\nHost: {self.host}\r\nUser-Agent: AegisProxy-ICAP/2.1\r\n"
-                    f"Allow: 204\r\nEncapsulated: {', '.join(offsets)}\r\n\r\n").encode("latin-1", "replace")
+                    f"Allow: 204\r\nConnection: keep-alive\r\nEncapsulated: {', '.join(offsets)}\r\n\r\n").encode("latin-1", "replace")
             payload = head + b"".join(parts) + (_chunked(body) if body else b"")
-            return await asyncio.wait_for(self._transact(method, payload, body, started, conn), self.timeout)
+            return await asyncio.wait_for(self._run(method, payload, body, started, conn), self.timeout)
         except (asyncio.TimeoutError, TimeoutError):
             return IcapResult("error", detail=f"ICAP timeout after {self.timeout:.0f}s")
         except OSError as exc:
