@@ -1,11 +1,11 @@
-# Hash-locked data-plane dependencies: mitmproxy 12.3.0, YARA-X 1.22.0 and every transitive dependency,
+# Hash-locked data-plane dependencies: mitmproxy 12.3.1, YARA-X 1.22.1 and every transitive dependency,
 # installed by deploy/systemd/install-linux.sh (default) and the CI audit environment with
 #   pip install --require-hashes --no-deps --only-binary=:all: -r data-plane/requirements-lock.txt
 # Universal lock for CPython >= 3.12 (Linux x86_64/aarch64; macOS/Windows packages carry markers). The
 # security overrides of requirements-security.txt are applied (Brotli 1.2.1 and tornado 6.6 lie above mitmproxy's
 # upper bounds; pip check reports those conflicts, which the installer tolerates for the overrides only).
 # Regenerate after changing mitmproxy, yara-x or requirements-security.txt (uv 0.13.5), then re-add this header:
-#   printf 'mitmproxy==12.3.0\nyara-x==1.22.0\n' > lock.in
+#   printf 'mitmproxy==12.3.1\nyara-x==1.22.1\n' > lock.in
 #   uv pip compile lock.in --universal --python-version 3.12 --generate-hashes --only-binary :all: \
 #     --override data-plane/requirements-security.txt --no-annotate --no-header -o data-plane/requirements-lock.txt
 aioquic==1.2.0 \
@@ -80,9 +80,9 @@ argon2-cffi-bindings==26.1.0 \
     --hash=sha256:f0c3103fcff20183e593459cfea6e012281c0e76ae3ed8b5565ad1b92eac3990 \
     --hash=sha256:f9c4420a7a864fe1b86ce35befc95b8e39fb852493b81cf798671ddc265de638 \
     --hash=sha256:ffff613aaa9ce6236766e2fc6dc560bb5abde7a2e2416e3db1f9ae395a2b4dd4
-asgiref==3.13.0 \
-    --hash=sha256:034cc8cbf72d00553b4be256703ac545120b4e50af13b49dec99da899aeeecb4 \
-    --hash=sha256:f9596a2434512686473d50f96ff6207fbba49ae1a785dfac614df4aeb085674d
+asgiref==3.12.1 \
+    --hash=sha256:59dcb51c272ad209d59bed5708a64a333083e86017d7fcdd67498eeab7784340 \
+    --hash=sha256:fe386d1c2bff7259ea95929266d12a8cf9a8b5a1c2598402967d8792e7a7c094
 attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309 \
     --hash=sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32
@@ -730,8 +730,8 @@ markupsafe==3.0.4 \
     --hash=sha256:fa95848c929b6a75f6848d3c9793e59db365ee436776e57db835cdbfa79ba977 \
     --hash=sha256:fd9f8797427910198f95bced71ddfed61130d7e349213bfb8466c9c99e2c46a8 \
     --hash=sha256:fdb4ca07ab75ffadab4a8b135ad59cdbb3156b99310f3d565370da74a15d6bd3
-mitmproxy==12.3.0 \
-    --hash=sha256:29fd9e934bad86a321ff345ec141f894dbcc1ec9e3bf5deffba9ac2ea9db3c61
+mitmproxy==12.3.1 \
+    --hash=sha256:87afb808ac8d55383dbe6aa30eadeb0fedaeffd26210e7e23c25c9cd43bdb36a
 mitmproxy-linux==0.12.15 ; sys_platform == 'linux' \
     --hash=sha256:438615c3eaaa7a84b75ede3fccacdac1df31584746e6f3d58678d5883f06c1c2 \
     --hash=sha256:59e54f1ab8952530333c91b484fad16a3ad4ade35473929d30ca68d6a9267a27 \
@@ -749,9 +749,9 @@ mitmproxy-windows==0.12.15 ; os_name == 'nt' \
 publicsuffix2==2.20191221 \
     --hash=sha256:00f8cc31aa8d0d5592a5ced19cccba7de428ebca985db26ac852d920ddd6fe7b \
     --hash=sha256:786b5e36205b88758bd3518725ec8cfe7a8173f5269354641f581c6b80a99893
-pyasn1==0.6.4 \
-    --hash=sha256:9c447d8431c947fe4c8febc4ed9e760bc29011a5b01e5c74b67025bd9fb8ce81 \
-    --hash=sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b
+pyasn1==0.6.5 \
+    --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587 \
+    --hash=sha256:6b11616a6bcf3a40e635f082bb232fa57b5e0dd7f517bd7ddd69ec3794508a47
 pycparser==3.12 ; implementation_name != 'PyPy' \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6

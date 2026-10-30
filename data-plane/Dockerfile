@@ -2,7 +2,7 @@
 # AegisProxy data-plane worker (mitmproxy 12 + AegisProxy addon).
 #   docker build -t ghcr.io/atomfritte/aegisproxy-data-plane:v3.0.0 data-plane/   (or: make images)
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
-FROM mitmproxy/mitmproxy:12.3.0@sha256:c8a3753de11fd8266afeb103e163f7b7ac6a4a568a707fa2e15b23d20acf4eba
+FROM mitmproxy/mitmproxy:12.3.1@sha256:e2f810b6e618258dd4980716da143c4a8de0edcb3243264baea398e2185bbbfb
 
 USER root
 # Every package added to the base image is pinned by hash; a missing or mismatching hash fails the build.
