@@ -35,6 +35,7 @@ VERDICT_FILETYPE = "FILETYPE_BLOCKED"
 VERDICT_POLICY = "POLICY_BLOCKED"
 VERDICT_QUARANTINED = "QUARANTINED"
 VERDICT_AUTH_FAILED = "AUTH_FAILED"  # invalid proxy credentials: HTTP 407, never an IP fallback
+VERDICT_PACKAGE_BLOCKED = "PACKAGE_BLOCKED"  # package firewall: metadata/artifact denied (mirrors models.VerdictPackageBlocked)
 UNREGISTERED_PREFIX = "srv-unregistered-"
 # Proxy-Authorization header that is present but cannot be parsed: as "username:token" with an empty token it
 # matches no server and fails authentication like any other invalid credential.
@@ -434,6 +435,10 @@ class Policy:
                 self.by_user[srv["proxy_auth_user"].strip().lower()] = srv
             if srv.get("proxy_auth_token_hash"):
                 self.by_token[srv["proxy_auth_token_hash"].strip().lower()] = srv
+        # Package firewall gate (local import: packages.py imports normalize_host/printable from this module, so a
+        # top-level import would be circular). Rebuilt with every bundle because each bundle makes a fresh Policy.
+        from .packages import PackageGate
+        self.packages = PackageGate(bundle.get("packages"))
 
     def policy_value(self, key: str, default: Any) -> Any:
         v = self.security.get(key)

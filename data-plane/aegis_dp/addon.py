@@ -31,6 +31,7 @@ import base64
 import functools
 import hashlib
 import inspect
+import json
 import logging
 import re
 import socket
@@ -43,6 +44,7 @@ from mitmproxy import connection, ctx, http, tcp, tls, udp
 from mitmproxy.proxy import server_hooks
 
 from . import __version__, buffering, liveconns
+from . import packages as pkg
 from .accesslog import AccessLog
 from .blockpage import ca_install_steps, is_cli_client, render_branded, render_cli, render_html, render_stale
 from .buffering import BLOCK, STREAM, BodyGuard, BufferBudget
@@ -58,8 +60,8 @@ from .liveconns import LiveConn
 from .yara_scan import YaraEngine
 from .policy import (
     MALFORMED_PROXY_AUTH, VERDICT_AUTH_FAILED, VERDICT_DLP, VERDICT_FILETYPE, VERDICT_LEARNING, VERDICT_MALWARE,
-    VERDICT_POLICY, VERDICT_QUARANTINED, VERDICT_REDIRECT, VERDICT_THREAT, VERDICT_TLS_BYPASS, EvalResult, Policy,
-    RedirectGrants, is_forbidden_addr,
+    VERDICT_PACKAGE_BLOCKED, VERDICT_POLICY, VERDICT_QUARANTINED, VERDICT_REDIRECT, VERDICT_THREAT, VERDICT_TLS_BYPASS,
+    EvalResult, Policy, RedirectGrants, is_forbidden_addr,
     is_internal_addr, is_internal_host, normalize_host, parse_ip, printable,
 )
 
@@ -553,9 +555,12 @@ class AegisAddon:
                 state = {True: "ok", False: "down"}.get(c.available if c else None, "unknown")
                 icap.append(f"{kind}={state}")
         age = self.cp.policy_age()
+        gate = getattr(policy, "packages", None) if policy else None
+        packages = gate.status_summary() if (gate and gate.enabled) else "disabled"
         return {"X-Aegis-YARA": self.yara.heartbeat(), "X-Aegis-ICAP": ",".join(icap) or "disabled",
                 "X-Aegis-Policy-Age": str(int(age)) if age is not None else "", "X-Aegis-Policy-Max-Age": str(int(self.cfg.policy_max_age)),
-                "X-Aegis-Flows-Dropped": self.cp.drop_summary(), "X-Aegis-Flow-Backlog": str(self.cp.queue_len())}
+                "X-Aegis-Flows-Dropped": self.cp.drop_summary(), "X-Aegis-Flow-Backlog": str(self.cp.queue_len()),
+                "X-Aegis-Packages": packages or "disabled"}
 
     def _yara_sync(self, policy: Policy) -> None:
         if self._yara_rev != policy.revision:
@@ -946,11 +951,83 @@ class AegisAddon:
         if inspect_on:
             self._prepare_inspection(flow, res)
         meta = flow.metadata["aegis"] = {"res": res, "peer": peer, "auth": auth, "started": time.time(), "inspect": inspect_on}
+        # Package firewall gate: acts only on otherwise-ALLOWED requests to the registry hosts (quarantine, threat,
+        # explicit BLOCK and auth decisions keep precedence and have already returned above). A gate block answers
+        # locally (403), never upstream.
+        if self._package_gate(flow, policy, res, meta, peer, auth, host):
+            return
         # Until its response is complete (streams, slow transfers, WebSocket upgrades) the request is re-evaluated
         # on policy changes.
         self._track(flow.id, "http", flow.client_conn, policy, res, auth, flow.request.method, host, flow.request.port,
                     flow.request.path, flow.request.pretty_url, flow.request.scheme, flow)
         self._plan_upload(flow, policy, res, meta)
+
+    # ------------------------------------------------------------------ package firewall
+    def _package_gate(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any],
+                      peer: str, auth: str, host: str) -> bool:
+        """Classifies a registry request and records the gate's decision on ``meta['package']``. Returns True when
+        the request was answered locally (blocked); the caller then stops. Allowed decisions (filter/verify/service)
+        mark the flow for the response hooks and let the request continue upstream."""
+        gate = getattr(policy, "packages", None)
+        if gate is None or not gate.enabled:
+            return False
+        req = gate.classify(host, flow.request.path, flow.request.method)
+        if req is None:
+            return False
+        decision = gate.decide(req, res.group_ids, res.server_id)
+        if decision is None:
+            return False  # ecosystem does not cover this client: ordinary egress rules applied above
+        meta["package"] = decision
+        if decision.action == pkg.ACT_BLOCK:
+            self._block_package(flow, res, meta, peer, auth, decision)
+            return True
+        if not decision.monitor:
+            # Enforce-mode allowed decisions are attributed to the package firewall (ALLOWED verdict kept).
+            res.matched_rule_id = res.matched_rule_name = "package-firewall"
+        if decision.action == pkg.ACT_FILTER:
+            # A full, decodable body is needed to filter: strip conditional headers (so the registry sends 200, not
+            # 304) and request only decodable codings and the whole entity.
+            self._prepare_inspection(flow, res)
+            for h in ("If-None-Match", "If-Modified-Since"):
+                flow.request.headers.pop(h, None)
+            meta["pkg_filter"] = True
+        elif decision.action == pkg.ACT_VERIFY:
+            # Hash the artifact file as stored: request identity and the whole entity so the digest matches the pin
+            # (the pin is computed over the artifact bytes, not a re-compressed transfer encoding).
+            flow.request.headers["Accept-Encoding"] = "identity"
+            flow.request.headers.pop("Range", None)
+            flow.request.headers.pop("If-Range", None)
+            meta["pkg_verify"] = True
+        return False
+
+    def _block_package(self, flow: http.HTTPFlow, res: EvalResult, meta: Dict[str, Any], peer: str, auth: str,
+                       decision: "pkg.GateDecision", status: int = 0, message: str = "", block_reason: str = "",
+                       tele: Optional[Dict[str, Any]] = None) -> None:
+        """Local 4xx/5xx for a package the gate refuses. JSON ``{"error": ...}`` for npm (its clients print it),
+        plain text otherwise; always with the console request link."""
+        status = status or decision.status or 403
+        trace = _trace_id()
+        if not decision.console_url:
+            decision.console_url = self._urls(self._policy())[0]
+        link = decision.request_link()
+        text = "AegisProxy package firewall: " + printable(message or decision.message or decision.reason or "not approved", 300)
+        if link:
+            text += f" Request approval: {link}"
+        text += f" (Trace ID: {trace})"
+        if decision.eco == pkg.NPM:
+            body = json.dumps({"error": text}).encode("utf-8")
+            ctype = "application/json"
+        else:
+            body = (text + "\n").encode("utf-8", "replace")
+            ctype = "text/plain; charset=utf-8"
+        res.block(VERDICT_PACKAGE_BLOCKED, block_reason or decision.decision, "package-firewall")
+        res.matched_rule_id = "package-firewall"
+        headers = {"Content-Type": ctype, "X-Aegis-Verdict": VERDICT_PACKAGE_BLOCKED, "X-Aegis-Trace-ID": trace,
+                   "Cache-Control": "no-store"}
+        flow.response = http.Response.make(status, body, headers)
+        flow.metadata["aegis_recorded"] = flow.metadata["aegis_local"] = True
+        extra = {"package": tele if tele is not None else decision.telemetry()}
+        self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, VERDICT_PACKAGE_BLOCKED, trace_id=trace, **extra))
 
     def _plan_upload(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> None:
         """Request bodies are buffered only when DLP, ICAP REQMOD or the max_upload_bytes check of a body of unknown
@@ -1240,6 +1317,96 @@ class AegisAddon:
     def _response_codings(resp: http.Response) -> List[str]:
         return parse_codings(resp.headers.get("Content-Encoding")) + transfer_codings(resp.headers.get("Transfer-Encoding"))
 
+    # ------------------------------------------------------------------ package firewall responses
+    def _setup_artifact_verify(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> bool:
+        """Install the streaming hash verifier. Returns True when it took over the body (skip ordinary inspection)."""
+        resp = flow.response
+        decision: "pkg.GateDecision" = meta["package"]
+        if resp is None or resp.status_code != 200 or not self._has_body(flow):
+            return False  # 404 / 304 / HEAD: nothing to verify; recorded in the response hook
+        gate = policy.packages
+        clen_raw = resp.headers.get("Content-Length", "")
+        clen = int(clen_raw) if clen_raw.isdigit() else None
+        if clen is not None and clen > gate.max_verify_bytes:
+            self._block_streamed(flow, meta, "artifact_too_large",
+                                 f"Package firewall: artifact of {clen} bytes exceeds the {gate.max_verify_bytes}-byte verify limit",
+                                 "AegisProxy blocked this artifact: it exceeds the package-firewall verification limit.\n",
+                                 verdict=VERDICT_PACKAGE_BLOCKED,
+                                 package=decision.telemetry(decision=pkg.D_BLOCKED, reason="artifact_too_large"))
+            return True
+        verifier = pkg.ArtifactVerifier(decision.sha256, decision.sha512,
+                                        on_fail=lambda v: self._artifact_failed(flow))
+        meta["verifier"] = verifier
+        resp.stream = verifier
+        return True
+
+    def _artifact_failed(self, flow: http.HTTPFlow) -> None:
+        """Invoked by the verifier at EOF on a hash mismatch (the tail was already withheld). Records the
+        ``hash_mismatch`` security event here (not in the response hook, which a kill may skip) and cuts the
+        connection so the client cannot complete the download."""
+        flow.metadata["aegis_terminated"] = "hash_mismatch"
+        meta = flow.metadata.get("aegis")
+        verifier: Optional[pkg.ArtifactVerifier] = meta.get("verifier") if meta else None
+        if meta is not None and verifier is not None and not flow.metadata.get("aegis_recorded"):
+            res: EvalResult = meta["res"]
+            decision: "pkg.GateDecision" = meta["package"]
+            res.block(VERDICT_PACKAGE_BLOCKED, "hash_mismatch", "package-firewall")
+            res.matched_rule_id = "package-firewall"
+            if "PACKAGE_HASH_MISMATCH" not in res.security_flags:
+                res.security_flags.append("PACKAGE_HASH_MISMATCH")
+            status = flow.response.status_code if flow.response else 0
+            extra = {"package": decision.telemetry(decision=pkg.D_HASH_MISMATCH, sha256=verifier.sha256,
+                                                   sha512=verifier.sha512, reason="hash_mismatch"),
+                     "latency_ms": max(1, int((time.time() - meta["started"]) * 1000))}
+            flow.metadata["aegis_recorded"] = True
+            try:
+                self.cp.record_flow(self._flow_record(flow, res, meta["peer"], meta["auth"], status, VERDICT_PACKAGE_BLOCKED, **extra))
+            except Exception:  # noqa: BLE001 - telemetry must not undo the block
+                log.exception("could not record a package hash mismatch for %s", flow.id)
+        try:
+            if flow.killable:
+                flow.kill()
+        except Exception:  # noqa: BLE001 - best effort inside the stream callback
+            pass
+        self.live.discard(flow.id)
+
+    def _setup_metadata_filter(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any]) -> bool:
+        """Buffer the metadata body (up to max_metadata_bytes) so the response hook can filter it. Returns True when
+        it took over the body; False (e.g. 304 / empty) lets the ordinary path handle and record the flow."""
+        resp = flow.response
+        decision: "pkg.GateDecision" = meta["package"]
+        if resp is None or resp.status_code != 200 or not self._has_body(flow):
+            return False
+        gate = policy.packages
+        clen_raw = resp.headers.get("Content-Length", "")
+        clen = int(clen_raw) if clen_raw.isdigit() else None
+        if clen is not None and clen > gate.max_metadata_bytes:
+            self._block_streamed(flow, meta, "metadata_too_large",
+                                 f"Package firewall: registry metadata of {clen} bytes exceeds the {gate.max_metadata_bytes}-byte limit",
+                                 "AegisProxy could not filter this registry metadata (too large); request blocked.\n",
+                                 status=503, verdict=VERDICT_PACKAGE_BLOCKED,
+                                 package=decision.telemetry(decision=pkg.D_BLOCKED, reason="metadata_too_large"))
+            return True
+        guard = buffering.attach(flow, "response", BodyGuard(self.budget, gate.max_metadata_bytes,
+                                                             lambda reason, _size: self._metadata_exceeded(flow, meta, reason),
+                                                             self._buffer_client(meta)))
+        if clen is not None:
+            reason = guard.declared(clen)
+            if reason:
+                guard.exceed(reason, clen)
+        return True
+
+    def _metadata_exceeded(self, flow: http.HTTPFlow, meta: Dict[str, Any], reason: str) -> str:
+        """The metadata body outgrew max_metadata_bytes or the worker budget: never forward it unfiltered."""
+        decision: "pkg.GateDecision" = meta["package"]
+        self.metrics.inc("aegis_dp_buffer_limited_total", (("direction", "response"), ("reason", reason)))
+        self._block_streamed(flow, meta, "metadata_too_large",
+                             "Package firewall: registry metadata exceeds the inspection limit",
+                             "AegisProxy could not filter this registry metadata; request blocked.\n",
+                             status=503, verdict=VERDICT_PACKAGE_BLOCKED,
+                             package=decision.telemetry(decision=pkg.D_BLOCKED, reason="metadata_" + reason))
+        return BLOCK
+
     @guarded
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("aegis_local") or flow.metadata.get("aegis_unenforced"):
@@ -1252,6 +1419,13 @@ class AegisAddon:
         if not flow.response:
             return
         res: EvalResult = meta["res"]
+        # Package firewall takes over the response body for artifacts (stream + hash) and metadata (buffer + filter),
+        # ahead of the ordinary download inspection.
+        if meta.get("package") is not None:
+            if meta.get("pkg_verify") and self._setup_artifact_verify(flow, policy, res, meta):
+                return
+            if meta.get("pkg_filter") and self._setup_metadata_filter(flow, policy, res, meta):
+                return
         inspect_on = self._inspection_enabled(policy, res.group_ids)
         meta["inspect"] = inspect_on
         resp = flow.response
@@ -1434,6 +1608,9 @@ class AegisAddon:
         ctype = flow.response.headers.get("Content-Type", "")
         extra["content_type"] = printable(ctype, 128)
 
+        if meta.get("package") is not None and self._finalize_package(flow, policy, res, meta, peer, auth, extra):
+            return  # the package firewall filtered/verified the body and recorded the flow itself
+
         if not flow.response.stream:
             blocked = await self._inspect_response(flow, policy, res, meta, extra)
             if blocked:
@@ -1459,6 +1636,73 @@ class AegisAddon:
                     self.grants.register(res.server_id, loc, flow.request.pretty_url, res.matched_rule_id, res.matched_rule_name,
                                          policy.internal_suffixes, res.redirect_hosts)
         self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, res.verdict, **extra))
+
+    # ------------------------------------------------------------------ package firewall finalize
+    def _finalize_package(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any],
+                          peer: str, auth: str, extra: Dict[str, Any]) -> bool:
+        """Carry out the response-side package decision. Returns True when this method recorded the flow itself
+        (filtered or verified); False lets the ordinary recording add the ``package`` telemetry and finish."""
+        decision: "pkg.GateDecision" = meta["package"]
+        if meta.get("pkg_filter"):
+            return self._finalize_filter(flow, policy, res, meta, peer, auth, extra, decision)
+        if meta.get("pkg_verify"):
+            return self._finalize_verify(flow, res, meta, peer, auth, extra, decision)
+        # Service endpoint or monitor-mode flow: forwarded unchanged, only recorded.
+        extra["package"] = decision.telemetry()
+        return False
+
+    def _finalize_filter(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any],
+                         peer: str, auth: str, extra: Dict[str, Any], decision: "pkg.GateDecision") -> bool:
+        resp = flow.response
+        if resp is None or resp.stream or resp.status_code != 200 or not self._has_body(flow):
+            extra["package"] = decision.telemetry()  # 304 / empty: forwarded unchanged
+            return False
+        gate = policy.packages
+        raw = resp.raw_content or b""
+        try:
+            if len(raw) > gate.max_metadata_bytes:
+                raise pkg.FilterError("metadata body exceeds max_metadata_bytes")
+            body, truncated = decode_body(raw, self._response_codings(resp), gate.max_metadata_bytes)
+            if truncated:
+                raise pkg.FilterError("metadata body exceeds max_metadata_bytes after decoding")
+            result = pkg.filter_metadata(decision.eco, decision.name, decision.approved_versions, body,
+                                         resp.headers.get("Content-Type", ""))
+        except (UndecodableContent, pkg.FilterError) as exc:
+            # Enforce mode must never deliver an unfiltered body: answer 503 locally instead.
+            self._block_package(flow, res, meta, peer, auth, decision, status=503,
+                                message=f"could not filter registry metadata ({exc})", block_reason="filter_error",
+                                tele=decision.telemetry(decision=pkg.D_BLOCKED, reason="filter_error"))
+            return True
+        _replace_body(resp, result.body)  # identity body, Content-Encoding dropped, Content-Length recomputed
+        for h in ("ETag", "Last-Modified"):
+            resp.headers.pop(h, None)
+        resp.headers["Cache-Control"] = "no-store"  # never let a client cache the filtered doc under the original validators
+        resp.headers["ETag"] = 'W/"aegis-' + hashlib.sha256(result.body).hexdigest()[:24] + '"'
+        extra["package"] = decision.telemetry(decision=pkg.D_FILTERED, hidden_versions=result.hidden,
+                                              visible_versions=result.visible)
+        extra["bytes_received"] = len(result.body)
+        self.cp.record_flow(self._flow_record(flow, res, peer, auth, resp.status_code, res.verdict, **extra))
+        return True
+
+    def _finalize_verify(self, flow: http.HTTPFlow, res: EvalResult, meta: Dict[str, Any], peer: str, auth: str,
+                         extra: Dict[str, Any], decision: "pkg.GateDecision") -> bool:
+        verifier: Optional[pkg.ArtifactVerifier] = meta.get("verifier")
+        if verifier is None:
+            extra["package"] = decision.telemetry()  # not a verifiable body (404 / HEAD): forwarded, recorded
+            return False
+        status = flow.response.status_code if flow.response else 0
+        if verifier.mismatch:
+            res.block(VERDICT_PACKAGE_BLOCKED, "hash_mismatch", "package-firewall")
+            res.matched_rule_id = "package-firewall"
+            res.security_flags.append("PACKAGE_HASH_MISMATCH")
+            extra["package"] = decision.telemetry(decision=pkg.D_HASH_MISMATCH, sha256=verifier.sha256,
+                                                  sha512=verifier.sha512, reason="hash_mismatch")
+            self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, VERDICT_PACKAGE_BLOCKED, **extra))
+            return True
+        extra["package"] = decision.telemetry(decision=pkg.D_APPROVED, sha256=verifier.sha256, sha512=verifier.sha512)
+        extra["bytes_received"] = verifier.total
+        self.cp.record_flow(self._flow_record(flow, res, peer, auth, status, res.verdict, **extra))
+        return True
 
     async def _inspect_response(self, flow: http.HTTPFlow, policy: Policy, res: EvalResult, meta: Dict[str, Any], extra: Dict[str, Any]):
         """Decodes the buffered body exactly as a client will (bounded) and runs the inspection pipeline.
