@@ -2284,5 +2284,494 @@ class LongLivedConnectionTest(unittest.TestCase):
         self.assertEqual((g['aegis_dp_flows_dropped_total{reason="overflow"}'], g['aegis_dp_flows_dropped_total{reason="rejected"}']), (3.0, 0.0))
 
 
+# ---------------------------------------------------------------------------
+# Package firewall (3.0): classify, normalize, decide, filter, verify
+# ---------------------------------------------------------------------------
+
+import xml.etree.ElementTree as ET  # noqa: E402
+
+from aegis_dp import packages as pk  # noqa: E402
+
+
+def _pkg_bundle(**eco_modes):
+    """A packages bundle covering all four ecosystems. ``eco_modes`` overrides individual modes."""
+    modes = {"npm": "enforce", "pypi": "enforce", "nuget": "monitor", "psgallery": "enforce"}
+    modes.update(eco_modes)
+    return {
+        "enabled": True, "console_url": "https://aegis.example", "max_metadata_bytes": 1 << 20, "max_verify_bytes": 1 << 20,
+        "ecosystems": {
+            "npm": {"mode": modes["npm"], "hosts": ["registry.npmjs.org", "registry.yarnpkg.com"], "group_ids": ["*"]},
+            "pypi": {"mode": modes["pypi"], "hosts": ["pypi.org"], "file_hosts": ["files.pythonhosted.org"], "group_ids": ["*"]},
+            "nuget": {"mode": modes["nuget"], "hosts": ["api.nuget.org"], "group_ids": ["grp-ci"]},
+            "psgallery": {"mode": modes["psgallery"], "hosts": ["www.powershellgallery.com"],
+                          "file_hosts": ["psg-prod-eastus.azureedge.net"], "group_ids": ["*"]},
+        },
+        "approved": {
+            "npm": {"lodash": {"4.17.21": {"g": ["*"], "files": {"lodash-4.17.21.tgz": {"sha512": "npmPIN"}}},
+                               "4.17.20": {"g": ["*"], "files": {"lodash-4.17.20.tgz": {"sha512": "npmPIN20"}}}},
+                    "@babel/core": {"7.0.0": {"g": ["*"], "files": {"core-7.0.0.tgz": {"sha512": "babelPIN"}}}},
+                    "event-stream": {"3.3.6": {"g": ["*"], "files": {"event-stream-3.3.6.tgz": {"sha512": "x"}}}}},
+            "pypi": {"requests": {"2.32.3": {"g": ["*"], "files": {
+                "requests-2.32.3-py3-none-any.whl": {"sha256": "whlhex"},
+                "requests-2.32.3.tar.gz": {"sha256": "sdisthex"}}}}},
+            "nuget": {"newtonsoft.json": {"13.0.3": {"g": ["grp-ci"], "files": {
+                "newtonsoft.json.13.0.3.nupkg": {"sha512": "nugetPIN"}}}}},
+            "psgallery": {"psreadline": {"2.3.5": {"g": ["*"], "files": {"psreadline.2.3.5.nupkg": {"sha512": "psgPIN"}}}}},
+        },
+        "blocked": {"npm": {"event-stream": {"3.3.6": "Known malicious (MAL-2018-1)"}}},
+    }
+
+
+class PackageNormalizeTest(unittest.TestCase):
+    def test_pypi_name_pep503(self):
+        for raw, out in [("Flask", "flask"), ("Flask_Cors", "flask-cors"), ("zope.interface", "zope-interface"),
+                         ("a--_.b", "a-b"), ("Django", "django")]:
+            self.assertEqual(pk.normalize_pypi_name(raw), out, raw)
+
+    def test_pypi_version_subset(self):
+        for raw, out in [("V1.0.0", "1.0.0"), ("2.32.3", "2.32.3"), ("1.0.0+ubuntu1", "1.0.0"), (" 1.0 ", "1.0")]:
+            self.assertEqual(pk.normalize_pypi_version(raw), out, raw)
+
+    def test_nuget_version_normalization(self):
+        for raw, out in [("1.0", "1.0.0"), ("1.0.0.0", "1.0.0"), ("1.00.0", "1.0.0"), ("1.2.3.4", "1.2.3.4"),
+                         ("1.0.0+githash", "1.0.0"), ("1.0.0-Alpha", "1.0.0-alpha"), ("13.0.3", "13.0.3")]:
+            self.assertEqual(pk.normalize_nuget_version(raw), out, raw)
+
+    def test_dispatch(self):
+        self.assertEqual(pk.normalize_name("npm", "@Scope/Name"), "@Scope/Name")  # npm verbatim
+        self.assertEqual(pk.normalize_name("nuget", "Newtonsoft.Json"), "newtonsoft.json")
+        self.assertEqual(pk.normalize_name("psgallery", "PSReadLine"), "psreadline")
+        self.assertEqual(pk.normalize_version("npm", "4.17.21-beta.1"), "4.17.21-beta.1")
+
+    def test_filename_version_extractors(self):
+        self.assertEqual(pk.pypi_file_version("requests-2.32.3-py3-none-any.whl"), "2.32.3")
+        self.assertEqual(pk.pypi_file_version("requests-2.32.3.tar.gz"), "2.32.3")
+        self.assertEqual(pk.pypi_file_version("google-cloud-storage-2.0.0.tar.gz"), "2.0.0")
+        self.assertEqual(pk.npm_tarball_version("lodash", "lodash-4.17.21.tgz"), "4.17.21")
+        self.assertEqual(pk.npm_tarball_version("@babel/core", "core-7.0.0.tgz"), "7.0.0")
+        self.assertEqual(pk.npm_tarball_version("pre", "pre-1.0.0-beta.1.tgz"), "1.0.0-beta.1")
+
+
+class PackageClassifyTest(unittest.TestCase):
+    def setUp(self):
+        self.g = pk.PackageGate(_pkg_bundle())
+
+    def c(self, host, path, method="GET"):
+        r = self.g.classify(host, path, method)
+        return None if r is None else (r.eco, r.kind, r.name, r.version, r.filename)
+
+    def test_npm(self):
+        self.assertEqual(self.c("registry.npmjs.org", "/lodash"), ("npm", "metadata", "lodash", "", ""))
+        self.assertEqual(self.c("registry.npmjs.org", "/lodash/4.17.21")[3], "4.17.21")
+        self.assertEqual(self.c("registry.npmjs.org", "/@babel%2fcore"), ("npm", "metadata", "@babel/core", "", ""))
+        self.assertEqual(self.c("registry.npmjs.org", "/@babel/core"), ("npm", "metadata", "@babel/core", "", ""))
+        self.assertEqual(self.c("registry.npmjs.org", "/lodash/-/lodash-4.17.21.tgz"),
+                         ("npm", "artifact", "lodash", "4.17.21", "lodash-4.17.21.tgz"))
+        self.assertEqual(self.c("registry.npmjs.org", "/@babel/core/-/core-7.0.0.tgz"),
+                         ("npm", "artifact", "@babel/core", "7.0.0", "core-7.0.0.tgz"))
+        for svc in ("/-/v1/search", "/-/ping", "/-/whoami", "/-/npm/v1/keys", "/-/npm/v1/attestations/x", "/-/user/me"):
+            self.assertEqual(self.c("registry.npmjs.org", svc)[1], "service", svc)
+        self.assertEqual(self.c("registry.yarnpkg.com", "/lodash")[0], "npm")  # second metadata host
+
+    def test_pypi(self):
+        self.assertEqual(self.c("pypi.org", "/simple/requests/"), ("pypi", "metadata", "requests", "", ""))
+        self.assertEqual(self.c("pypi.org", "/simple/Flask_Cors/")[2], "flask-cors")  # PEP 503 name
+        self.assertEqual(self.c("pypi.org", "/simple/")[1], "service")               # index root
+        self.assertEqual(self.c("pypi.org", "/pypi/requests/json")[1], "metadata")
+        self.assertEqual(self.c("pypi.org", "/pypi/requests/2.32.3/json")[3], "2.32.3")
+        self.assertEqual(self.c("files.pythonhosted.org", "/packages/ab/cd/requests-2.32.3-py3-none-any.whl"),
+                         ("pypi", "artifact", "requests", "2.32.3", "requests-2.32.3-py3-none-any.whl"))
+        self.assertEqual(self.c("files.pythonhosted.org", "/packages/ab/requests-2.32.3-py3-none-any.whl.metadata")[1], "service")
+        self.assertEqual(self.c("files.pythonhosted.org", "/integrity/abc")[1], "service")
+
+    def test_nuget(self):
+        self.assertEqual(self.c("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/index.json"),
+                         ("nuget", "metadata", "newtonsoft.json", "", ""))
+        self.assertEqual(self.c("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"),
+                         ("nuget", "artifact", "newtonsoft.json", "13.0.3", "newtonsoft.json.13.0.3.nupkg"))
+        self.assertEqual(self.c("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.nuspec")[1], "service")
+        self.assertEqual(self.c("api.nuget.org", "/v3/registration5-gz-semver2/newtonsoft.json/index.json"),
+                         ("nuget", "metadata", "newtonsoft.json", "", ""))
+        self.assertEqual(self.c("api.nuget.org", "/v3/registration5-semver1/newtonsoft.json/13.0.3.json")[3], "13.0.3")
+        self.assertEqual(self.c("api.nuget.org", "/v3/index.json")[1], "service")
+        self.assertEqual(self.c("api.nuget.org", "/v3/vulnerabilities/index.json")[1], "service")
+        self.assertEqual(self.c("api.nuget.org", "/v3/catalog0/page1.json")[1], "service")
+
+    def test_psgallery(self):
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2/FindPackagesById()?id='PSReadLine'"),
+                         ("psgallery", "metadata", "psreadline", "", ""))
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2/Packages(Id='PSReadLine',Version='2.3.5')"),
+                         ("psgallery", "metadata", "psreadline", "2.3.5", ""))
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2/package/PSReadLine/2.3.5"),
+                         ("psgallery", "artifact", "psreadline", "2.3.5", "psreadline.2.3.5.nupkg"))
+        self.assertEqual(self.c("psg-prod-eastus.azureedge.net", "/packages/psreadline.2.3.5.nupkg"),
+                         ("psgallery", "artifact", "psreadline", "2.3.5", "psreadline.2.3.5.nupkg"))
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2")[1], "service")
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2/$metadata")[1], "service")
+        self.assertEqual(self.c("www.powershellgallery.com", "/api/v2/Search()?q=x")[1], "service")
+
+    def test_non_registry_and_other(self):
+        self.assertIsNone(self.c("example.com", "/lodash"))          # not a registry host
+        self.assertIsNone(self.c("registry.npmjs.org", "/"))         # registry root ("other") -> None
+        self.assertIsNone(self.c("registry.npmjs.org", "/lodash", "PUT"))  # publish/write -> ordinary egress
+        # an "off" ecosystem host is invisible to the gate
+        g2 = pk.PackageGate(_pkg_bundle(npm="off"))
+        self.assertIsNone(g2.classify("registry.npmjs.org", "/lodash", "GET"))
+
+    def test_bounded_path(self):
+        self.assertIsNone(self.g.classify("registry.npmjs.org", "/" + "a" * 9000, "GET"))
+
+
+class PackageDecideTest(unittest.TestCase):
+    def setUp(self):
+        self.g = pk.PackageGate(_pkg_bundle())
+
+    def d(self, host, path, groups=("*",), sid="srv-1", method="GET"):
+        req = self.g.classify(host, path, method)
+        return None if req is None else self.g.decide(req, list(groups), sid)
+
+    def test_enforce_metadata_filter_and_block(self):
+        d = self.d("registry.npmjs.org", "/lodash")
+        self.assertEqual((d.action, d.decision), (pk.ACT_FILTER, pk.D_FILTERED))
+        self.assertEqual(d.approved_versions & {"4.17.21", "4.17.20"}, {"4.17.21", "4.17.20"})
+        d = self.d("registry.npmjs.org", "/left-pad")  # no approval
+        self.assertEqual((d.action, d.decision, d.status), (pk.ACT_BLOCK, pk.D_NOT_APPROVED, 403))
+        self.assertIn("packages/request?", d.request_link())
+
+    def test_enforce_metadata_concrete_version(self):
+        self.assertEqual(self.d("registry.npmjs.org", "/lodash/4.17.21").action, pk.ACT_FILTER)
+        d = self.d("registry.npmjs.org", "/lodash/9.9.9")  # concrete, not approved
+        self.assertEqual((d.action, d.decision), (pk.ACT_BLOCK, pk.D_NOT_APPROVED))
+
+    def test_enforce_artifact(self):
+        d = self.d("registry.npmjs.org", "/lodash/-/lodash-4.17.21.tgz")
+        self.assertEqual((d.action, d.decision, d.sha512), (pk.ACT_VERIFY, pk.D_APPROVED, "npmPIN"))
+        d = self.d("registry.npmjs.org", "/lodash/-/lodash-9.9.9.tgz")  # version not approved
+        self.assertEqual((d.action, d.decision), (pk.ACT_BLOCK, pk.D_NOT_APPROVED))
+        d = self.d("files.pythonhosted.org", "/packages/x/requests-2.32.3-py3-none-any.whl")
+        self.assertEqual((d.action, d.decision, d.sha256), (pk.ACT_VERIFY, pk.D_APPROVED, "whlhex"))
+
+    def test_blocked_wins_over_approval(self):
+        # event-stream 3.3.6 is approved AND blocked -> block wins, for both metadata and artifact.
+        d = self.d("registry.npmjs.org", "/event-stream/-/event-stream-3.3.6.tgz")
+        self.assertEqual((d.action, d.decision), (pk.ACT_BLOCK, pk.D_BLOCKED))
+        d = self.d("registry.npmjs.org", "/event-stream")  # its only version is blocked -> no visible version
+        self.assertEqual((d.action, d.decision), (pk.ACT_BLOCK, pk.D_BLOCKED))
+
+    def test_service_passthrough(self):
+        d = self.d("registry.npmjs.org", "/-/ping")
+        self.assertEqual((d.action, d.decision), (pk.ACT_PASSTHROUGH, pk.D_SERVICE))
+
+    def test_monitor_never_acts(self):
+        # nuget is monitor in the fixture.
+        d = self.d("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", groups=["grp-ci"])
+        self.assertEqual((d.action, d.decision, d.monitor), (pk.ACT_PASSTHROUGH, pk.D_MONITOR, True))
+        self.assertEqual(d.reason, pk.D_APPROVED)  # the would-be outcome is preserved
+        d = self.d("api.nuget.org", "/v3-flatcontainer/unknown/index.json", groups=["grp-ci"])
+        self.assertEqual((d.action, d.decision, d.reason), (pk.ACT_PASSTHROUGH, pk.D_MONITOR, pk.D_NOT_APPROVED))
+
+    def test_group_scoping(self):
+        # nuget ecosystem is scoped to grp-ci: a client not in grp-ci is not covered -> ordinary egress (None).
+        self.assertIsNone(self.d("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/index.json", groups=["other"]))
+        self.assertIsNotNone(self.d("api.nuget.org", "/v3-flatcontainer/newtonsoft.json/index.json", groups=["grp-ci"]))
+        # npm ecosystem group_ids=["*"] covers unregistered clients (no groups, unregistered id).
+        d = self.d("registry.npmjs.org", "/lodash", groups=[], sid="srv-unregistered-10.0.0.1")
+        self.assertEqual(d.action, pk.ACT_FILTER)
+
+    def test_version_group_scope(self):
+        # Approve lodash 4.17.21 only for grp-ci; a client outside it sees no approved version.
+        b = _pkg_bundle()
+        b["approved"]["npm"]["lodash"]["4.17.21"]["g"] = ["grp-ci"]
+        del b["approved"]["npm"]["lodash"]["4.17.20"]
+        g = pk.PackageGate(b)
+        req = g.classify("registry.npmjs.org", "/lodash", "GET")
+        self.assertEqual(g.decide(req, ["grp-ci"], "s").action, pk.ACT_FILTER)
+        self.assertEqual(g.decide(req, ["other"], "s").decision, pk.D_NOT_APPROVED)
+
+
+class PackageFilterTest(unittest.TestCase):
+    def test_npm_packument_full_and_abbrev(self):
+        doc = {"name": "lodash", "dist-tags": {"latest": "4.17.21", "next": "5.0.0", "old": "3.0.0"},
+               "versions": {"3.0.0": {"version": "3.0.0"}, "4.17.20": {"version": "4.17.20"},
+                            "4.17.21": {"version": "4.17.21"}, "5.0.0": {"version": "5.0.0"}},
+               "time": {"created": "a", "modified": "b", "3.0.0": "c", "4.17.21": "d", "5.0.0": "e"}}
+        for ctype in ("application/json", "application/vnd.npm.install-v1+json"):
+            r = pk.filter_metadata("npm", "lodash", frozenset(["4.17.21", "4.17.20"]), json.dumps(doc).encode(), ctype)
+            out = json.loads(r.body)
+            self.assertEqual(set(out["versions"]), {"4.17.21", "4.17.20"})
+            self.assertEqual((r.hidden, r.visible), (2, 2))
+            self.assertEqual(out["dist-tags"]["latest"], "4.17.21")  # approved, kept
+            self.assertEqual(out["dist-tags"]["next"], "4.17.21")    # 5.0.0 -> highest approved <= 5.0.0
+            self.assertEqual(out["dist-tags"]["old"], "4.17.21")     # 3.0.0 -> nothing <=, highest overall
+            self.assertNotIn("5.0.0", out["time"])
+            self.assertIn("created", out["time"])
+
+    def test_npm_zero_approved(self):
+        doc = {"versions": {"1.0.0": {}}, "dist-tags": {"latest": "1.0.0"}}
+        r = pk.filter_metadata("npm", "x", frozenset(), json.dumps(doc).encode(), "application/json")
+        self.assertEqual(json.loads(r.body)["versions"], {})
+        self.assertEqual(json.loads(r.body)["dist-tags"], {})
+
+    def test_pypi_html(self):
+        html = (b'<html><body>\n'
+                b'<a href="https://f/requests-2.32.3-py3-none-any.whl#sha256=aa" data-requires-python="&gt;=3.8"'
+                b' data-core-metadata="sha256=bb" data-provenance="p">requests-2.32.3-py3-none-any.whl</a><br/>\n'
+                b'<a href="https://f/requests-2.0.0.tar.gz#sha256=cc">requests-2.0.0.tar.gz</a><br/>\n'
+                b'</body></html>')
+        r = pk.filter_metadata("pypi", "requests", frozenset(["2.32.3"]), html, "text/html")
+        self.assertEqual((r.hidden, r.visible), (1, 1))
+        self.assertNotIn(b"2.0.0", r.body)
+        self.assertIn(b"requests-2.32.3-py3-none-any.whl", r.body)
+        self.assertIn(b"data-requires-python", r.body)
+        self.assertIn(b"#sha256=aa", r.body)
+        self.assertIn(b"data-provenance", r.body)
+
+    def test_pypi_simple_json(self):
+        doc = {"meta": {"api-version": "1.1"}, "name": "requests",
+               "files": [{"filename": "requests-2.32.3-py3-none-any.whl", "url": "u", "hashes": {"sha256": "a"}},
+                         {"filename": "requests-2.0.0.tar.gz", "url": "v", "hashes": {"sha256": "b"}}],
+               "versions": ["2.0.0", "2.32.3"]}
+        r = pk.filter_metadata("pypi", "requests", frozenset(["2.32.3"]), json.dumps(doc).encode(),
+                               "application/vnd.pypi.simple.v1+json")
+        out = json.loads(r.body)
+        self.assertEqual([f["filename"] for f in out["files"]], ["requests-2.32.3-py3-none-any.whl"])
+        self.assertEqual(out["versions"], ["2.32.3"])
+        self.assertEqual(r.hidden, 1)
+
+    def test_pypi_project_json(self):
+        doc = {"info": {"version": "2.0.0"}, "releases": {"2.0.0": [{"filename": "x"}], "2.32.3": [{"filename": "y"}]},
+               "urls": [{"filename": "latest-is-2.0.0"}]}
+        r = pk.filter_metadata("pypi", "requests", frozenset(["2.32.3"]), json.dumps(doc).encode(), "application/json")
+        out = json.loads(r.body)
+        self.assertEqual(set(out["releases"]), {"2.32.3"})
+        self.assertEqual(out["urls"], [])  # latest 2.0.0 not approved -> files withdrawn
+
+    def test_nuget_flatcontainer(self):
+        doc = {"versions": ["12.0.0", "13.0.1", "13.0.3"]}
+        r = pk.filter_metadata("nuget", "newtonsoft.json", frozenset(["13.0.3"]), json.dumps(doc).encode(), "application/json")
+        self.assertEqual(json.loads(r.body)["versions"], ["13.0.3"])
+        self.assertEqual((r.hidden, r.visible), (2, 1))
+
+    def test_nuget_registration_inline(self):
+        doc = {"@id": "i", "@type": ["catalog:CatalogRoot"], "count": 1,
+               "items": [{"@id": "p", "@type": "catalog:CatalogPage", "count": 3, "lower": "12.0.0", "upper": "13.0.3",
+                          "items": [{"@id": "l1", "catalogEntry": {"version": "12.0.0"}},
+                                    {"@id": "l2", "catalogEntry": {"version": "13.0.1"}},
+                                    {"@id": "l3", "catalogEntry": {"version": "13.0.3"}}]}]}
+        r = pk.filter_metadata("nuget", "newtonsoft.json", frozenset(["13.0.3"]), json.dumps(doc).encode(), "application/json")
+        out = json.loads(r.body)
+        self.assertEqual([l["catalogEntry"]["version"] for l in out["items"][0]["items"]], ["13.0.3"])
+        self.assertEqual(out["items"][0]["count"], 1)
+        self.assertEqual(out["@type"], ["catalog:CatalogRoot"])  # structural fields kept
+        self.assertEqual((r.hidden, r.visible), (2, 1))
+
+    def test_nuget_registration_paged_dropped(self):
+        doc = {"@id": "i", "count": 1, "items": [{"@id": "page-url", "count": 99, "lower": "1.0.0", "upper": "9.0.0"}]}
+        r = pk.filter_metadata("nuget", "newtonsoft.json", frozenset(["13.0.3"]), json.dumps(doc).encode(), "application/json")
+        out = json.loads(r.body)
+        self.assertEqual(out["items"], [])  # paged (not inline) -> dropped (fail closed)
+        self.assertEqual(out["count"], 0)
+
+    def test_psgallery_odata_atom(self):
+        xml = (b'<?xml version="1.0" encoding="utf-8"?>\n'
+               b'<feed xmlns="http://www.w3.org/2005/Atom"'
+               b' xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"'
+               b' xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+               b'<title>Packages</title>'
+               b'<link rel="next" href="https://p/x?$skiptoken=a"/>'
+               b'<entry><m:properties><d:Version>2.0.0</d:Version><d:NormalizedVersion>2.0.0</d:NormalizedVersion></m:properties></entry>'
+               b'<entry><m:properties><d:Version>2.3.5</d:Version><d:NormalizedVersion>2.3.5</d:NormalizedVersion></m:properties></entry>'
+               b'</feed>')
+        r = pk.filter_metadata("psgallery", "psreadline", frozenset(["2.3.5"]), xml, "application/atom+xml")
+        self.assertEqual((r.hidden, r.visible), (1, 1))
+        self.assertNotIn(b">2.0.0</d:NormalizedVersion>", r.body)
+        self.assertIn(b">2.3.5</d:NormalizedVersion>", r.body)
+        self.assertIn(b'rel="next"', r.body)       # feed-level link preserved
+        root = ET.fromstring(r.body)                # still well-formed XML
+        self.assertTrue(root.tag.endswith("feed"))
+
+    def test_malformed_body_fails_closed(self):
+        with self.assertRaises(pk.FilterError):
+            pk.filter_metadata("npm", "x", frozenset(["1.0.0"]), b"not json", "application/json")
+        with self.assertRaises(pk.FilterError):
+            pk.filter_metadata("psgallery", "x", frozenset(["1.0.0"]), b"<feed><broken", "application/atom+xml")
+
+
+class PackageVerifierTest(unittest.TestCase):
+    DATA = b"artifact-payload-" * 9000  # ~153 KiB, larger than the tail window
+
+    def _run(self, verifier, data, chunk=5000):
+        out = bytearray()
+        for i in range(0, len(data), chunk):
+            out += verifier(data[i:i + chunk])
+        out += verifier(b"")
+        return bytes(out)
+
+    def test_match_sha256_and_sha512(self):
+        h256 = hashlib.sha256(self.DATA).hexdigest()
+        h512 = base64.b64encode(hashlib.sha512(self.DATA).digest()).decode()
+        v = pk.ArtifactVerifier(expected_sha256=h256, expected_sha512=h512)
+        self.assertEqual(self._run(v, self.DATA), self.DATA)  # complete file delivered
+        self.assertTrue(v.matched)
+        self.assertEqual(v.sha256, h256)
+        self.assertEqual(v.sha512.rstrip("="), h512.rstrip("="))
+
+    def test_mismatch_truncates_and_calls_on_fail(self):
+        failed = []
+        v = pk.ArtifactVerifier(expected_sha256="0" * 64, on_fail=lambda vf: failed.append(vf))
+        out = self._run(v, self.DATA)
+        self.assertLess(len(out), len(self.DATA))  # tail withheld: the client never gets a complete file
+        self.assertTrue(v.mismatch)
+        self.assertEqual(len(failed), 1)
+
+    def test_no_content_length_single_chunk(self):
+        h256 = hashlib.sha256(self.DATA).hexdigest()
+        v = pk.ArtifactVerifier(expected_sha256=h256)
+        self.assertEqual(v(self.DATA) + v(b""), self.DATA)
+        self.assertTrue(v.matched)
+
+    def test_npm_integrity_prefix_and_no_pin(self):
+        h512 = base64.b64encode(hashlib.sha512(self.DATA).digest()).decode()
+        v = pk.ArtifactVerifier(expected_sha512="sha512-" + h512)  # npm integrity spelling
+        self.assertEqual(self._run(v, self.DATA), self.DATA)
+        self.assertTrue(v.matched)
+        v = pk.ArtifactVerifier()  # no pin at all -> fail closed
+        self._run(v, self.DATA)
+        self.assertTrue(v.mismatch)
+
+    def test_memory_is_bounded(self):
+        v = pk.ArtifactVerifier(expected_sha256=hashlib.sha256(self.DATA).hexdigest())
+        for i in range(0, len(self.DATA), 5000):
+            v(self.DATA[i:i + 5000])
+            self.assertLessEqual(len(v._pending), v.tail)  # never buffers the whole artifact
+
+
+class PackagePolicyWiringTest(unittest.TestCase):
+    def test_policy_builds_gate_from_bundle(self):
+        p = Policy({**BUNDLE, "packages": _pkg_bundle()})
+        self.assertTrue(p.packages.enabled)
+        self.assertEqual(p.packages.status_summary(), "npm=enforce,pypi=enforce,nuget=monitor,psgallery=enforce")
+
+    def test_absent_packages_disables_gate(self):
+        p = Policy(BUNDLE)
+        self.assertFalse(p.packages.enabled)
+        self.assertIsNone(p.packages.classify("registry.npmjs.org", "/lodash", "GET"))
+
+
+@unittest.skipUnless(HAVE_MITMPROXY, "mitmproxy not installed (runs in the data-plane image)")
+class PackageGateAddonTest(unittest.TestCase):
+    """Hook-level integration: the package gate through requestheaders/responseheaders/response."""
+
+    def addon(self, **eco_modes):
+        from aegis_dp.addon import AegisAddon
+        a = AegisAddon(Config(control_plane_url="http://127.0.0.1:1", dataplane_key="k" * 40, worker_id="test", ops_addr=""))
+        bundle = json.loads(json.dumps(ADDON_BUNDLE))
+        bundle["rules"] = [{"id": "reg", "name": "registries", "action": "ALLOW", "host_pattern": "*",
+                            "path_pattern": "/**", "group_ids": ["g1"], "enabled": True}]
+        bundle["packages"] = _pkg_bundle(**eco_modes)
+        a.cp.policy = Policy(bundle)
+        return a
+
+    def flow(self, host, path, method="GET", headers=()):
+        client = tflow.tclient_conn()
+        client.peername = ("10.1.0.5", 40000)
+        client.proxy_mode = mode_specs.ProxyMode.parse("regular")
+        hdrs = mhttp.Headers([(k.encode(), v.encode()) for k, v in (list(headers) + [("Host", host)])])
+        req = tutils.treq(host=host, port=443, scheme=b"https", method=method.encode(), path=path.encode(), headers=hdrs)
+        return tflow.tflow(client_conn=client, req=req)
+
+    @staticmethod
+    def call(a, hook, data):
+        r = getattr(a, hook)(data)
+        if inspect.isawaitable(r):
+            asyncio.run(r)
+
+    def records(self, a):
+        return list(a.cp._queue)
+
+    def test_metadata_not_approved_blocked_locally(self):
+        a = self.addon()
+        f = self.flow("registry.npmjs.org", "/left-pad")
+        self.call(a, "requestheaders", f)
+        self.assertIsNotNone(f.response)
+        self.assertEqual(f.response.status_code, 403)
+        self.assertEqual(f.response.headers["X-Aegis-Verdict"], "PACKAGE_BLOCKED")
+        body = json.loads(f.response.raw_content)  # npm gets JSON {"error": ...}
+        self.assertIn("packages/request?", body["error"])
+        rec = self.records(a)[-1]
+        self.assertEqual(rec["verdict"], "PACKAGE_BLOCKED")
+        self.assertEqual(rec["package"]["decision"], "not_approved")
+        self.assertEqual(rec["package"]["ecosystem"], "npm")
+
+    def test_metadata_filtered(self):
+        a = self.addon()
+        doc = {"name": "lodash", "dist-tags": {"latest": "5.0.0"},
+               "versions": {"4.17.21": {"version": "4.17.21"}, "5.0.0": {"version": "5.0.0"}}}
+        f = self.flow("registry.npmjs.org", "/lodash", headers=[("If-None-Match", '"abc"')])
+        self.call(a, "requestheaders", f)
+        self.assertIsNone(f.response)
+        self.assertNotIn("If-None-Match", f.request.headers)  # conditional header stripped
+        f.response = tutils.tresp(content=json.dumps(doc).encode(),
+                                  headers=mhttp.Headers([(b"Content-Type", b"application/json"), (b"ETag", b'"up"')]))
+        self.call(a, "responseheaders", f)
+        self.call(a, "response", f)
+        out = json.loads(f.response.raw_content)
+        self.assertEqual(set(out["versions"]), {"4.17.21"})  # 5.0.0 hidden
+        self.assertEqual(out["dist-tags"]["latest"], "4.17.21")  # repointed
+        self.assertEqual(f.response.headers["Cache-Control"], "no-store")
+        self.assertTrue(f.response.headers["ETag"].startswith('W/"aegis-'))
+        rec = self.records(a)[-1]
+        self.assertEqual((rec["verdict"], rec["matched_rule_id"]), ("ALLOWED", "package-firewall"))
+        self.assertEqual((rec["package"]["decision"], rec["package"]["hidden_versions"]), ("filtered", 1))
+
+    def test_artifact_hash_match_and_mismatch(self):
+        body = b"TARBALL-BYTES-" * 5000
+        h512 = base64.b64encode(hashlib.sha512(body).digest()).decode()
+        a = self.addon()
+        a.cp.policy.packages._approved["npm"]["lodash"]["4.17.21"]["files"]["lodash-4.17.21.tgz"]["sha512"] = h512
+        # match: the full body is delivered and recorded approved
+        f = self.flow("registry.npmjs.org", "/lodash/-/lodash-4.17.21.tgz")
+        self.call(a, "requestheaders", f)
+        f.response = tutils.tresp(content=b"", headers=mhttp.Headers([(b"Content-Length", str(len(body)).encode())]))
+        self.call(a, "responseheaders", f)
+        self.assertTrue(callable(f.response.stream))
+        delivered = f.response.stream(body) + f.response.stream(b"")
+        self.call(a, "response", f)
+        self.assertEqual(delivered, body)
+        rec = self.records(a)[-1]
+        self.assertEqual((rec["verdict"], rec["package"]["decision"]), ("ALLOWED", "approved"))
+        self.assertEqual(rec["package"]["sha512"].rstrip("="), h512.rstrip("="))
+        # mismatch: the registry serves different bytes -> truncated + hash_mismatch
+        a.cp.policy.packages._approved["npm"]["lodash"]["4.17.21"]["files"]["lodash-4.17.21.tgz"]["sha512"] = "WRONGPIN"
+        f = self.flow("registry.npmjs.org", "/lodash/-/lodash-4.17.21.tgz")
+        self.call(a, "requestheaders", f)
+        f.response = tutils.tresp(content=b"", headers=mhttp.Headers([(b"Content-Length", str(len(body)).encode())]))
+        self.call(a, "responseheaders", f)
+        delivered = f.response.stream(body) + f.response.stream(b"")
+        self.call(a, "response", f)
+        self.assertLess(len(delivered), len(body))  # tail withheld
+        rec = self.records(a)[-1]
+        self.assertEqual((rec["verdict"], rec["package"]["decision"]), ("PACKAGE_BLOCKED", "hash_mismatch"))
+        self.assertIn("PACKAGE_HASH_MISMATCH", rec["security_flags"])
+
+    def test_monitor_records_but_does_not_block(self):
+        a = self.addon()
+        # nuget is scoped to grp-ci in the fixture; the test client is in g1, so widen the scope to every client.
+        a.cp.policy.packages.ecosystems["nuget"]["group_ids"] = ["*"]
+        f = self.flow("api.nuget.org", "/v3-flatcontainer/unknown/index.json")
+        self.call(a, "requestheaders", f)
+        self.assertIsNone(f.response)  # monitor never blocks
+        f.response = tutils.tresp(content=b'{"versions":[]}', headers=mhttp.Headers([(b"Content-Type", b"application/json")]))
+        self.call(a, "responseheaders", f)
+        self.call(a, "response", f)
+        rec = self.records(a)[-1]
+        self.assertEqual(rec["package"]["decision"], "monitor")
+        self.assertEqual(rec["package"]["reason"], "not_approved")
+
+    def test_heartbeat_header(self):
+        a = self.addon()
+        self.assertEqual(a._engine_status()["X-Aegis-Packages"], "npm=enforce,pypi=enforce,nuget=monitor,psgallery=enforce")
+
+
 if __name__ == "__main__":
     unittest.main()
