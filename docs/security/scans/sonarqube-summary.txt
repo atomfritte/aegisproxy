@@ -1,0 +1,29 @@
+# SonarQube analysis summary — AegisProxy
+# Generated 2026-10-31 · SonarQube 26.8 (community) · project 'aegisproxy' · ncloc 94,402
+
+## Ratings (after fixes + false-positive triage)
+  Security:        A   (0 vulnerabilities, 0 security hotspots)
+  Reliability:     A   (0 bugs)
+  Maintainability: A   (1224 code smells; sqale rating A = low debt ratio)
+  Duplicated lines: 0.0%
+
+## Issues handled this pass
+  33 bugs      -> 0 open:  23 fixed in code (S2871 sort comparators); 10 a11y (S1082) false-positive
+                           (keyboard-navigable widgets handle keys at the container level).
+  8 vulns      -> 0 open:  all false-positive/by-design (TLS secure-by-default + operator opt-out;
+                           CA-bootstrap/proxy-URL http). See docs/security/README.md.
+  1224 smells  -> backlog: maintainability/style (see breakdown); not security/reliability.
+
+## Code-smell breakdown (top rules)
+  typescript:S3358 (272)  nested ternary expressions (idiomatic in JSX)
+  go:S3776         (229)  cognitive complexity > 15
+  typescript:S6478 (224)  component defined in render / JSX nesting
+  go:S1192         ( 83)  string literal duplicated >=3x
+  typescript:S3776 ( 61)  cognitive complexity > 15
+  python:S3776     ( 47)  cognitive complexity > 15
+  typescript:S4624 ( 37)  nested template literals
+  typescript:S6819 ( 30)  prefer a semantic element over a role
+  typescript:S6479 ( 23)  array index used as React key
+  typescript:S8786 ( 19)  / python:S1313 (12, hardcoded IPs in tests) / typescript:S1128 (9, unused)
+
+Config: sonar-project.properties (repo root). Reproduce: docs/security/README.md#sonarqube.

@@ -17,7 +17,7 @@ reviewers) can reproduce every scan from the commands below and compare against 
 | **npm audit** | console dependencies | ✅ 0 vulnerabilities |
 | **pip-audit** | data-plane / CI / e2e locked deps | ✅ No known vulnerabilities |
 | **Trivy** | repo filesystem: deps, secrets, IaC | ✅ 0 CVEs, 0 committed secrets; only sandbox-image hardening notes |
-| **SonarQube** | multi-language | ⏳ config ready; server run blocked in this environment — see [below](#sonarqube) |
+| **SonarQube** | multi-language (Go/Python/TS) | ✅ **0 bugs, 0 vulnerabilities, 0 hotspots** (Security A · Reliability A · Maintainability A); 1224 maintainability smells tracked as backlog |
 
 **Net:** no vulnerabilities and no committed secrets across six scanners. Three real correctness findings
 (staticcheck) were fixed. Everything else is documented as accepted-by-design with a rationale.
@@ -112,11 +112,41 @@ docker run --rm --network sonar-net -v "$PWD:/usr/src" \
   -e SONAR_HOST_URL=http://sonar:9000 -e SONAR_TOKEN=<token> sonarsource/sonar-scanner-cli
 ```
 
-> **Status in this environment:** a fresh SonarQube could not start because the host disk is at ~92 %
-> and Elasticsearch refuses shard allocation above its 90 % watermark; a pre-existing local
-> `sonarqube-server` is healthy but its admin password was changed and is unknown (we do not reset a
-> shared instance without the owner). Free disk below 90 % (or supply the existing instance's token) and
-> run the commands above; then triage the issues/hotspots the same way as the gosec triage here.
+### Results (SonarQube 26.8, project `aegisproxy`, 94,402 ncloc)
+
+Full summary in [`scans/sonarqube-summary.txt`](scans/sonarqube-summary.txt). After the fixes and
+false-positive triage below: **Security A · Reliability A · Maintainability A**, 0.0 % duplication.
+
+| | Raised | Open after triage | How handled |
+|---|---:|---:|---|
+| **Bugs** | 33 | **0** | 23 fixed in code (missing sort comparators, `S2871`); 10 marked false-positive (a11y `S1082`) |
+| **Vulnerabilities** | 8 | **0** | all false-positive / by-design (see below), marked with a justification in SonarQube |
+| **Security hotspots** | 0 | 0 | — |
+| **Code smells** | 1224 | 1224 | maintainability/style backlog (see below) — not security or reliability |
+
+- **Bugs fixed (`S2871`, 23):** `.sort()` on string arrays (team/OS/tag/actor/category lists) now use an
+  explicit `String(a).localeCompare(String(b))` comparator for reliable, locale-correct ordering.
+- **Bugs — false positive (`S1082`, 10 a11y):** "clickable element needs a keyboard listener" — these are
+  items inside keyboard-navigable widgets (`Menu`, `Select`, `CommandPalette`, `TagInput`) that handle keys
+  at the **container** level (roving focus + `aria-activedescendant` + container `onKeyDown` for
+  Arrow/Enter/Space, per WAI-ARIA), or mouse propagation guards around already-accessible controls. Adding
+  element-level handlers would be inert. Marked false-positive in SonarQube with that justification.
+- **Vulnerabilities — all false positive / by-design (8):** TLS cert+hostname verification is **on by
+  default** (`ssl.create_default_context`), disabled only on explicit operator opt-in for a self-signed
+  local ICAP endpoint (`icap.py`); the `controlplane.py` context is the secure default (FP); the `http://`
+  URLs are the **CA-bootstrap** help text (you cannot use HTTPS before trusting the CA — integrity is via
+  out-of-band SHA-256) and the forward-**proxy URL** convention (`http://proxy:8080`, even for HTTPS via
+  CONNECT). Consistent with govulncheck / gosec / Trivy all finding no real issue.
+- **Code smells (1224):** maintainability/style only — nested ternaries (272), cognitive complexity > 15
+  (337 across Go/TS/Python), duplicated string literals (83), array-index React keys, etc. The sqale
+  rating is **A** (low debt ratio), there are **0.0 %** duplicated lines, and none is a security or
+  reliability defect. Refactoring 1224 opinionated findings would be high-churn, high-risk change against
+  an already-A-rated codebase, so they are kept as a tracked maintainability backlog rather than force-fixed.
+
+> The scan ran against a dedicated SonarQube+PostgreSQL stack (`aegis-sonar` + `aegis-sonar-db` on the
+> `aegis-sonar-net` network, console on `http://localhost:9001`); your pre-existing `sonarqube-server` was
+> left untouched. Remove the stack with `docker rm -f aegis-sonar aegis-sonar-db && docker network rm
+> aegis-sonar-net`, or re-run anytime with the commands above.
 
 ## Continuous scanning
 
