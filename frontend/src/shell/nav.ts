@@ -2,7 +2,9 @@
 import type { LucideIcon } from 'lucide-react';
 import {
   Activity,
+  Ban,
   BarChart3,
+  CheckCircle2,
   FileWarning,
   GitPullRequestArrow,
   History,
@@ -10,8 +12,12 @@ import {
   LayoutDashboard,
   Layers,
   Lock,
+  PackageCheck,
+  PackageSearch,
   Radar,
+  ScrollText,
   Server,
+  ServerCog,
   Settings,
   ShieldAlert,
   ShieldCheck,
@@ -35,6 +41,8 @@ export interface NavItem {
   icon: LucideIcon;
   /** Pattern used for the active state (prefix match). Defaults to `to`. */
   match?: string;
+  /** Exact-match the active state (no prefix) — for a section landing page like /packages. */
+  end?: boolean;
   /** Short description (command palette). */
   description: string;
   /** Extra search terms for the command palette. */
@@ -162,6 +170,61 @@ export const NAV: NavSection[] = [
         icon: BarChart3,
         description: 'Throughput and top talkers',
         keywords: 'volume mbps',
+      },
+    ],
+  },
+  {
+    id: 'packages',
+    title: 'Packages',
+    items: [
+      {
+        id: 'packages-overview',
+        label: 'Package firewall',
+        to: '/packages',
+        end: true,
+        icon: PackageCheck,
+        description: 'Ecosystems, work queues, sandbox health and recent decisions',
+        keywords: 'package firewall npm pypi nuget powershell gallery registry supply chain overview',
+      },
+      {
+        id: 'packages-requests',
+        label: 'Requests',
+        to: '/packages/requests',
+        icon: PackageSearch,
+        description: 'Request and review packages with the dependency graph',
+        keywords: 'request review dependency graph assessment sandbox approve reject karenz cooldown',
+      },
+      {
+        id: 'packages-approvals',
+        label: 'Approvals',
+        to: '/packages/approvals',
+        icon: CheckCircle2,
+        description: 'Approved versions, pinned files, revoke and extend',
+        keywords: 'approved versions pins sha256 sha512 revoke extend expiry',
+      },
+      {
+        id: 'packages-rules',
+        label: 'Rules',
+        to: '/packages/rules',
+        icon: ScrollText,
+        description: 'Cooldown, auto-approve, review and block rules',
+        keywords: 'rules cooldown karenz auto approve review block priority glob severity risk signature provenance',
+      },
+      {
+        id: 'packages-blocks',
+        label: 'Block list',
+        to: '/packages/blocks',
+        icon: Ban,
+        description: 'Versions denied regardless of approvals',
+        keywords: 'block list deny malicious banned versions',
+      },
+      {
+        id: 'packages-receivers',
+        label: 'Receivers',
+        to: '/packages/receivers',
+        icon: ServerCog,
+        description: 'Which servers obtained a package',
+        keywords: 'receivers incident who downloaded servers investigation forensics telemetry',
       },
     ],
   },

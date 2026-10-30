@@ -30,6 +30,13 @@ const SettingsPage = page(() => import('./pages/governance/SettingsPage'), 'Sett
 const BlockPagesPage = page(() => import('./pages/security/BlockPagesPage'), 'BlockPagesPage');
 const BlockPageEditorPage = page(() => import('./pages/security/BlockPageEditorPage'), 'BlockPageEditorPage');
 const PosturePage = page(() => import('./pages/governance/PosturePage'), 'PosturePage');
+const PackagesOverviewPage = page(() => import('./pages/packages/PackagesOverviewPage'), 'PackagesOverviewPage');
+const PackageRequestsPage = page(() => import('./pages/packages/PackageRequestsPage'), 'PackageRequestsPage');
+const PackageRequestDetailPage = page(() => import('./pages/packages/PackageRequestDetailPage'), 'PackageRequestDetailPage');
+const PackageApprovalsPage = page(() => import('./pages/packages/PackageApprovalsPage'), 'PackageApprovalsPage');
+const PackageRulesPage = page(() => import('./pages/packages/PackageRulesPage'), 'PackageRulesPage');
+const PackageBlocksPage = page(() => import('./pages/packages/PackageBlocksPage'), 'PackageBlocksPage');
+const PackageReceiversPage = page(() => import('./pages/packages/PackageReceiversPage'), 'PackageReceiversPage');
 
 export const ROUTES: RouteDef[] = [
   { path: '/', component: OverviewPage },
@@ -50,6 +57,14 @@ export const ROUTES: RouteDef[] = [
   // Traffic
   { path: '/traffic', component: LiveTrafficPage },
   { path: '/bandwidth', component: BandwidthPage },
+  // Packages (package firewall)
+  { path: '/packages', component: PackagesOverviewPage },
+  { path: '/packages/requests', component: PackageRequestsPage },
+  { path: '/packages/requests/:id', component: PackageRequestDetailPage },
+  { path: '/packages/approvals', component: PackageApprovalsPage },
+  { path: '/packages/rules', component: PackageRulesPage },
+  { path: '/packages/blocks', component: PackageBlocksPage },
+  { path: '/packages/receivers', component: PackageReceiversPage },
   // Security
   { path: '/threats/:tab?/:id?', component: ThreatProtectionPage }, // yara/:id = rule set editor
   { path: '/tls', component: TlsCaPage },

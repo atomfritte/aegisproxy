@@ -1563,3 +1563,709 @@ export interface ExportsResponse {
   export_dir: string;
   can_edit: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Package firewall (3.0) — /api/packages/*
+// Mirror of control-plane/internal/models/packages*.go and internal/sandbox/report.go
+// (snake_case JSON). Arrays may arrive as null, so read them with `?? []`.
+// ---------------------------------------------------------------------------
+
+/** Supported package ecosystems (display order). */
+export type PackageEcosystem = 'npm' | 'pypi' | 'nuget' | 'psgallery';
+/** Enforcement mode of an ecosystem. */
+export type PackageMode = 'off' | 'monitor' | 'enforce';
+/** Severity / risk levels shared by findings, advisories and assessments. */
+export type PackageRisk = 'none' | 'info' | 'low' | 'medium' | 'high' | 'critical' | 'unknown';
+/** Signature / provenance verification outcome. */
+export type PackageVerificationStatus = 'verified' | 'unsigned' | 'failed' | 'unchecked';
+/** Data-plane package gate decision (FlowPackage.decision). */
+export type PackageDecision =
+  | 'approved'
+  | 'filtered'
+  | 'not_approved'
+  | 'blocked'
+  | 'hash_mismatch'
+  | 'monitor'
+  | 'service';
+
+/** An artifact pinned by an approval. */
+export interface PackageFilePin {
+  filename: string;
+  /** hex */
+  sha256?: string;
+  /** base64 (npm integrity, NuGet / PowerShell Gallery package hash) */
+  sha512?: string;
+  size?: number;
+  url?: string;
+}
+
+/** One advisory / reputation source (osv, github, npm, pypi, nuget, depsdev, ossindex, socket, snyk). */
+export interface PackageAuditSource {
+  id: string;
+  enabled: boolean;
+  /** Write-only: only sent when a new value is typed. Never returned. */
+  token?: string;
+  has_token?: boolean;
+  /** OSS Index user name or Snyk organization ID. */
+  account?: string;
+  /** Base URL override (mirror / on-premises). */
+  url?: string;
+}
+
+/** Behaviour analysis configuration (sandbox workers). */
+export interface PackageSandboxConfig {
+  enabled: boolean;
+  /** static (unpack and inspect), install (install hooks), load (import the module). */
+  scenarios: string[] | null;
+  timeout_seconds: number;
+  max_artifact_bytes: number;
+  /** An approval needs a completed analysis; manual overrides are flagged. */
+  required: boolean;
+}
+
+/** One ecosystem's configuration. */
+export interface PackageEcosystemSettings {
+  mode: PackageMode;
+  hosts: string[] | null;
+  file_hosts?: string[] | null;
+  /** Server groups the gate applies to; ["*"] = every client. */
+  group_ids: string[] | null;
+  /** Registry base URL used for metadata, resolution and analysis. */
+  upstream: string;
+}
+
+/** Package firewall configuration (part of the configuration document). */
+export interface PackageSettings {
+  ecosystems: Record<string, PackageEcosystemSettings>;
+  /** Waiting period (Karenz) after publication used by new rules / shown for uncovered versions. */
+  default_cooldown_hours: number;
+  /** Open a request (and analysis) for packages a client tried to download but that are not approved. */
+  auto_request_discovered: boolean;
+  /** Re-check approved versions against advisory sources (0 = off). */
+  reaudit_hours: number;
+  /** Look for new upstream versions of approved packages (0 = off). */
+  watch_hours: number;
+  /** Revoke approvals when a new advisory of at least this severity (or malware) applies: '' | malware | critical | high. */
+  revoke_on_severity: string;
+  /** Bounds dependency resolution (nodes per request). */
+  max_graph_size: number;
+  sandbox: PackageSandboxConfig;
+  audit_sources: PackageAuditSource[] | null;
+  /** PEP 508 marker environments dependencies are resolved for (union). */
+  python_environments?: Array<Record<string, string>> | null;
+  /** Limits the NuGet dependency groups considered (empty = every group). */
+  nuget_frameworks?: string[] | null;
+}
+
+/** Permits one version of a package for a set of server groups. */
+export interface PackageApproval {
+  id: string;
+  ecosystem: string;
+  name: string;
+  display_name?: string;
+  version: string;
+  files: PackageFilePin[] | null;
+  /** ["*"] = every client the ecosystem applies to. */
+  group_ids: string[] | null;
+  status: 'approved' | 'revoked';
+  /** manual | rule | dependency */
+  via: string;
+  rule_id?: string;
+  request_id?: string;
+  /** Root package (name@version) that pulled it in. */
+  required_by?: string;
+  approved_by: string;
+  approved_at: string;
+  expires_at?: string;
+  reason?: string;
+  /** Assessment at approval time. */
+  risk?: PackageRisk;
+  published_at?: string;
+  /** Approved without a completed sandbox analysis (override). */
+  unanalyzed?: boolean;
+  revoked_by?: string;
+  revoked_at?: string;
+  revoke_reason?: string;
+}
+
+/** Denies versions of a package regardless of approvals (explicit block list). */
+export interface PackageBlock {
+  id: string;
+  ecosystem: string;
+  name: string;
+  /** "*" or a version range in the ecosystem's syntax. */
+  versions: string;
+  reason: string;
+  /** manual | advisory | sandbox */
+  source: string;
+  created_by: string;
+  created_at: string;
+}
+
+export type PackageRuleAction = 'auto_approve' | 'review' | 'block';
+export type PackageRuleTrigger = 'any' | 'updates';
+
+/** Decides automatically about versions (ordered by priority, first match wins; no match = review). */
+export interface PackageRule {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  priority: number;
+  /** empty = all */
+  ecosystems: string[] | null;
+  /** name globs ("*", "@corp/*", "microsoft.extensions.*") */
+  packages: string[] | null;
+  /** scope of approvals the rule creates (["*"] = all) */
+  group_ids: string[] | null;
+  action: PackageRuleAction;
+  trigger: PackageRuleTrigger;
+  /** restricts the updates trigger to patch / minor / major steps (empty = all) */
+  update_types?: string[] | null;
+  /** cooldown (Karenz): hours a version must have been public before the rule approves it */
+  min_age_hours: number;
+  /** highest advisory severity tolerated (none, low, medium, high); critical / malware always fail */
+  max_severity: string;
+  /** highest overall assessment tolerated */
+  max_risk: string;
+  require_signature: boolean;
+  require_provenance: boolean;
+  require_sandbox: boolean;
+  allow_install_scripts: boolean;
+  /** allowed SPDX identifiers (empty = any) */
+  licenses?: string[] | null;
+  exclude_prerelease: boolean;
+  exclude_deprecated: boolean;
+  created_by?: string;
+  created_at: string;
+  updated_by?: string;
+  updated_at: string;
+}
+
+/** Signature or provenance verification result. */
+export interface PackageVerification {
+  status: PackageVerificationStatus;
+  /** what was verified, e.g. "npm-registry" key id, Sigstore identity */
+  kind?: string;
+  identity?: string;
+  key_id?: string;
+  detail?: string;
+  /** from a verified SLSA provenance */
+  source_repo?: string;
+  commit?: string;
+  workflow?: string;
+}
+
+/** One advisory affecting a version. */
+export interface PackageAdvisory {
+  id: string;
+  /** osv | github | npm | pypi | nuget | depsdev | ossindex */
+  source: string;
+  severity: PackageRisk;
+  malware?: boolean;
+  summary: string;
+  url?: string;
+  aliases?: string[] | null;
+  cvss?: number;
+  withdrawn?: boolean;
+}
+
+/** Summary of a sandbox analysis stored with an assessment. */
+export interface PackageSandboxResult {
+  job_id: string;
+  status: 'completed' | 'failed' | 'running' | 'queued' | 'skipped';
+  driver?: string;
+  started_at?: string;
+  finished_at?: string;
+  /** URLs and hosts the package tried to reach (deduplicated across phases). */
+  urls?: string[] | null;
+  hosts?: string[] | null;
+  dns_names?: string[] | null;
+  /** aggregate system-call histogram across phases */
+  syscall_counts?: Record<string, number> | null;
+  /** argv of spawned processes */
+  processes?: string[] | null;
+  files_written?: string[] | null;
+  secrets_read?: string[] | null;
+  canary_hits?: number;
+  /** locates the full stored report */
+  report_key?: string;
+  error?: string;
+}
+
+/** A notable finding shown in the review UI. */
+export interface PackageFinding {
+  id: string;
+  severity: PackageRisk;
+  category: string;
+  title: string;
+  detail?: string;
+  /** advisory | signature | sandbox | static | policy */
+  source: string;
+}
+
+/** Cached risk assessment of one exact package version. */
+export interface PackageAssessment {
+  ecosystem: string;
+  name: string;
+  version: string;
+  risk: PackageRisk;
+  summary?: string;
+  advisories?: PackageAdvisory[] | null;
+  signature: PackageVerification;
+  provenance: PackageVerification;
+  sandbox?: PackageSandboxResult | null;
+  findings?: PackageFinding[] | null;
+  has_install_scripts?: boolean;
+  published_at?: string;
+  /** advisory sources that actually answered */
+  sources?: string[] | null;
+  /** some source or the sandbox did not complete */
+  partial?: boolean;
+  updated_at: string;
+}
+
+/** Who required a node and with what range. */
+export interface PackageEdge {
+  /** parent node key ("" for the root request) */
+  parent: string;
+  range: string;
+  kind?: string;
+}
+
+/** Node state relative to the current approvals. */
+export type PackageNodeState = 'approved' | 'blocked' | 'new' | 'update';
+
+/** One package version in a resolved graph. */
+export interface PackageNode {
+  /** ecosystem:name@version */
+  key: string;
+  ecosystem: string;
+  name: string;
+  display_name?: string;
+  version: string;
+  root?: boolean;
+  direct?: boolean;
+  required_by?: PackageEdge[] | null;
+  /** runtime, dev, optional, peer, build, framework */
+  kinds?: string[] | null;
+  files?: PackageFilePin[] | null;
+  published_at?: string;
+  license?: string;
+  deprecated?: boolean;
+  yanked?: boolean;
+  state: PackageNodeState;
+  /** existing approval covering this node (state approved) */
+  already_approved_id?: string;
+  assessment?: PackageAssessment | null;
+}
+
+export type PackageRequestStatus = 'resolving' | 'analyzing' | 'ready' | 'approved' | 'rejected' | 'failed';
+
+/** A request to approve a package (and its dependency graph) for a set of groups. */
+export interface PackageRequest {
+  id: string;
+  ecosystem: string;
+  name: string;
+  display_name: string;
+  /** version or range the requester asked for */
+  requested: string;
+  /** concrete root version the resolver selected */
+  version: string;
+  group_ids: string[] | null;
+  status: PackageRequestStatus;
+  /** manual | discovered | rule | watch */
+  origin: string;
+  requested_by: string;
+  reason?: string;
+  created_at: string;
+  updated_at: string;
+  /** resolved dependency graph (root first; empty while resolving) */
+  graph?: PackageNode[] | null;
+  /** graph key (name@version) of the requested package */
+  root_key?: string;
+  /** highest node risk */
+  risk?: PackageRisk;
+  /** node-state counts for the list view */
+  counts?: Record<string, number> | null;
+  error?: string;
+  decided_by?: string;
+  decided_at?: string;
+  decision?: 'approve' | 'reject';
+  decision_note?: string;
+  /** rule that decided without a human (if any) */
+  auto_rule_id?: string;
+  auto_rule_name?: string;
+}
+
+export type AnalysisJobState = 'queued' | 'running' | 'completed' | 'failed';
+
+/** A queued / finished sandbox analysis of one artifact. */
+export interface AnalysisJob {
+  id: string;
+  ecosystem: string;
+  name: string;
+  version: string;
+  filename: string;
+  url: string;
+  sha256?: string;
+  sha512?: string;
+  scenarios: string[] | null;
+  state: AnalysisJobState;
+  worker?: string;
+  attempts: number;
+  created_at: string;
+  leased_at?: string;
+  lease_until?: string;
+  finished_at?: string;
+  report_key?: string;
+  error?: string;
+}
+
+// --- Full sandbox report (GET /api/packages/analysis/:job_id) ---------------
+
+export interface SandboxArtifactInfo {
+  filename: string;
+  size: number;
+  sha256: string;
+  sha512: string;
+  /** tgz | zip | wheel | sdist-tar | sdist-zip | nupkg */
+  format: string;
+}
+
+export interface SandboxFile {
+  path: string;
+  size: number;
+  /** text | script | native | binary | archive | other */
+  kind: string;
+  sha256?: string;
+}
+
+export interface SandboxInstallHook {
+  /** npm-script | npm-gyp | setup-py | pep517 | pth | msbuild-props | msbuild-targets | nuget-ps | ps-scripts-to-process | ps-module */
+  kind: string;
+  name: string;
+  file?: string;
+  command?: string;
+}
+
+export interface SandboxIndicator {
+  rule: string;
+  severity: PackageRisk;
+  file: string;
+  line?: number;
+  snippet?: string;
+  description: string;
+}
+
+export interface SandboxEmbeddedSignature {
+  file: string;
+  /** nuget-repository | nuget-author | authenticode */
+  kind: string;
+  signer: string;
+  issuer?: string;
+  verified?: boolean | null;
+  detail?: string;
+}
+
+export interface SandboxStatic {
+  file_count: number;
+  total_size: number;
+  files?: SandboxFile[] | null;
+  native_binaries?: SandboxFile[] | null;
+  install_hooks?: SandboxInstallHook[] | null;
+  urls?: string[] | null;
+  domains?: string[] | null;
+  ips?: string[] | null;
+  indicators?: SandboxIndicator[] | null;
+  manifest?: Record<string, unknown> | null;
+  signatures?: SandboxEmbeddedSignature[] | null;
+  entrypoints?: string[] | null;
+  dropped?: number;
+}
+
+export interface SandboxDNSQuery {
+  name: string;
+  type: string;
+  count: number;
+  first_ms: number;
+}
+
+export interface SandboxHTTPRequest {
+  time_ms: number;
+  method: string;
+  url: string;
+  host: string;
+  tls: boolean;
+  sni?: string;
+  headers?: Record<string, string> | null;
+  body_size: number;
+  body_preview?: string;
+}
+
+export interface SandboxConnection {
+  time_ms: number;
+  pid?: number;
+  /** tcp | udp | unix */
+  protocol: string;
+  address: string;
+  port?: number;
+  hostname?: string;
+  result?: string;
+  preview?: string;
+}
+
+export interface SandboxNetwork {
+  dns?: SandboxDNSQuery[] | null;
+  http?: SandboxHTTPRequest[] | null;
+  connections?: SandboxConnection[] | null;
+  dropped?: number;
+}
+
+export interface SandboxSyscallEvent {
+  time_ms: number;
+  pid: number;
+  syscall: string;
+  /** process | network | file-write | file-sensitive | file-delete | permission | privilege | evasion */
+  category: string;
+  args: string;
+  result?: string;
+}
+
+export interface SandboxSyscalls {
+  total: number;
+  counts?: Record<string, number> | null;
+  events?: SandboxSyscallEvent[] | null;
+  dropped?: number;
+}
+
+export interface SandboxProcess {
+  time_ms: number;
+  pid: number;
+  ppid?: number;
+  exe: string;
+  argv: string[] | null;
+}
+
+export interface SandboxPathEvent {
+  time_ms: number;
+  pid: number;
+  path: string;
+  detail?: string;
+}
+
+export interface SandboxFileActivity {
+  written?: SandboxPathEvent[] | null;
+  read_sensitive?: SandboxPathEvent[] | null;
+  deleted?: SandboxPathEvent[] | null;
+  permissions?: SandboxPathEvent[] | null;
+  dropped?: number;
+}
+
+export interface SandboxCanaryHit {
+  /** e.g. aws-secret-key, npm-token, ssh-private-key */
+  canary: string;
+  /** file | http | dns | tcp */
+  where: string;
+  detail: string;
+}
+
+export interface SandboxPhase {
+  name: string;
+  command: string[] | null;
+  exit_code: number;
+  timed_out?: boolean;
+  duration_ms: number;
+  /** reason the phase did not run */
+  skipped?: string;
+  stdout?: string;
+  stderr?: string;
+  network: SandboxNetwork;
+  syscalls: SandboxSyscalls;
+  processes?: SandboxProcess[] | null;
+  files: SandboxFileActivity;
+  canary_hits?: SandboxCanaryHit[] | null;
+}
+
+export interface SandboxReportFinding {
+  id: string;
+  severity: PackageRisk;
+  /** network | process | filesystem | credentials | install-hook | obfuscation | native | signature | runtime */
+  category: string;
+  title: string;
+  detail?: string;
+  evidence?: string[] | null;
+  phase?: string;
+}
+
+/** Behaviour report of one analysis job (every field is untrusted data). */
+export interface SandboxReport {
+  schema_version: number;
+  runner_version: string;
+  /** docker | firecracker */
+  driver: string;
+  isolation: string;
+  image: string;
+  worker_id?: string;
+  started_at: string;
+  finished_at: string;
+  artifact: SandboxArtifactInfo;
+  static: SandboxStatic;
+  phases?: SandboxPhase[] | null;
+  findings?: SandboxReportFinding[] | null;
+  errors?: string[] | null;
+  truncated?: boolean;
+}
+
+// --- Console response shapes (GET endpoints) --------------------------------
+
+/** One ecosystem's row on the overview. */
+export interface PackageEcosystemOverview {
+  ecosystem: string;
+  mode: PackageMode;
+  approvals: number;
+  blocks: number;
+  open_requests: number;
+  hosts?: string[] | null;
+  file_hosts?: string[] | null;
+  group_ids?: string[] | null;
+}
+
+/** Sandbox worker fleet status on the overview. */
+export interface PackageSandboxStatus {
+  enabled: boolean;
+  /** connected workers */
+  workers: number;
+  healthy: boolean;
+  queued?: number;
+  running?: number;
+  failed?: number;
+  drivers?: string[] | null;
+  last_seen_at?: string;
+}
+
+/** A recent package decision for the overview timeline. */
+export interface PackageDecisionEvent {
+  id: string;
+  ecosystem: string;
+  name: string;
+  version?: string;
+  /** approved | rejected | blocked | auto_approved | revoked | analyzed | discovered */
+  decision: string;
+  /** manual | rule | dependency | watch | discovered */
+  via?: string;
+  actor?: string;
+  risk?: PackageRisk;
+  rule_name?: string;
+  request_id?: string;
+  at: string;
+}
+
+/**
+ * GET /api/packages/overview. The API table lists only POST for the settings; the current
+ * configuration is read from here (`settings`), and the full PackageSettings is POSTed back.
+ */
+export interface PackagesOverview {
+  enabled: boolean;
+  settings: PackageSettings;
+  ecosystems: PackageEcosystemOverview[] | null;
+  totals: { open_requests: number; approvals: number; blocks: number; rules: number };
+  sandbox: PackageSandboxStatus;
+  recent: PackageDecisionEvent[] | null;
+  can_manage?: boolean;
+}
+
+/** GET /api/packages/lookup — live assessment preview for the request wizard. */
+export interface PackageLookupResult {
+  ecosystem: string;
+  name: string;
+  display_name?: string;
+  /** the version or range that was looked up */
+  requested: string;
+  /** concrete version the resolver would pick */
+  version?: string;
+  assessment?: PackageAssessment | null;
+  /** existing approval covering this version, if any */
+  state?: PackageNodeState;
+  already_approved_id?: string;
+  /** cooldown (Karenz) in hours a rule would require */
+  cooldown_hours?: number;
+  /** number of resolved dependencies, when the backend resolves eagerly */
+  dependency_count?: number;
+  error?: string;
+}
+
+/** GET /api/packages/approvals — paged, newest first. May also arrive as a bare array. */
+export interface PackageApprovalsPage {
+  approvals: PackageApproval[] | null;
+  /** opaque cursor for the next page (absent = last page) */
+  cursor?: string;
+}
+
+/** GET /api/packages/approvals/:id — one approval with its origin. */
+export interface PackageApprovalDetail {
+  approval: PackageApproval;
+  request?: PackageRequest | null;
+  /** the graph node that pulled it in (dependency approvals) */
+  node?: PackageNode | null;
+}
+
+/** One server that obtained a package (receivers / incident view). */
+export interface PackageReceiverFile {
+  filename: string;
+  sha256?: string;
+  sha512?: string;
+  version?: string;
+  decision: PackageDecision;
+  /** complete | partial | reset | pending | '' */
+  transfer_status?: string;
+  bytes?: number;
+  first_seen: string;
+  last_seen: string;
+  count: number;
+}
+
+export interface PackageReceiver {
+  server_id?: string;
+  server_hostname?: string;
+  server_ip: string;
+  group_ids?: string[] | null;
+  owner_team?: string;
+  first_seen: string;
+  last_seen: string;
+  /** most relevant decision across the matching downloads */
+  decision: PackageDecision;
+  transfer_status?: string;
+  request_count: number;
+  files?: PackageReceiverFile[] | null;
+}
+
+export interface PackageReceiversResponse {
+  ecosystem: string;
+  name: string;
+  version?: string;
+  sha256?: string;
+  receivers: PackageReceiver[] | null;
+  /** telemetry only covers what passed through the proxy and is retained */
+  partial?: boolean;
+  /** false when the ecosystem is off (no telemetry recorded) */
+  monitored?: boolean;
+  note?: string;
+}
+
+/** POST body for opening a package request. */
+export interface PackageRequestInput {
+  ecosystem: string;
+  name: string;
+  version: string;
+  group_ids: string[];
+  reason?: string;
+}
+
+/** POST body for a review decision. */
+export interface PackageDecisionInput {
+  decision: 'approve' | 'reject';
+  note: string;
+  /** optional group override on approve */
+  group_ids?: string[];
+}

@@ -29,6 +29,7 @@ const NavEntry: React.FC<{ item: NavItem; collapsed: boolean; badge: NavBadge | 
     <NavLink
       to={item.to}
       match={item.match}
+      end={item.end}
       onClick={onNavigate}
       aria-label={collapsed ? `${item.label}${badge ? ` (${badge.label})` : ''}` : undefined}
       className={(active) =>
