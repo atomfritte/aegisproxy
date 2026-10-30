@@ -132,3 +132,55 @@ Workers authenticate with `X-Aegis-Sandbox-Key` (`AEGIS_SANDBOX_KEY`) and identi
 (`RunnerInput`) followed by the artifact bytes on stdin (Docker) or from the second virtio drive (Firecracker) and
 writes the report as one JSON document between the lines `AEGIS-REPORT-BEGIN` and `AEGIS-REPORT-END` on stdout
 (serial console).
+
+## Control-plane API
+
+All console endpoints require a session and the system role (InfoSec Approver or Super Admin) for
+writes; reads are allowed for any signed-in role. Payload shapes are the `models.Package*` types.
+
+| Method & path | Purpose |
+|---|---|
+| `GET /api/packages/overview` | ecosystem modes, counts (approvals, blocks, rules, open requests), sandbox worker status, recent decisions |
+| `POST /api/packages/settings` | replace `PackageSettings` (tokens write-only, `has_token`) |
+| `GET /api/packages/rules` · `POST` · `PUT /{id}` · `DELETE /{id}` · `POST /{id}/toggle` | package rules (cooldown / auto-approve / review / block) |
+| `GET /api/packages/blocks` · `POST` · `DELETE /{id}` | block list |
+| `GET /api/packages/approvals?ecosystem=&status=&q=&cursor=` | approvals (paged, newest first) |
+| `GET /api/packages/approvals/{id}` | one approval with its originating request / graph edge |
+| `POST /api/packages/approvals/{id}/revoke` `{reason}` · `POST /{id}/extend` `{expires_at}` | lifecycle |
+| `GET /api/packages/requests?status=&ecosystem=&mine=` | request inbox |
+| `GET /api/packages/requests/{id}` | one request with the full resolved graph and per-node assessment |
+| `POST /api/packages/requests` `{ecosystem,name,version,group_ids,reason}` | open a request; resolution + analysis start asynchronously |
+| `POST /api/packages/requests/{id}/decision` `{decision:"approve"\|"reject", note, group_ids?}` | review; approve creates the graph's approvals |
+| `POST /api/packages/requests/{id}/reanalyze` | re-run resolution + analysis (new advisories / rules) |
+| `GET /api/packages/lookup?ecosystem=&name=&version=` | live assessment preview for the request wizard (no request created) |
+| `GET /api/packages/analysis/{job_id}` | the full `sandbox.Report` of one analysis (URLs, syscalls, processes, files, findings) |
+| `GET /api/packages/receivers?ecosystem=&name=&version=&sha256=` | **which servers obtained this package** — backed by the `package` field on flow telemetry, with per-server first/last seen, decision and transfer status |
+
+### Sandbox worker API (`X-Aegis-Sandbox-Key`)
+
+| Method & path | Purpose |
+|---|---|
+| `POST /api/sandbox/jobs/claim` `{drivers,ecosystems}` | lease the next queued job (`200` job / `204` none) |
+| `POST /api/sandbox/jobs/{id}/heartbeat` | extend the lease |
+| `POST /api/sandbox/jobs/{id}/result` `{report}` or `{error}` | complete the job; the assessment is updated and dependent requests advance |
+
+## Rules and cooldown (Karenz)
+
+A rule matches on ecosystem(s), package name globs and (for the approvals it creates) server groups,
+and fires on a trigger: `any` version of a matching package, or only `updates` of packages that
+already have an approved version. Its action is `auto_approve`, `review` (force human review) or
+`block`. Rules are ordered by priority; the first matching rule decides, and no match means review.
+
+An `auto_approve` rule only approves a version when **all** of its conditions hold: the version has
+been public for at least `min_age_hours` (the cooldown / Karenz), its advisory severity is at most
+`max_severity` (never malware or critical), its overall assessment is at most `max_risk`, and the
+optional `require_signature` / `require_provenance` / `require_sandbox` / `licenses` /
+`allow_install_scripts` / `exclude_prerelease` / `exclude_deprecated` constraints are satisfied.
+Dependencies pulled in by an approved root are evaluated against the same rules; a dependency that no
+rule auto-approves holds the whole request for review with the offending node highlighted.
+
+The `watch` loop looks for new upstream versions of approved packages at `watch_hours` and evaluates
+them against the `updates` rules — so a patch release that clears its cooldown and its checks is
+approved automatically, while a release still inside its cooldown waits. The `reaudit` loop re-checks
+approved versions against the advisory sources at `reaudit_hours`; a new advisory at or above
+`revoke_on_severity` (or any malware verdict) revokes the approval and raises a security event.
