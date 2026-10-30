@@ -2,7 +2,7 @@ import React from 'react';
 import { Check, KeyRound, LogOut, Menu as MenuIcon, Monitor, Moon, Rows3, Search, Sun } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { useTheme } from '../lib/theme';
-import { useConsole, useFlows } from '../data/AppData';
+import { useConsole, useFlows, useLastUpdated } from '../data/AppData';
 import { ROLE_LABELS } from '../data/permissions';
 import { useSession } from '../data/session';
 import { Avatar, IconButton, Kbd, Menu, modKey, Tooltip } from '../ui';
@@ -15,7 +15,8 @@ export const Topbar: React.FC<{ onOpenPalette: () => void; onOpenMobileNav: () =
 }) => {
   const { user, logout } = useSession();
   const { connected } = useFlows();
-  const { lastUpdated, error } = useConsole();
+  const { error } = useConsole();
+  const lastUpdated = useLastUpdated();
   const { theme, setTheme, resolvedTheme, density, setDensity } = useTheme();
   const ThemeIcon = theme === 'system' ? Monitor : resolvedTheme === 'dark' ? Moon : Sun;
 

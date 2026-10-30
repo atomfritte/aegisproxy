@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, ChevronsUpDown, Filter, SearchX, X } from 'lucide-react';
 import { cn } from '../lib/cn';
-import { useIsMobile } from '../lib/hooks';
+import { useDebouncedValue, useIsMobile } from '../lib/hooks';
 import { navigate } from '../lib/router';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
@@ -118,8 +118,23 @@ export function DataTable<T>(props: DataTableProps<T>) {
   const isMobile = useIsMobile();
 
   const [searchState, setSearchState] = useState('');
+  // `search` is the committed value that drives filtering (and, when controlled, the ?q= URL).
   const search = props.search ?? searchState;
   const setSearch = props.onSearchChange ?? setSearchState;
+  // The input itself is held locally so typing stays instant; only the debounced value is committed
+  // (one URL write per pause instead of per keystroke, and one re-filter instead of per keystroke).
+  // Filter *results* are unchanged — only when they recompute.
+  const [typed, setTyped] = useState(search);
+  const debouncedTyped = useDebouncedValue(typed, 200);
+  useEffect(() => {
+    if (debouncedTyped !== search) setSearch(debouncedTyped);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedTyped]);
+  // Adopt external changes to the committed value (deep links, "Clear filters", the clear button).
+  useEffect(() => {
+    setTyped(search);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
 
   const [facetState, setFacetState] = useState<Record<string, string[]>>({});
   const facetValues = props.facetValues ?? facetState;
@@ -215,7 +230,7 @@ export function DataTable<T>(props: DataTableProps<T>) {
   const header = hasToolbar ? (
     <div className="flex flex-col gap-2 pb-3 sm:flex-row sm:flex-wrap sm:items-center">
       {getSearchText && (
-        <SearchInput value={search} onChange={setSearch} placeholder={searchPlaceholder} className="sm:max-w-[280px]" inputSize="sm" />
+        <SearchInput value={typed} onChange={setTyped} placeholder={searchPlaceholder} className="sm:max-w-[280px]" inputSize="sm" />
       )}
       {facets.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">

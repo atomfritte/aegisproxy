@@ -1,8 +1,9 @@
 // Console data layer.
 //
 //   <DataProvider>            (inside the signed-in shell)
-//     useConsole()  -> { state, refresh, perms, me, demoMode, error, lastUpdated }
-//     useFlows()    -> { flows, connected }      live flows (SSE /api/flows/stream)
+//     useConsole()      -> { state, refresh, perms, me, demoMode, error }
+//     useLastUpdated()  -> number | null         freshness tick, isolated so it re-renders only its readers
+//     useFlows()        -> { flows, connected }   live flows (SSE /api/flows/stream)
 //     useAction()   -> { run, pending }          mutation helper: toast + refresh
 //     useLookups()  -> maps for ids -> names (groups, servers, users, policy sets)
 //
@@ -23,7 +24,6 @@ interface ConsoleContextValue {
   /** null until the first /api/state response. `state.flows` is not kept current — use useFlows(). */
   state: DashboardState | null;
   error: string | null;
-  lastUpdated: number | null;
   /** Re-fetches /api/state (resolves when done; never throws). */
   refresh: () => Promise<void>;
   perms: Permissions;
@@ -38,6 +38,9 @@ interface FlowsContextValue {
 
 const ConsoleContext = createContext<ConsoleContextValue | null>(null);
 const FlowsContext = createContext<FlowsContextValue>({ flows: [], connected: false });
+// Isolated from ConsoleContext so the freshness tick (every poll) re-renders only its readers
+// (the Topbar status pill), not all ~78 console-state consumers.
+const LastUpdatedContext = createContext<number | null>(null);
 
 export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, meta, updateUser } = useSession();
@@ -50,6 +53,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const loadedFlows = useRef(false);
   const pending = useRef<TrafficFlow[]>([]);
   const inflight = useRef<Promise<void> | null>(null);
+  const lastSig = useRef<string | null>(null);
   const userId = user?.id;
   const lastUpdatedRef = useRef<number | null>(null);
   lastUpdatedRef.current = lastUpdated;
@@ -63,7 +67,15 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setFlows((prev) => mergeFlows(prev, data.flows));
         }
         loadedFlows.current = true;
-        setState({ ...data, flows: [] });
+        // Skip the state update (and the re-render of all ~78 consumers) when the polled payload is
+        // unchanged. Otherwise every 30 s tick replaced `state` with a brand-new object, re-deriving
+        // every DataTable even on a byte-identical response. `stateSignature` ignores volatile fields
+        // (see its doc), so an unchanged signature is a genuine no-op.
+        const sig = stateSignature(data);
+        if (sig !== lastSig.current) {
+          lastSig.current = sig;
+          setState({ ...data, flows: [] });
+        }
         setError(null);
         setLastUpdated(Date.now());
         if (data.me) updateUser(data.me);
@@ -148,6 +160,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setState(null);
       setFlows([]);
       loadedFlows.current = false;
+      lastSig.current = null;
       pending.current = [];
     }
   }, [userId]);
@@ -157,22 +170,51 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     () => ({
       state,
       error,
-      lastUpdated,
       refresh,
       perms,
       demoMode: state?.demo_mode ?? meta?.demo_mode ?? false,
       version: state?.version || meta?.version || '',
     }),
-    [state, error, lastUpdated, refresh, perms, meta]
+    [state, error, refresh, perms, meta]
   );
   const flowsValue = useMemo(() => ({ flows, connected }), [flows, connected]);
 
   return (
     <ConsoleContext.Provider value={value}>
-      <FlowsContext.Provider value={flowsValue}>{children}</FlowsContext.Provider>
+      <LastUpdatedContext.Provider value={lastUpdated}>
+        <FlowsContext.Provider value={flowsValue}>{children}</FlowsContext.Provider>
+      </LastUpdatedContext.Provider>
     </ConsoleContext.Provider>
   );
 };
+
+/**
+ * Cheap change signal for a polled /api/state payload, used to skip no-op state updates.
+ * Excludes two fields that change regardless of real activity:
+ *   - `flows`: carried by the live SSE stream and always stored as [] here, not part of `state`.
+ *   - `bandwidth`: a rolling 24 h summary recomputed against now() on every request (its 15-minute
+ *     buckets, time labels and current_mbps slide every minute), so it is never byte-stable. Any
+ *     real traffic change also moves `stats`/`overview` (and streams in live via SSE), so those
+ *     remain in the signal and still trigger a full state update that carries the fresh bandwidth.
+ * Returns `length:checksum` (cyrb53) so we retain a short string, never the whole payload.
+ */
+function stateSignature(data: DashboardState): string {
+  const { flows: _flows, bandwidth: _bandwidth, ...rest } = data;
+  const json = JSON.stringify(rest);
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const checksum = 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  return `${json.length}:${checksum}`;
+}
 
 /** Newest first, de-duplicated, capped. `incoming` is newest-first. */
 function mergeFlows(prev: TrafficFlow[], incoming: TrafficFlow[]): TrafficFlow[] {
@@ -202,6 +244,11 @@ export function useConsoleState(): DashboardState {
 
 export function useFlows(): FlowsContextValue {
   return useContext(FlowsContext);
+}
+
+/** Timestamp (ms) of the last successful /api/state refresh, or null before the first load. */
+export function useLastUpdated(): number | null {
+  return useContext(LastUpdatedContext);
 }
 
 export function usePermissions(): Permissions {
