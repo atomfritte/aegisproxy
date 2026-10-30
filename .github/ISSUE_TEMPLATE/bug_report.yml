@@ -1,0 +1,49 @@
+name: Bug report
+description: Something isn't working as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! **Do not report security
+        vulnerabilities here** — see [SECURITY.md](../blob/main/SECURITY.md) and
+        report them privately.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: Steps to reproduce, expected vs. actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: Control-plane or data-plane logs, error messages, a trace ID. Redact secrets.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: AegisProxy version
+      placeholder: "e.g. 3.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Docker Compose HA
+        - Kubernetes (Helm)
+        - Linux (systemd)
+        - Windows Server
+        - Other / from source
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, storage (file / PostgreSQL), anything else relevant.

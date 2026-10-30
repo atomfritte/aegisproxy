@@ -11,10 +11,13 @@ Every outbound HTTP(S) request of your servers passes a default-deny proxy that 
 **which exact path** it wants and **who approved it** — with self-service requests, change management,
 threat protection and a complete audit trail.
 
-![Version](https://img.shields.io/badge/version-2.1.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.27-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF)
+![Version](https://img.shields.io/badge/version-3.0.0-2B4ACB) ![Control-plane](https://img.shields.io/badge/control--plane-Go_1.27-00ADD8?logo=go&logoColor=white) ![Data-plane](https://img.shields.io/badge/data--plane-mitmproxy_12.3-0A0A0A) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm_chart-326CE5?logo=kubernetes&logoColor=white) ![Platforms](https://img.shields.io/badge/runs_on-Linux_%C2%B7_Windows_Server_%C2%B7_Docker-5B7BFF) ![License](https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0-F5A623)
 
 [Quick start](#quick-start) · [Screenshots](#a-tour-of-the-console) · [Deployment](#deployment) ·
-[Documentation](#documentation) · [Security](SECURITY.md)
+[Documentation](#documentation) · [Security](SECURITY.md) · [License](#license)
+
+> **Free for noncommercial use** (personal, research, education, non-profits, evaluation).
+> **Commercial use requires a license** — [get in touch](mailto:licensing@broeer.org). See [License](#license).
 
 <br>
 
@@ -39,6 +42,10 @@ proxies allow whole domains and leave the rest to firewall tickets. AegisProxy c
   optional four-eyes review, recertification and one-click rollback.
 - **Threat protection on every allowed request.** Threat intelligence (abuse.ch, Spamhaus, TAXII 2.1, MISP,
   Microsoft Defender), ClamAV, YARA-X, ICAP engines and DLP — fail-open or fail-closed, per policy.
+- **A firewall for your dependencies.** Transparently approve npm, PyPI, NuGet and PowerShell Gallery packages:
+  resolve the full dependency graph, check it against the known advisory feeds, verify signatures and provenance,
+  watch behavior in a throwaway sandbox, and let only approved, hash-pinned artifacts through — with a waiting
+  period for new versions and alerts when an advisory later lands.
 - **Built for enterprises.** SSO and SCIM, RBAC with need-to-know, keyed hash-chained audit trail, secrets
   encrypted at rest, SIEM export, active-active HA on PostgreSQL, and installers for Kubernetes, Linux and
   Windows Server.
@@ -149,8 +156,8 @@ Browsers get the branded HTML block page with a request form instead.
 - **Policy as code**: export and import policy sets as drafts.
 </details>
 
-<details>
-<summary><b>Package firewall</b> (3.0) · <a href="docs/package-firewall.md">guide</a></summary>
+<details open>
+<summary><b>Package firewall</b> (3.0, new) · <a href="docs/package-firewall.md">guide</a></summary>
 
 - **Transparent approval** of npm, PyPI, NuGet and PowerShell Gallery packages: clients keep using the public
   registries through the proxy; the data-plane filters registry metadata down to approved versions and lets only
@@ -163,8 +170,10 @@ Browsers get the branded HTML block page with a request form instead.
   and DNS name the package reaches and every system call it makes while installing and loading, plus processes,
   file writes and decoy-credential access.
 - **Rules with a waiting period (Karenz)**: auto-approve new versions only once they have been public long
-  enough and clear their advisory, signature and sandbox checks; a re-audit loop revokes an approval when a new
-  advisory lands.
+  enough and clear their advisory, signature and sandbox checks.
+- **Periodic re-audit with alerts**: a background loop re-checks approved versions against the advisory sources,
+  revokes an approval when a qualifying advisory or malware verdict lands, and alerts Slack, Teams or a webhook —
+  with a one-click link to exactly which servers already pulled the affected version.
 - **Incident recall**: which servers obtained a package that a later advisory flags — including gateway cache hits.
 </details>
 
@@ -319,3 +328,16 @@ scripts/            secret generation, Wine and conformance harnesses, live inte
 
 Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). The security model, the
 results of the independent review and the hardening checklist are in [docs/security.md](docs/security.md).
+
+## License
+
+AegisProxy is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+- ✅ **Free** for any **noncommercial** purpose — personal projects, research, education, non-profits and
+  evaluation — including modifying and redistributing it under the same terms.
+- 💼 **Commercial use requires a separate license.** If you (or your company) want to use AegisProxy in or for a
+  business, email **[licensing@broeer.org](mailto:licensing@broeer.org)** and we'll sort out a commercial license.
+
+Not sure which applies to you? Just ask. Third-party components bundled or run alongside AegisProxy keep their
+own licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). This summary is for convenience; the
+[LICENSE](LICENSE) file is the binding text, and nothing here is legal advice.
