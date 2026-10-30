@@ -210,13 +210,13 @@ func (s *Store) FailOrReject(id, kind, ruleName, reason string) error {
 func (s *Store) NodeState(ecosystem, name, version string, groups []string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.isBlockedLocked(ecosystem, name, version) {
+	if s.isBlockedIndexedLocked(ecosystem, name, version) {
 		return "blocked"
 	}
-	if s.activeApprovalLocked(ecosystem, name, version, groups) != nil {
+	if s.activeApprovalIndexedLocked(ecosystem, name, version, groups) != nil {
 		return "approved"
 	}
-	if s.hasApprovedVersionLocked(ecosystem, name) {
+	if s.hasApprovedVersionIndexedLocked(ecosystem, name) {
 		return "update"
 	}
 	return "new"
@@ -226,7 +226,7 @@ func (s *Store) NodeState(ecosystem, name, version string, groups []string) stri
 func (s *Store) ActiveApprovalID(ecosystem, name, version string, groups []string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if a := s.activeApprovalLocked(ecosystem, name, version, groups); a != nil {
+	if a := s.activeApprovalIndexedLocked(ecosystem, name, version, groups); a != nil {
 		return a.ID
 	}
 	return ""
@@ -236,7 +236,7 @@ func (s *Store) ActiveApprovalID(ecosystem, name, version string, groups []strin
 func (s *Store) IsBlocked(ecosystem, name, version string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.isBlockedLocked(ecosystem, name, version)
+	return s.isBlockedIndexedLocked(ecosystem, name, version)
 }
 
 // HasApprovedVersion reports whether any version of a package is approved (any groups) — the "updates"
@@ -244,14 +244,41 @@ func (s *Store) IsBlocked(ecosystem, name, version string) bool {
 func (s *Store) HasApprovedVersion(ecosystem, name string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.hasApprovedVersionLocked(ecosystem, name)
+	return s.hasApprovedVersionIndexedLocked(ecosystem, name)
 }
 
-func (s *Store) hasApprovedVersionLocked(ecosystem, name string) bool {
+// The *IndexedLocked helpers use the approval/block lookup indexes (rebuilt in buildIndexLocked) instead
+// of scanning every approval/block. They run only on the read path (NodeState and friends, under the
+// read lock); the index is consistent with committed state because every approval/block mutation ends in
+// saveLocked -> buildIndexLocked. The linear activeApprovalLocked/isBlockedLocked stay for the
+// intra-mutation path (ApproveRequestGraph), which must see additions made within the same operation.
+func (s *Store) activeApprovalIndexedLocked(ecosystem, name, version string, groups []string) *models.PackageApproval {
 	now := time.Now().UTC()
-	for i := range s.state.Packages.Approvals {
+	for _, i := range s.pkgApprovalIdx[ecosystem+"\x00"+name] {
 		a := &s.state.Packages.Approvals[i]
-		if a.Ecosystem == ecosystem && a.Name == name && a.Active(now) {
+		if a.Version != version || !a.Active(now) {
+			continue
+		}
+		if groupsCovered(a.GroupIDs, groups) {
+			return a
+		}
+	}
+	return nil
+}
+
+func (s *Store) hasApprovedVersionIndexedLocked(ecosystem, name string) bool {
+	now := time.Now().UTC()
+	for _, i := range s.pkgApprovalIdx[ecosystem+"\x00"+name] {
+		if s.state.Packages.Approvals[i].Active(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) isBlockedIndexedLocked(ecosystem, name, version string) bool {
+	for _, i := range s.pkgBlockIdx[ecosystem+"\x00"+normalizePackageName(ecosystem, name)] {
+		if versionInBlock(ecosystem, version, s.state.Packages.Blocks[i].Versions) {
 			return true
 		}
 	}

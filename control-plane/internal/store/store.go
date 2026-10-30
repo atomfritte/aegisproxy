@@ -157,6 +157,11 @@ type Store struct {
 	ruleIndex   map[string]int
 	quarantined map[string]bool
 	saByHash    map[string]int
+	// Package approval/block lookup indexes (ecosystem+"\x00"+normalized-name -> positions in
+	// Packages.Approvals/Blocks), rebuilt in buildIndexLocked. Used by the coordinator's per-node read
+	// path so it does not scan every approval/block; the intra-mutation scans stay linear.
+	pkgApprovalIdx map[string][]int
+	pkgBlockIdx    map[string][]int
 	saTouchMu   sync.Mutex
 	saTouched   map[string]time.Time
 	revoked     map[string]time.Time
@@ -422,6 +427,18 @@ func (s *Store) buildIndexLocked(rev uint64) {
 	s.ruleIndex = make(map[string]int, len(s.state.Rules))
 	for i, r := range s.state.Rules {
 		s.ruleIndex[r.ID] = i
+	}
+	s.pkgApprovalIdx = make(map[string][]int, len(s.state.Packages.Approvals))
+	for i := range s.state.Packages.Approvals {
+		a := &s.state.Packages.Approvals[i]
+		k := a.Ecosystem + "\x00" + a.Name
+		s.pkgApprovalIdx[k] = append(s.pkgApprovalIdx[k], i)
+	}
+	s.pkgBlockIdx = make(map[string][]int, len(s.state.Packages.Blocks))
+	for i := range s.state.Packages.Blocks {
+		b := &s.state.Packages.Blocks[i]
+		k := b.Ecosystem + "\x00" + normalizePackageName(b.Ecosystem, b.Name)
+		s.pkgBlockIdx[k] = append(s.pkgBlockIdx[k], i)
 	}
 }
 
