@@ -80,7 +80,25 @@ workers fail closed.
 
 ## A tour of the console
 
-The screenshots show the console with its built-in sample data (`AEGIS_DEMO_MODE=true`).
+The screenshots show the console with its built-in sample data (`AEGIS_DEMO_MODE=true`), which now also
+seeds the package firewall.
+
+### Package firewall — new in 3.0
+
+<img src="docs/images/package-firewall.png" alt="Package firewall overview: ecosystems, work queues, sandbox workers and recent decisions" width="100%">
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/package-request.png" alt="Package request"><br><b>Request review</b> — the full resolved dependency graph with per-package state, risk, signatures and a sandbox summary (hosts contacted, syscalls, install scripts).</td>
+    <td width="50%"><img src="docs/images/package-approvals.png" alt="Package approvals"><br><b>Approvals</b> — approved versions with pinned artifact hashes, risk, how they were approved (manual / rule / dependency) and expiry.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/package-rules.png" alt="Package rules"><br><b>Rules</b> — ordered auto-approve / review / block rules with a cooldown (Karenz), signature and sandbox requirements.</td>
+    <td><img src="docs/images/package-blocks.png" alt="Package block list"><br><b>Block list</b> — versions denied regardless of approvals, with the reason and source (advisory / sandbox / manual).</td>
+  </tr>
+</table>
+
+### Zero-trust egress
 
 <table>
   <tr>
