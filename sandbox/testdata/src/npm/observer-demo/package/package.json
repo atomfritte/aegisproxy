@@ -1,0 +1,10 @@
+{
+  "name": "observer-demo",
+  "version": "1.0.0",
+  "description": "AegisProxy sandbox test fixture (harmless). Exercises the sandbox observers only; it reaches a made-up host that the sandbox has no route to, reads a planted decoy file and runs `sh -c id`.",
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}
