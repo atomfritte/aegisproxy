@@ -403,14 +403,14 @@ export const api = {
       update: (s: PackageSettings) => apiPost<PackageSettings>('/api/packages/settings', s),
     },
     rules: {
-      list: () => apiJSON<PackageRule[]>('/api/packages/rules'),
+      list: () => apiJSON<{ rules: PackageRule[] }>('/api/packages/rules').then((r) => r.rules ?? []),
       create: (r: Partial<PackageRule>) => apiPost<PackageRule>('/api/packages/rules', r),
       update: (id: string, r: Partial<PackageRule>) => apiPut<PackageRule>(`/api/packages/rules/${seg(id)}`, r),
       delete: (id: string) => apiDelete<Status>(`/api/packages/rules/${seg(id)}`),
       toggle: (id: string, enabled: boolean) => apiPost<PackageRule>(`/api/packages/rules/${seg(id)}/toggle`, { enabled }),
     },
     blocks: {
-      list: () => apiJSON<PackageBlock[]>('/api/packages/blocks'),
+      list: () => apiJSON<{ blocks: PackageBlock[] }>('/api/packages/blocks').then((r) => r.blocks ?? []),
       add: (b: Partial<PackageBlock>) => apiPost<PackageBlock>('/api/packages/blocks', b),
       delete: (id: string) => apiDelete<Status>(`/api/packages/blocks/${seg(id)}`),
     },
@@ -425,9 +425,9 @@ export const api = {
     },
     requests: {
       list: (params: { status?: string; ecosystem?: string; mine?: boolean } = {}) =>
-        apiJSON<PackageRequest[]>(`/api/packages/requests${qs(params)}`),
+        apiJSON<{ requests: PackageRequest[] }>(`/api/packages/requests${qs(params)}`).then((r) => r.requests ?? []),
       /** One request with the full resolved graph and per-node assessment. */
-      get: (id: string) => apiJSON<PackageRequest>(`/api/packages/requests/${seg(id)}`),
+      get: (id: string) => apiJSON<{ request: PackageRequest }>(`/api/packages/requests/${seg(id)}`).then((r) => r.request),
       /** Opens a request; resolution + analysis start asynchronously. */
       create: (body: PackageRequestInput) => apiPost<PackageRequest>('/api/packages/requests', body),
       /** Review; approve creates the graph's approvals. */

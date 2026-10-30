@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,47 +70,139 @@ func (s *Server) packagesReady(w http.ResponseWriter) bool {
 
 func (s *Server) handlePackageOverview(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	fw := s.store.PackageFirewall()
+
+	// The firewall is "on" as soon as any ecosystem leaves "off" (monitor or enforce).
+	enabled := false
+	for _, es := range fw.Settings.Ecosystems {
+		if es.Mode != "" && es.Mode != models.PackageModeOff {
+			enabled = true
+			break
+		}
+	}
+
 	requests := s.store.PackageRequests("", "")
 	open := 0
+	openByEco := map[string]int{}
 	for _, rq := range requests {
 		if rq.Status == models.PackageReqReady || rq.Status == models.PackageReqResolving || rq.Status == models.PackageReqAnalyzing {
 			open++
+			openByEco[rq.Ecosystem]++
 		}
 	}
-	recent := requests
-	if len(recent) > 10 {
-		recent = recent[:10]
-	}
-	queued, running := 0, 0
+
+	// Sandbox fleet: we track the analysis queue and the workers currently leasing running jobs
+	// (there is no separate worker registry — a worker is "seen" while it holds a running job).
+	queued, running, failed := 0, 0, 0
+	workers := map[string]bool{}
 	for _, j := range s.store.AnalysisJobs() {
 		switch j.State {
 		case models.AnalysisQueued:
 			queued++
 		case models.AnalysisRunning:
 			running++
+			if j.Worker != "" {
+				workers[j.Worker] = true
+			}
+		case models.AnalysisFailed:
+			failed++
 		}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"settings":        fw.Settings,
-		"counts":          map[string]int{"approvals": countActive(fw.Approvals), "blocks": len(fw.Blocks), "rules": len(fw.Rules), "open_requests": open},
-		"ecosystems":      s.ecosystemStats(fw),
-		"recent_requests": recent,
-		"analysis":        map[string]int{"queued": queued, "running": running},
-		"can_edit":        auth.CanManageSystem(claims) && !claims.ServiceAccount,
+		"enabled":    enabled,
+		"settings":   fw.Settings,
+		"ecosystems": s.ecosystemStats(fw, openByEco),
+		"totals":     map[string]int{"approvals": countActive(fw.Approvals), "blocks": len(fw.Blocks), "rules": len(fw.Rules), "open_requests": open},
+		"sandbox": map[string]any{
+			"enabled": fw.Settings.Sandbox.Enabled,
+			"workers": len(workers),
+			"healthy": fw.Settings.Sandbox.Enabled,
+			"queued":  queued,
+			"running": running,
+			"failed":  failed,
+		},
+		"recent":     recentDecisions(fw, 12),
+		"can_manage": auth.CanManageSystem(claims) && !claims.ServiceAccount,
 	})
 }
 
-func (s *Server) ecosystemStats(fw models.PackageFirewall) []map[string]any {
+func (s *Server) ecosystemStats(fw models.PackageFirewall, openByEco map[string]int) []map[string]any {
+	now := time.Now()
 	approvalsByEco := map[string]int{}
 	for _, a := range fw.Approvals {
-		if a.Status == "approved" {
+		if a.Active(now) {
 			approvalsByEco[a.Ecosystem]++
 		}
+	}
+	blocksByEco := map[string]int{}
+	for _, b := range fw.Blocks {
+		blocksByEco[b.Ecosystem]++
 	}
 	out := make([]map[string]any, 0, len(models.Ecosystems))
 	for _, e := range models.Ecosystems {
 		es := fw.Settings.Ecosystems[e]
-		out = append(out, map[string]any{"ecosystem": e, "mode": es.Mode, "approvals": approvalsByEco[e]})
+		mode := es.Mode
+		if mode == "" {
+			mode = models.PackageModeOff
+		}
+		out = append(out, map[string]any{
+			"ecosystem":     e,
+			"mode":          mode,
+			"approvals":     approvalsByEco[e],
+			"blocks":        blocksByEco[e],
+			"open_requests": openByEco[e],
+			"hosts":         es.Hosts,
+			"file_hosts":    es.FileHosts,
+			"group_ids":     es.GroupIDs,
+		})
+	}
+	return out
+}
+
+// recentDecisions builds the overview timeline from the real, timestamped decisions the firewall
+// keeps — approvals (and their revocations) and block-list entries — newest first.
+func recentDecisions(fw models.PackageFirewall, limit int) []map[string]any {
+	type event struct {
+		at time.Time
+		m  map[string]any
+	}
+	name := func(display, normalized string) string {
+		if display != "" {
+			return display
+		}
+		return normalized
+	}
+	events := make([]event, 0, len(fw.Approvals)+len(fw.Blocks))
+	for _, a := range fw.Approvals {
+		if a.Status == "revoked" && a.RevokedAt != nil {
+			events = append(events, event{*a.RevokedAt, map[string]any{
+				"id": a.ID + ":revoked", "ecosystem": a.Ecosystem, "name": name(a.DisplayName, a.Name), "version": a.Version,
+				"decision": "revoked", "via": a.Via, "actor": a.RevokedBy, "risk": a.Risk, "request_id": a.RequestID, "at": *a.RevokedAt,
+			}})
+			continue
+		}
+		decision := "approved"
+		if a.Via == "rule" {
+			decision = "auto_approved"
+		}
+		events = append(events, event{a.ApprovedAt, map[string]any{
+			"id": a.ID, "ecosystem": a.Ecosystem, "name": name(a.DisplayName, a.Name), "version": a.Version,
+			"decision": decision, "via": a.Via, "actor": a.ApprovedBy, "risk": a.Risk, "request_id": a.RequestID, "at": a.ApprovedAt,
+		}})
+	}
+	for _, b := range fw.Blocks {
+		events = append(events, event{b.CreatedAt, map[string]any{
+			"id": b.ID, "ecosystem": b.Ecosystem, "name": b.Name, "version": b.Versions,
+			"decision": "blocked", "via": b.Source, "actor": b.CreatedBy, "at": b.CreatedAt,
+		}})
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
+	out := make([]map[string]any, 0, limit)
+	for _, e := range events {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, e.m)
 	}
 	return out
 }
