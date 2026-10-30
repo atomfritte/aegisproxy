@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}"
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 LABEL org.opencontainers.image.title="AegisProxy control-plane" \
       org.opencontainers.image.description="Policy, threat-intel and audit control-plane with bundled web console" \
-      org.opencontainers.image.licenses="Proprietary"
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 COPY --from=build /out/aegis-control-plane /app/aegis-control-plane
 COPY --from=ui /src/dist /app/ui
 COPY --from=build --chown=65532:65532 /out/data /data

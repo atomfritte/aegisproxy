@@ -74,10 +74,11 @@ info:
       `application/scim+json` (`application/json` is accepted), limited to 8 MiB, errors are SCIM error
       documents (also for unknown paths and wrong methods), and `PATCH` is used.
   contact:
-    name: AegisProxy
+    name: AegisProxy — commercial licensing
+    email: licensing@broeer.org
   license:
-    name: Proprietary
-    identifier: LicenseRef-AegisProxy-Proprietary
+    name: PolyForm Noncommercial License 1.0.0 (commercial use requires a separate license)
+    identifier: PolyForm-Noncommercial-1.0.0
 servers:
   - url: /
     description: The control-plane that serves this document (AEGIS_PUBLIC_URL).
