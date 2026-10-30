@@ -132,17 +132,17 @@ type Signature struct {
 
 // Phase is one executed scenario (install, load).
 type Phase struct {
-	Name       string   `json:"name"`
-	Command    []string `json:"command"`
-	ExitCode   int      `json:"exit_code"`
-	TimedOut   bool     `json:"timed_out,omitempty"`
-	DurationMs int64    `json:"duration_ms"`
-	Skipped    string   `json:"skipped,omitempty"` // reason the phase did not run (no install hooks, unsupported format …)
-	Stdout     string   `json:"stdout,omitempty"`  // tail, capped
-	Stderr     string   `json:"stderr,omitempty"`  // tail, capped
-	Network    Network  `json:"network"`
-	Syscalls   Syscalls `json:"syscalls"`
-	Processes  []Process `json:"processes,omitempty"`
+	Name       string       `json:"name"`
+	Command    []string     `json:"command"`
+	ExitCode   int          `json:"exit_code"`
+	TimedOut   bool         `json:"timed_out,omitempty"`
+	DurationMs int64        `json:"duration_ms"`
+	Skipped    string       `json:"skipped,omitempty"` // reason the phase did not run (no install hooks, unsupported format …)
+	Stdout     string       `json:"stdout,omitempty"`  // tail, capped
+	Stderr     string       `json:"stderr,omitempty"`  // tail, capped
+	Network    Network      `json:"network"`
+	Syscalls   Syscalls     `json:"syscalls"`
+	Processes  []Process    `json:"processes,omitempty"`
 	Files      FileActivity `json:"files"`
 	CanaryHits []CanaryHit  `json:"canary_hits,omitempty"`
 }
