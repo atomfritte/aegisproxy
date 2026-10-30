@@ -17,12 +17,19 @@ import (
 	"aegisproxy/control-plane/internal/store"
 )
 
+// Notifier delivers package-firewall alerts (re-audit revokes, newly discovered advisories) to the
+// configured channels. *notify.Dispatcher satisfies it; a nil notifier disables alerts.
+type Notifier interface {
+	NotifyPackageEvent(models.PackageAlert)
+}
+
 // Coordinator orchestrates request resolution and analysis.
 type Coordinator struct {
-	store   *store.Store
-	svc     *packages.Service
-	reports *packages.ReportStore
-	log     *slog.Logger
+	store    *store.Store
+	svc      *packages.Service
+	reports  *packages.ReportStore
+	notifier Notifier
+	log      *slog.Logger
 
 	wake   chan string // request IDs to (re)process; "" = scan for pending work
 	closed chan struct{}
@@ -48,6 +55,9 @@ func New(st *store.Store, svc *packages.Service, reports *packages.ReportStore, 
 		closed:  make(chan struct{}),
 	}
 }
+
+// SetNotifier attaches the dispatcher used for re-audit alerts. Call before Start; safe to leave unset.
+func (c *Coordinator) SetNotifier(n Notifier) { c.notifier = n }
 
 // Start launches the background worker and the re-audit / watch loops.
 func (c *Coordinator) Start() {

@@ -87,13 +87,12 @@ func (c *Coordinator) runMaintenance() {
 	}
 }
 
-// reaudit re-checks active approvals against the advisory sources and revokes those that a new
-// advisory at or above revoke_on_severity (or any malware verdict) now affects.
+// reaudit re-checks active approvals against the advisory sources. Approvals that a new advisory at or
+// above revoke_on_severity (or any malware verdict) now affects are revoked; every newly discovered
+// advisory raises an alert (even when auto-revoke is off), so the periodic vulnerability check reaches
+// SecOps instead of only the log.
 func (c *Coordinator) reaudit(settings models.PackageSettings) {
 	threshold := settings.RevokeOnSeverity
-	if threshold == "" {
-		return
-	}
 	ctx, cancel := c.ctx(10 * time.Minute)
 	defer cancel()
 	for _, ap := range c.store.PackageApprovals() {
@@ -105,19 +104,110 @@ func (c *Coordinator) reaudit(settings models.PackageSettings) {
 		if ap.Status != "approved" {
 			continue
 		}
+		prev := c.store.Assessment(ap.Ecosystem, ap.Name, ap.Version)
 		a, err := c.svc.Assess(ctx, ap.Ecosystem, ap.Name, ap.Version)
 		if err != nil {
 			continue
 		}
 		c.store.PutAssessment(*a)
-		if shouldRevoke(a, threshold) {
+		fresh := newAdvisories(prev, a) // advisories that appeared since the last assessment
+
+		if threshold != "" && shouldRevoke(a, threshold) {
 			reason := "re-audit: " + a.Summary
-			if err := c.store.RevokePackageApproval(ap.ID, "system", "SYSTEM", reason); err == nil {
-				c.log.Warn("revoked package approval after re-audit", "approval", ap.ID,
-					"package", ap.Ecosystem+":"+ap.Name+"@"+ap.Version, "risk", a.Risk)
+			if err := c.store.RevokePackageApproval(ap.ID, "system", "SYSTEM", reason); err != nil {
+				continue
+			}
+			c.log.Warn("revoked package approval after re-audit", "approval", ap.ID,
+				"package", ap.Ecosystem+":"+ap.Name+"@"+ap.Version, "risk", a.Risk)
+			c.alertReaudit(ap, a, a.Advisories, "revoked")
+			continue
+		}
+		// Not revoked (auto-revoke off, or the threshold is not met): still alert once about newly
+		// discovered findings so a human can decide. Storing the assessment above means the next cycle
+		// no longer sees them as new, so this does not repeat every interval.
+		if len(fresh) > 0 {
+			action := "advisory"
+			if anyMalware(fresh) {
+				action = "malware"
+			}
+			c.alertReaudit(ap, a, fresh, action)
+		}
+	}
+}
+
+// newAdvisories returns the non-withdrawn advisories in cur that were not already present in prev
+// (matched by ID or alias) — i.e. findings that appeared since the last assessment.
+func newAdvisories(prev, cur *models.PackageAssessment) []models.PackageAdvisory {
+	known := map[string]bool{}
+	if prev != nil {
+		for _, adv := range prev.Advisories {
+			if adv.Withdrawn {
+				continue
+			}
+			known[adv.ID] = true
+			for _, al := range adv.Aliases {
+				known[al] = true
 			}
 		}
 	}
+	var out []models.PackageAdvisory
+	for _, adv := range cur.Advisories {
+		if adv.Withdrawn || known[adv.ID] {
+			continue
+		}
+		seen := false
+		for _, al := range adv.Aliases {
+			if known[al] {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, adv)
+		}
+	}
+	return out
+}
+
+func anyMalware(advs []models.PackageAdvisory) bool {
+	for _, a := range advs {
+		if a.Malware {
+			return true
+		}
+	}
+	return false
+}
+
+// alertReaudit raises a package-firewall alert for one approval, annotated with how many servers have
+// already pulled the version (from the retained flow telemetry) so the alert shows how far it spread.
+func (c *Coordinator) alertReaudit(ap models.PackageApproval, a *models.PackageAssessment, advs []models.PackageAdvisory, action string) {
+	if c.notifier == nil {
+		return
+	}
+	ids := make([]string, 0, len(advs))
+	for _, adv := range advs {
+		id := adv.ID
+		if id == "" {
+			continue
+		}
+		if adv.Malware {
+			id += " (malware)"
+		}
+		ids = append(ids, id)
+		if len(ids) >= 6 {
+			break
+		}
+	}
+	name := ap.DisplayName
+	if name == "" {
+		name = ap.Name
+	}
+	rcv := c.store.PackageReceivers(ap.Ecosystem, ap.Name, ap.Version, "")
+	c.notifier.NotifyPackageEvent(models.PackageAlert{
+		Action: action, Ecosystem: ap.Ecosystem, Name: name, Version: ap.Version,
+		Severity: a.Risk, Summary: a.Summary, Advisories: ids, Reason: "re-audit",
+		ApprovalID: ap.ID, Servers: len(rcv.Receivers),
+	})
 }
 
 func shouldRevoke(a *models.PackageAssessment, threshold string) bool {

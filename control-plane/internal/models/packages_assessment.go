@@ -91,6 +91,25 @@ type PackageFinding struct {
 	Source   string `json:"source"` // advisory | signature | sandbox | static | policy
 }
 
+// PackageAlert is a package-firewall event delivered to the notification channels (Slack / Teams /
+// webhook). The re-audit loop raises it when a new advisory or malware verdict affects an approved
+// version — whether or not the approval was auto-revoked — so SecOps hears about it instead of only
+// the log.
+type PackageAlert struct {
+	Action     string   `json:"action"`    // revoked | advisory | malware
+	Ecosystem  string   `json:"ecosystem"` // npm | pypi | nuget | psgallery
+	Name       string   `json:"name"`      // display name
+	Version    string   `json:"version"`
+	Severity   string   `json:"severity"`             // none … critical
+	Summary    string   `json:"summary,omitempty"`    // one-line reason
+	Advisories []string `json:"advisories,omitempty"` // advisory identifiers (CVE / GHSA / MAL-…)
+	Reason     string   `json:"reason,omitempty"`     // what triggered the alert (e.g. "re-audit")
+	ApprovalID string   `json:"approval_id,omitempty"`
+	// Servers is how many servers were observed pulling this version in the retained flow telemetry
+	// (-1 = not looked up). It lets the alert say how far an affected version has already spread.
+	Servers int `json:"servers"`
+}
+
 // AnalysisJobState values.
 const (
 	AnalysisQueued    = "queued"

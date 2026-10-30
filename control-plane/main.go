@@ -277,6 +277,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("package report store: %w", err)
 	}
 	pkgCoord := coordinator.New(st, pkgSvc, reportStore, logger)
+	pkgCoord.SetNotifier(notifier) // re-audit alerts to the configured Slack / Teams / webhook channels
 	pkgCoord.Start()
 	defer pkgCoord.Close()
 

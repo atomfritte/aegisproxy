@@ -249,6 +249,42 @@ func (d *Dispatcher) NotifySecurityEvent(ev models.SecurityEvent) {
 		payload: string(slackJSON), enabled: cfg.SlackEnabled, webhookURL: string(cfg.SlackWebhookURL)})
 }
 
+// NotifyPackageEvent alerts the SecOps channels about a package-firewall event: an approved package
+// that a new advisory or malware verdict now affects (and may have auto-revoked). It respects the same
+// opt-in as threat-protection events (notify_security_events) and links to the receiver view so a
+// responder can immediately see which servers already pulled the affected version.
+func (d *Dispatcher) NotifyPackageEvent(ev models.PackageAlert) {
+	cfg := d.GetConfig()
+	if !cfg.NotifySecurityEvents {
+		return
+	}
+	icon, color, action := "⚠️", "Warning", "new advisory on an approved package"
+	switch ev.Action {
+	case "revoked":
+		icon, color, action = "🚫", "Attention", "approval revoked after re-audit"
+	case "malware":
+		icon, color, action = "☣️", "Attention", "malware verdict on an approved package"
+	}
+	title := fmt.Sprintf("%s AegisProxy package firewall: %s", icon, action)
+	base := strings.TrimRight(cfg.DashboardBaseURL, "/")
+	// Deep link straight to "which servers already pulled this version".
+	link := fmt.Sprintf("%s/packages/receivers?ecosystem=%s&name=%s&version=%s", base,
+		url.QueryEscape(ev.Ecosystem), url.QueryEscape(ev.Name), url.QueryEscape(ev.Version))
+	spread := "not looked up"
+	if ev.Servers == 0 {
+		spread = "none in the retained telemetry window"
+	} else if ev.Servers > 0 {
+		spread = fmt.Sprintf("%d server(s) in the retained telemetry window", ev.Servers)
+	}
+	d.simple("PACKAGE_"+strings.ToUpper(ev.Action), title, color, [][2]string{
+		{"Package:", fmt.Sprintf("%s:%s@%s", ev.Ecosystem, ev.Name, ev.Version)},
+		{"Severity:", strings.ToUpper(ev.Severity)},
+		{"Finding:", ev.Summary},
+		{"Advisories:", strings.Join(ev.Advisories, ", ")},
+		{"Already pulled by:", spread},
+	}, "See which servers pulled it", link)
+}
+
 // NotifyChangeRequest asks reviewers to look at a policy change (four-eyes review).
 func (d *Dispatcher) NotifyChangeRequest(cr models.ChangeRequest) {
 	cfg := d.GetConfig()
