@@ -150,6 +150,25 @@ Browsers get the branded HTML block page with a request form instead.
 </details>
 
 <details>
+<summary><b>Package firewall</b> (3.0) · <a href="docs/package-firewall.md">guide</a></summary>
+
+- **Transparent approval** of npm, PyPI, NuGet and PowerShell Gallery packages: clients keep using the public
+  registries through the proxy; the data-plane filters registry metadata down to approved versions and lets only
+  approved, **hash-pinned** artifacts through. Packages are never re-hosted.
+- **Full dependency graph**: a request resolves the transitive graph, shows every package with its state
+  (new / update / approved / blocked) and surfaces the risky path instead of hiding it in an average score.
+- **Checked against the known audit tools** (OSV and the ecosystem advisory feeds), with **signature and
+  provenance verification** (npm registry signatures, Sigstore attestations, PyPI PEP 740) and license checks.
+- **Behavior analysis in a throwaway sandbox** (Docker or Firecracker, no network): records every web URL, host
+  and DNS name the package reaches and every system call it makes while installing and loading, plus processes,
+  file writes and decoy-credential access.
+- **Rules with a waiting period (Karenz)**: auto-approve new versions only once they have been public long
+  enough and clear their advisory, signature and sandbox checks; a re-audit loop revokes an approval when a new
+  advisory lands.
+- **Incident recall**: which servers obtained a package that a later advisory flags — including gateway cache hits.
+</details>
+
+<details>
 <summary><b>Self-service access requests</b></summary>
 
 - Browser block page and CLI message with a **data-plane-signed block token**, so the requesting server is

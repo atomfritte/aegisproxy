@@ -8,7 +8,14 @@ AegisProxy consists of three independently scalable components plus optional ser
 | **Data-plane** | mitmproxy 12 + Python addon | Explicit HTTP(S) proxy for servers: TLS inspection, policy enforcement, DLP, antivirus, download control | stateless (local cache of the policy) |
 | **Console** | React/TypeScript (static SPA) | Administration and SOC user interface | none |
 | ClamAV (optional) | clamd | Malware scanning of downloaded content (INSTREAM) | signatures |
+| Sandbox worker (optional, 3.0) | Go + Docker/Firecracker | Package behavior analysis: runs an artifact in a disposable sandbox and reports URLs, syscalls, processes and file access | stateless |
 | PostgreSQL (optional) | ≥ 14 | Shared state for HA operation | – |
+
+The **package firewall** (3.0, see [package-firewall.md](package-firewall.md)) adds transparent approval of npm,
+PyPI, NuGet and PowerShell Gallery packages: the control-plane resolves dependency graphs, assesses versions
+(advisories, signatures, provenance, sandbox behavior) and applies rules with a waiting period; the data-plane
+filters registry metadata to approved versions and delivers only approved, hash-pinned artifacts. It is off until
+an ecosystem is enabled.
 
 ```mermaid
 flowchart LR

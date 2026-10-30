@@ -124,6 +124,10 @@ tags:
     description: Health, metrics, console state, live flow stream, security posture and the web console.
   - name: Data-plane
     description: API for mitmproxy data-plane workers (X-Aegis-DataPlane-Key).
+  - name: Package firewall
+    description: Transparent approval of npm, PyPI, NuGet and PowerShell Gallery packages (3.0).
+  - name: Sandbox
+    description: Package behavior-analysis workers (X-Aegis-Sandbox-Key).
   - name: Public
     description: Unauthenticated endpoints (CA trust bootstrap, self-service block portal, metadata, this document).
 paths:
@@ -5134,6 +5138,309 @@ paths:
           $ref: '#/components/responses/UnsupportedMediaType'
         '503':
           $ref: '#/components/responses/TelemetryUnavailable'
+  /api/packages/overview:
+    get:
+      tags: [Package firewall]
+      operationId: getPackageOverview
+      summary: Package firewall overview
+      description: |
+        Ecosystem modes, counts (approvals, blocks, rules, open requests), the current analysis queue and the
+        settings. **Roles:** any signed-in role (edit: Super Admin, InfoSec Approver).
+      responses:
+        '200': { description: Overview., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/packages/settings:
+    post:
+      tags: [Package firewall]
+      operationId: updatePackageSettings
+      summary: Update the package firewall settings
+      description: 'Replace the ecosystem modes, cooldown, re-audit/watch intervals, sandbox and advisory sources. **Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Updated firewall., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/rules:
+    get:
+      tags: [Package firewall]
+      operationId: listPackageRules
+      summary: List package rules
+      description: 'Rules ordered by priority (auto-approve / review / block, with the cooldown and checks). **Roles:** any signed-in role.'
+      responses:
+        '200': { description: Rules., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Package firewall]
+      operationId: createPackageRule
+      summary: Create a package rule
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Saved rule., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/rules/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [Package firewall]
+      operationId: updatePackageRule
+      summary: Update a package rule
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Saved rule., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Package firewall]
+      operationId: deletePackageRule
+      summary: Delete a package rule
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      responses:
+        '200': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/rules/{id}/toggle:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Package firewall]
+      operationId: togglePackageRule
+      summary: Enable or disable a package rule
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      responses:
+        '200': { description: Rule., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/blocks:
+    get:
+      tags: [Package firewall]
+      operationId: listPackageBlocks
+      summary: List blocked package versions
+      description: '**Roles:** any signed-in role.'
+      responses:
+        '200': { description: Blocks., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Package firewall]
+      operationId: addPackageBlock
+      summary: Block package versions
+      description: 'Block a package version range; matching active approvals are revoked. **Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '201': { description: Block., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/blocks/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [Package firewall]
+      operationId: deletePackageBlock
+      summary: Remove a block
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      responses:
+        '200': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/approvals:
+    get:
+      tags: [Package firewall]
+      operationId: listPackageApprovals
+      summary: List package approvals
+      description: 'Filter by ecosystem, status and name. **Roles:** any signed-in role.'
+      parameters:
+        - { name: ecosystem, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Approvals., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/packages/approvals/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Package firewall]
+      operationId: getPackageApproval
+      summary: Get one approval
+      description: '**Roles:** any signed-in role.'
+      responses:
+        '200': { description: Approval., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/packages/approvals/{id}/revoke:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Package firewall]
+      operationId: revokePackageApproval
+      summary: Revoke an approval
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/approvals/{id}/extend:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Package firewall]
+      operationId: extendPackageApproval
+      summary: Set or clear an approval's expiry
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Updated. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/requests:
+    get:
+      tags: [Package firewall]
+      operationId: listPackageRequests
+      summary: List package requests
+      description: 'Filter by status, ecosystem and mine. **Roles:** any signed-in role.'
+      parameters:
+        - { name: status, in: query, schema: { type: string } }
+        - { name: ecosystem, in: query, schema: { type: string } }
+        - { name: mine, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Requests., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Package firewall]
+      operationId: createPackageRequest
+      summary: Request a package
+      description: 'Open a request; resolution and analysis start asynchronously. **Roles:** any signed-in role.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '201': { description: Request., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/packages/requests/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Package firewall]
+      operationId: getPackageRequest
+      summary: Get one request with its resolved graph
+      description: '**Roles:** any signed-in role.'
+      responses:
+        '200': { description: Request., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/packages/requests/{id}/decision:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Package firewall]
+      operationId: decidePackageRequest
+      summary: Approve or reject a request
+      description: 'Approve creates the graph''s approvals. **Roles:** Super Admin, InfoSec Approver.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Decision., content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/packages/requests/{id}/reanalyze:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Package firewall]
+      operationId: reanalyzePackageRequest
+      summary: Re-run resolution and analysis
+      description: '**Roles:** Super Admin, InfoSec Approver.'
+      responses:
+        '200': { description: Reanalyzing. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/packages/lookup:
+    get:
+      tags: [Package firewall]
+      operationId: lookupPackage
+      summary: Assessment preview for the request wizard
+      description: 'Resolve and assess one version without creating a request. **Roles:** any signed-in role.'
+      parameters:
+        - { name: ecosystem, in: query, required: true, schema: { type: string } }
+        - { name: name, in: query, required: true, schema: { type: string } }
+        - { name: version, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Assessed node., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { description: The registry could not be reached. }
+  /api/packages/analysis/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Package firewall]
+      operationId: getPackageAnalysis
+      summary: Full sandbox report of one analysis
+      description: 'URLs, syscalls, processes, file access and findings. Served from the node that received the worker result. **Roles:** any signed-in role.'
+      responses:
+        '200': { description: Report., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/packages/receivers:
+    get:
+      tags: [Package firewall]
+      operationId: getPackageReceivers
+      summary: Which servers obtained a package
+      description: 'Incident recall over the flow telemetry. **Roles:** any signed-in role.'
+      parameters:
+        - { name: ecosystem, in: query, schema: { type: string } }
+        - { name: name, in: query, schema: { type: string } }
+        - { name: version, in: query, schema: { type: string } }
+        - { name: sha256, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Receivers., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/sandbox/jobs/claim:
+    post:
+      tags: [Sandbox]
+      operationId: claimSandboxJob
+      summary: Lease the next queued analysis job
+      description: 'Authenticated with X-Aegis-Sandbox-Key. `200` with a job or `204` when the queue is empty.'
+      security: [{ sandboxKey: [] }]
+      requestBody: { content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: A leased job., content: { application/json: { schema: { type: object } } } }
+        '204': { description: No job available. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/sandbox/jobs/{id}/heartbeat:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Sandbox]
+      operationId: heartbeatSandboxJob
+      summary: Extend a job's lease
+      description: 'Authenticated with X-Aegis-Sandbox-Key.'
+      security: [{ sandboxKey: [] }]
+      responses:
+        '200': { description: Lease extended., content: { application/json: { schema: { type: object } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/sandbox/jobs/{id}/result:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Sandbox]
+      operationId: reportSandboxResult
+      summary: Submit an analysis report or error
+      description: 'Authenticated with X-Aegis-Sandbox-Key. The assessment is updated and dependent requests advance.'
+      security: [{ sandboxKey: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Recorded. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 components:
   securitySchemes:
     sessionCookie:
@@ -5171,6 +5478,11 @@ components:
       in: header
       name: X-Aegis-DataPlane-Key
       description: Shared data-plane key (`AEGIS_DATAPLANE_KEY`) of mitmproxy workers. Only accepted by `/api/dataplane/*`.
+    sandboxKey:
+      type: apiKey
+      in: header
+      name: X-Aegis-Sandbox-Key
+      description: Shared sandbox key (`AEGIS_SANDBOX_KEY`) of package analysis workers. Only accepted by `/api/sandbox/*`.
     metricsToken:
       type: http
       scheme: bearer
