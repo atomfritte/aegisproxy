@@ -49,7 +49,10 @@ x-dp-env: &dp-env
 
 services:
   postgres:
-    image: postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb   # pinned by digest
+    # PostgreSQL 18 (pinned by digest). This is a MAJOR version: a pg-data volume created by an earlier
+    # major (e.g. 17) will NOT start under 18 — migrate first with pg_upgrade or a dump/restore, or start
+    # on a fresh volume. See docs/deployment/high-availability.md.
+    image: postgres:18-alpine@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503
     restart: unless-stopped
     environment:
       POSTGRES_USER: aegis

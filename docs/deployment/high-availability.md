@@ -42,6 +42,14 @@ docker stop aegis-ha-control-plane-1-1     # writes keep working via replica 2
 docker start aegis-ha-control-plane-1-1    # rejoins with the current revision
 ```
 
+> [!IMPORTANT]
+> **PostgreSQL major upgrades.** The reference compose pins PostgreSQL 18. A data directory created by an
+> earlier major (e.g. 17) will not start under a newer major — the server refuses to open an incompatible
+> `pg-data`. To move an existing cluster forward, dump and restore (`pg_dump`/`pg_restore`) or run
+> `pg_upgrade` against a 18 binary, then point the control-planes at the upgraded database; or start fresh
+> on a new volume (the control-plane recreates its schema). On managed/operated databases
+> (CloudNativePG, Patroni, RDS/Aurora, Azure, Cloud SQL) use the platform's major-version upgrade procedure.
+
 ## Production on multiple hosts / VMs
 
 1. Provision PostgreSQL HA and create a database + user (`CREATE DATABASE aegis OWNER aegis`). The schema is
