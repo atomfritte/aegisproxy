@@ -174,6 +174,7 @@
 !internal/store/scim.go
 !internal/store/security.go
 !internal/store/seed_demo.go
+!internal/store/seed_demo_packages.go
 !internal/store/seed_demo_policy.go
 !internal/store/serviceaccounts.go
 !internal/store/sessions.go
