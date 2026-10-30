@@ -172,7 +172,7 @@ export const TlsCaPage: React.FC = () => {
     });
   }
 
-  const categories = [...new Set(rows.map((t) => t.category).filter(Boolean))].sort();
+  const categories = [...new Set(rows.map((t) => t.category).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
   const active = rows.filter((t) => statusOf(t, now) === 'active').length;
 
   return (

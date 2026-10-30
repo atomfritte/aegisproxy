@@ -85,7 +85,7 @@ export const PolicySetCreatePage: React.FC = () => {
   const valid = Object.values(errors).every((e) => !e);
 
   const ownerSuggestions = [...new Set([...state.policy_sets.map((s) => s.owner_team), ...state.groups.map((g) => g.owner_team)].filter(Boolean))];
-  const tagSuggestions = [...new Set(state.policy_sets.flatMap((s) => s.tags ?? []))].sort();
+  const tagSuggestions = [...new Set(state.policy_sets.flatMap((s) => s.tags ?? []))].sort((a, b) => String(a).localeCompare(String(b)));
 
   const submit = async () => {
     setTouched(true);

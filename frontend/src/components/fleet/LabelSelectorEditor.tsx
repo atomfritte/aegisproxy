@@ -58,7 +58,7 @@ export const LabelSelectorEditor: React.FC<{ rows: SelectorRow[]; onChange: (row
     <div className="space-y-2">
       {rows.length === 0 && <p className="text-[12.5px] text-fg-subtle">No selector: membership is static or by CIDR only.</p>}
       {rows.map((r, i) => {
-        const values = [...(known.get(r.key.trim().toLowerCase()) ?? [])].sort();
+        const values = [...(known.get(r.key.trim().toLowerCase()) ?? [])].sort((a, b) => String(a).localeCompare(String(b)));
         return (
           <div key={i} className="flex items-start gap-2">
             {i > 0 && <span className="mt-2 w-7 shrink-0 text-center text-[11.5px] font-medium text-fg-subtle">and</span>}
@@ -99,7 +99,7 @@ export const LabelSelectorEditor: React.FC<{ rows: SelectorRow[]; onChange: (row
         );
       })}
       <datalist id={`${uid}-keys`}>
-        {[...known.keys()].sort().map((k) => (
+        {[...known.keys()].sort((a, b) => String(a).localeCompare(String(b))).map((k) => (
           <option key={k} value={k} />
         ))}
       </datalist>

@@ -190,7 +190,7 @@ export const ServersPage: React.FC = () => {
 
   const groupOptions = state.groups.map((g) => ({ value: g.id, label: g.name }));
   const labelOptions = useMemo(
-    () => [...new Set(servers.flatMap((s) => Object.entries(s.labels ?? {}).map(([k, v]) => `${k}=${v}`)))].sort().map((v) => ({ value: v, label: v })),
+    () => [...new Set(servers.flatMap((s) => Object.entries(s.labels ?? {}).map(([k, v]) => `${k}=${v}`)))].sort((a, b) => String(a).localeCompare(String(b))).map((v) => ({ value: v, label: v })),
     [servers]
   );
 

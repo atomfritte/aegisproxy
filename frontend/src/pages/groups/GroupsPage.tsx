@@ -133,8 +133,8 @@ export const GroupsPage: React.FC = () => {
     { id: 'menu', header: <span className="sr-only">Actions</span>, width: 48, align: 'right', cell: (r) => menu(r.group) },
   ];
 
-  const envs = [...new Set(state.groups.map((g) => g.environment).filter(Boolean))].sort();
-  const owners = [...new Set(state.groups.map((g) => g.owner_team).filter(Boolean))].sort();
+  const envs = [...new Set(state.groups.map((g) => g.environment).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+  const owners = [...new Set(state.groups.map((g) => g.owner_team).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
 
   return (
     <>

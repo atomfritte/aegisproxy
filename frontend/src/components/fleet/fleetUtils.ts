@@ -191,7 +191,7 @@ export function serversToCsv(servers: Server[]): string {
   const lines = [CSV_COLUMNS.join(',')];
   for (const s of servers) {
     const labels = Object.keys(s.labels ?? {})
-      .sort()
+      .sort((a, b) => String(a).localeCompare(String(b)))
       .map((k) => `${k}=${s.labels![k]}`)
       .join(';');
     lines.push(

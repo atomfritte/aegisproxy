@@ -128,7 +128,7 @@ export function fromSink(s: ExportSink): SinkForm {
     secretMode: s.has_secret ? 'keep' : 'new',
     secret: '',
     headers: Object.keys(s.headers ?? {})
-      .sort()
+      .sort((a, b) => String(a).localeCompare(String(b)))
       .map((name) => ({ name, value: '', stored: true })),
     batch_size: s.batch_size || 500,
     flush_seconds: s.flush_seconds || 2,

@@ -195,7 +195,7 @@ export const AuditTrailPage: React.FC = () => {
     },
   ];
 
-  const actors = [...new Set(events.map((e) => e.actor))].sort();
+  const actors = [...new Set(events.map((e) => e.actor))].sort((a, b) => String(a).localeCompare(String(b)));
   const entityTypes = [...new Set(events.map((e) => e.entity_type).filter(Boolean))].sort((a, b) => entityLabel(a).localeCompare(entityLabel(b)));
 
   return (

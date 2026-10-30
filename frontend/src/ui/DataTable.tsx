@@ -475,7 +475,7 @@ function FacetButton<T>({ facet, rows, value, onChange }: { facet: FacetDef<T>; 
   const options = useMemo(() => {
     const counts = new Map<string, number>();
     for (const r of rows) for (const v of asArray(facet.getValue(r))) counts.set(v, (counts.get(v) || 0) + 1);
-    const base = facet.options ?? [...counts.keys()].sort().map((v) => ({ value: v, label: facet.optionLabel?.(v) ?? v }));
+    const base = facet.options ?? [...counts.keys()].sort((a, b) => String(a).localeCompare(String(b))).map((v) => ({ value: v, label: facet.optionLabel?.(v) ?? v }));
     return base.map((o) => ({ ...o, count: counts.get(o.value) || 0 }));
   }, [rows, facet]);
   const labelOf = (v: string) => options.find((o) => o.value === v)?.label ?? v;

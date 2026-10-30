@@ -197,7 +197,7 @@ export const GroupFormDrawer: React.FC<{ open: boolean; onClose: () => void; gro
             ))}
           </datalist>
           <datalist id={`${uid}-teams`}>
-            {[...new Set(state.groups.map((g) => g.owner_team).filter(Boolean))].sort().map((t) => (
+            {[...new Set(state.groups.map((g) => g.owner_team).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b))).map((t) => (
               <option key={t} value={t} />
             ))}
           </datalist>

@@ -122,14 +122,14 @@ const Editor: React.FC<{ template?: BlockPageTemplate }> = ({ template }) => {
   const initial = useMemo(() => (template ? toDraft(template) : newTemplate(defaultTpl?.company_name || '')), [template?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const [baseline, setBaseline] = useState<TemplateDraft>(initial);
   const [draft, setDraft] = useState<TemplateDraft>(initial);
-  const baseGroups = useMemo(() => (template ? assignedGroups(groups, template.id).map((g) => g.id).sort() : []), [groups, template]);
+  const baseGroups = useMemo(() => (template ? assignedGroups(groups, template.id).map((g) => g.id).sort((a, b) => String(a).localeCompare(String(b))) : []), [groups, template]);
   const [selGroups, setSelGroups] = useState<string[]>(baseGroups);
   const [attempted, setAttempted] = useState(false);
   const [saving, setSaving] = useState(false);
   const [mobileTab, setMobileTab] = useState<'edit' | 'preview'>('edit');
   const [view, setView] = useState<PreviewView>({ mode: 'browser', variant: 'request', locale: (initial.default_locale as Locale) || 'en', device: isMobile ? 'phone' : 'desktop' });
 
-  const groupsDirty = JSON.stringify([...selGroups].sort()) !== JSON.stringify(baseGroups);
+  const groupsDirty = JSON.stringify([...selGroups].sort((a, b) => String(a).localeCompare(String(b)))) !== JSON.stringify(baseGroups);
   const dirty = draftKey(draft) !== draftKey(baseline) || groupsDirty;
   const allErrors = useMemo(() => validateDraft(draft), [draft]);
   const errors = attempted ? allErrors : liveErrors(allErrors);

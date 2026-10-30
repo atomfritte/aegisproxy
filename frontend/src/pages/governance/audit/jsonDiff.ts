@@ -36,7 +36,7 @@ export function diffStates(beforeRaw?: string, afterRaw?: string): FieldChange[]
   if ((before !== undefined && !isPlainObject(before)) || (after !== undefined && !isPlainObject(after))) return null;
   const b = flatten(before ?? {});
   const a = flatten(after ?? {});
-  const paths = [...new Set([...b.keys(), ...a.keys()])].sort();
+  const paths = [...new Set([...b.keys(), ...a.keys()])].sort((a, b) => String(a).localeCompare(String(b)));
   return paths.map((p) => {
     const bv = b.get(p);
     const av = a.get(p);

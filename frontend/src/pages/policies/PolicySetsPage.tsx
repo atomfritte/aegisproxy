@@ -132,8 +132,8 @@ export const PolicySetsPage: React.FC = () => {
     },
   ];
 
-  const allTags = [...new Set(sets.flatMap((s) => s.tags ?? []))].sort();
-  const allOwners = [...new Set(sets.map((s) => s.owner_team).filter(Boolean))].sort();
+  const allTags = [...new Set(sets.flatMap((s) => s.tags ?? []))].sort((a, b) => String(a).localeCompare(String(b)));
+  const allOwners = [...new Set(sets.map((s) => s.owner_team).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
   const kindFilter = f.values.kind;
 
   return (

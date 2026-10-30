@@ -86,9 +86,9 @@ export const ServerFormDrawer: React.FC<ServerFormDrawerProps> = ({ open, onClos
 
   const matches = useMemo(() => matchingGroups(f.labels, state.groups).filter((g) => !f.group_ids.includes(g.id)), [f.labels, f.group_ids, state.groups]);
   const groupOptions = state.groups.map((g) => ({ value: g.id, label: g.name, description: g.cidrs?.length ? g.cidrs.join(', ') : g.id, color: g.color }));
-  const osValues = useMemo(() => [...new Set(state.servers.map((s) => s.os).filter(Boolean))].sort(), [state.servers]);
-  const teams = useMemo(() => [...new Set([...state.servers.map((s) => s.owner_team), ...state.groups.map((g) => g.owner_team)].filter(Boolean) as string[])].sort(), [state.servers, state.groups]);
-  const departments = useMemo(() => [...new Set(state.servers.map((s) => s.department).filter(Boolean))].sort(), [state.servers]);
+  const osValues = useMemo(() => [...new Set(state.servers.map((s) => s.os).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b))), [state.servers]);
+  const teams = useMemo(() => [...new Set([...state.servers.map((s) => s.owner_team), ...state.groups.map((g) => g.owner_team)].filter(Boolean) as string[])].sort((a, b) => String(a).localeCompare(String(b))), [state.servers, state.groups]);
+  const departments = useMemo(() => [...new Set(state.servers.map((s) => s.department).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b))), [state.servers]);
 
   const save = async () => {
     setTouched(true);

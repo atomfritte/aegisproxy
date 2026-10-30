@@ -174,9 +174,9 @@ const same = (a: Draft, b: Draft) => JSON.stringify(fromDraftSafe(a)) === JSON.s
 function fromDraftSafe(d: Draft) {
   const p = fromDraft(d) as unknown as Record<string, unknown>;
   // order-insensitive comparison for lists
-  for (const k of ['dlp_detectors', 'blocked_file_types', 'allowed_ports']) p[k] = [...(p[k] as Array<string | number>)].sort();
+  for (const k of ['dlp_detectors', 'blocked_file_types', 'allowed_ports']) p[k] = [...(p[k] as Array<string | number>)].sort((a, b) => String(a).localeCompare(String(b)));
   const g = (p.group_blocked_file_types || {}) as Record<string, string[]>;
-  p.group_blocked_file_types = Object.fromEntries(Object.keys(g).sort().map((k) => [k, [...g[k]].sort()]));
+  p.group_blocked_file_types = Object.fromEntries(Object.keys(g).sort((a, b) => String(a).localeCompare(String(b))).map((k) => [k, [...g[k]].sort((a, b) => String(a).localeCompare(String(b)))]));
   return p;
 }
 
