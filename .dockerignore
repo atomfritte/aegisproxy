@@ -391,6 +391,7 @@
 !control-plane/internal/store/scim.go
 !control-plane/internal/store/security.go
 !control-plane/internal/store/seed_demo.go
+!control-plane/internal/store/seed_demo_packages.go
 !control-plane/internal/store/seed_demo_policy.go
 !control-plane/internal/store/serviceaccounts.go
 !control-plane/internal/store/sessions.go
