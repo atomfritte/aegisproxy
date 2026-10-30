@@ -37,7 +37,8 @@ const (
 	VerdictFileTypeBlocked  = "FILETYPE_BLOCKED"
 	VerdictPolicyBlocked    = "POLICY_BLOCKED"
 	VerdictQuarantined      = "QUARANTINED"
-	VerdictAuthFailed       = "AUTH_FAILED" // invalid proxy credentials (HTTP 407), never an IP fallback
+	VerdictAuthFailed       = "AUTH_FAILED"     // invalid proxy credentials (HTTP 407), never an IP fallback
+	VerdictPackageBlocked   = "PACKAGE_BLOCKED" // package firewall: version not approved, blocked or hash mismatch
 	VerdictSimulatedDryRun  = "SIMULATED"
 	SecurityEventThreat     = "THREAT_INTEL"
 	SecurityEventMalware    = "MALWARE"
@@ -50,6 +51,7 @@ const (
 	SecurityEventAVError    = "AV_ERROR"
 	SecurityEventBlockBurst = "BLOCK_BURST"
 	SecurityEventQuarantine = "QUARANTINE"
+	SecurityEventPackage    = "PACKAGE" // package firewall: advisory, malicious behavior, hash mismatch
 )
 
 // IsAllowedVerdict reports whether traffic with this verdict was forwarded upstream.
@@ -539,6 +541,8 @@ type TrafficFlow struct {
 	DLPFindings     []string `json:"dlp_findings,omitempty"`
 	ResolvedIP      string   `json:"resolved_ip,omitempty"`
 	DataPlaneID     string   `json:"data_plane_id,omitempty"`
+	// Package is set for registry requests the package firewall classified (3.0).
+	Package *FlowPackage `json:"package,omitempty"`
 }
 
 type BandwidthSample struct {
