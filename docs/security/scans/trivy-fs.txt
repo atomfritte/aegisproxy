@@ -1,0 +1,160 @@
+2026-10-30T23:15:40Z	INFO	[vuln] Vulnerability scanning is enabled
+2026-10-30T23:15:40Z	INFO	[misconfig] Misconfiguration scanning is enabled
+2026-10-30T23:15:40Z	INFO	[checks-client] Using existing checks from cache	path="/root/.cache/trivy/policy/content"
+2026-10-30T23:15:42Z	INFO	[secret] Secret scanning is enabled
+2026-10-30T23:15:42Z	INFO	[secret] If your scanning is slow, please try '--scanners vuln,misconfig' to disable secret scanning
+2026-10-30T23:15:42Z	INFO	[secret] Please see https://trivy.dev/docs/v0.75/guide/scanner/secret#recommendation for faster secret detection
+2026-10-30T23:15:53Z	WARN	[helm scanner] Skipping chart	file_path="deploy/helm/aegisproxy" err="parse chart: execution error at (aegisproxy/templates/secrets.yaml:1:4): storage.type=postgres requires storage.postgres.url, storage.postgres.existingSecret or storage.postgres.cnpg.enabled=true"
+2026-10-30T23:15:54Z	WARN	[pip] Unable to find python `site-packages` directory. License detection is skipped.	err="unable to find path to Python executable"
+2026-10-30T23:15:54Z	INFO	Suppressing dependencies for development and testing. To display them, try the '--include-dev-deps' flag.
+2026-10-30T23:15:54Z	INFO	Number of language-specific files	num=4
+2026-10-30T23:15:54Z	INFO	[gomod] Detecting vulnerabilities...
+2026-10-30T23:15:54Z	INFO	[npm] Detecting vulnerabilities...
+2026-10-30T23:15:54Z	INFO	[pip] Detecting vulnerabilities...
+2026-10-30T23:15:54Z	INFO	Detected config files	num=10
+
+Report Summary
+
+┌──────────────────────────────────────────┬────────────┬─────────────────┬─────────┬───────────────────┐
+│                  Target                  │    Type    │ Vulnerabilities │ Secrets │ Misconfigurations │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ control-plane/go.mod                     │   gomod    │        0        │    -    │         -         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ data-plane/requirements.txt              │    pip     │        0        │    -    │         -         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ frontend/e2e/requirements.txt            │    pip     │        0        │    -    │         -         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ frontend/package-lock.json               │    npm     │        0        │    -    │         -         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ Dockerfile                               │ dockerfile │        -        │    -    │         0         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ control-plane/Dockerfile                 │ dockerfile │        -        │    -    │         0         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ data-plane/Dockerfile                    │ dockerfile │        -        │    -    │         0         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ deploy/sentinel/aegisproxy-sentinel.json │ azure-arm  │        -        │    -    │         0         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ frontend/Dockerfile                      │ dockerfile │        -        │    -    │         0         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ sandbox/images/npm/Dockerfile            │ dockerfile │        -        │    -    │         2         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ sandbox/images/nuget/Dockerfile          │ dockerfile │        -        │    -    │         2         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ sandbox/images/psgallery/Dockerfile      │ dockerfile │        -        │    -    │         2         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ sandbox/images/pypi/Dockerfile           │ dockerfile │        -        │    -    │         2         │
+├──────────────────────────────────────────┼────────────┼─────────────────┼─────────┼───────────────────┤
+│ scripts/wine/Dockerfile                  │ dockerfile │        -        │    -    │         1         │
+└──────────────────────────────────────────┴────────────┴─────────────────┴─────────┴───────────────────┘
+Legend:
+- '-': Not scanned
+- '0': Clean (no security findings detected)
+
+
+sandbox/images/npm/Dockerfile (dockerfile)
+==========================================
+Tests: 27 (SUCCESSES: 25, FAILURES: 2)
+Failures: 2 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 1, CRITICAL: 0)
+
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+════════════════════════════════════════
+Running containers with 'root' user can lead to a container escape situation. It is a best practice to run containers as non-root users, which can be done by adding a 'USER' statement to the Dockerfile.
+
+See https://avd.aquasec.com/misconfig/ds-0002
+────────────────────────────────────────
+
+
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+════════════════════════════════════════
+You should add HEALTHCHECK instruction in your docker container images to perform the health check on running containers.
+
+See https://avd.aquasec.com/misconfig/ds-0026
+────────────────────────────────────────
+
+
+
+sandbox/images/nuget/Dockerfile (dockerfile)
+============================================
+Tests: 27 (SUCCESSES: 25, FAILURES: 2)
+Failures: 2 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 1, CRITICAL: 0)
+
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+════════════════════════════════════════
+Running containers with 'root' user can lead to a container escape situation. It is a best practice to run containers as non-root users, which can be done by adding a 'USER' statement to the Dockerfile.
+
+See https://avd.aquasec.com/misconfig/ds-0002
+────────────────────────────────────────
+
+
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+════════════════════════════════════════
+You should add HEALTHCHECK instruction in your docker container images to perform the health check on running containers.
+
+See https://avd.aquasec.com/misconfig/ds-0026
+────────────────────────────────────────
+
+
+
+sandbox/images/psgallery/Dockerfile (dockerfile)
+================================================
+Tests: 27 (SUCCESSES: 25, FAILURES: 2)
+Failures: 2 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 1, CRITICAL: 0)
+
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+════════════════════════════════════════
+Running containers with 'root' user can lead to a container escape situation. It is a best practice to run containers as non-root users, which can be done by adding a 'USER' statement to the Dockerfile.
+
+See https://avd.aquasec.com/misconfig/ds-0002
+────────────────────────────────────────
+
+
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+════════════════════════════════════════
+You should add HEALTHCHECK instruction in your docker container images to perform the health check on running containers.
+
+See https://avd.aquasec.com/misconfig/ds-0026
+────────────────────────────────────────
+
+
+
+sandbox/images/pypi/Dockerfile (dockerfile)
+===========================================
+Tests: 27 (SUCCESSES: 25, FAILURES: 2)
+Failures: 2 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 1, CRITICAL: 0)
+
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+════════════════════════════════════════
+Running containers with 'root' user can lead to a container escape situation. It is a best practice to run containers as non-root users, which can be done by adding a 'USER' statement to the Dockerfile.
+
+See https://avd.aquasec.com/misconfig/ds-0002
+────────────────────────────────────────
+
+
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+════════════════════════════════════════
+You should add HEALTHCHECK instruction in your docker container images to perform the health check on running containers.
+
+See https://avd.aquasec.com/misconfig/ds-0026
+────────────────────────────────────────
+
+
+
+scripts/wine/Dockerfile (dockerfile)
+====================================
+Tests: 27 (SUCCESSES: 26, FAILURES: 1)
+Failures: 1 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 0, CRITICAL: 0)
+
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+════════════════════════════════════════
+You should add HEALTHCHECK instruction in your docker container images to perform the health check on running containers.
+
+See https://avd.aquasec.com/misconfig/ds-0026
+────────────────────────────────────────
+
+
+
+📣 [34mNotices:[0m
+  - Version 0.76.1 of Trivy is now available, current version is 0.75.0
+
+To suppress version checks, run Trivy scans with the --skip-version-check flag
+

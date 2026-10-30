@@ -1,0 +1,10 @@
+# pip-audit --disable-pip --require-hashes (data-plane/requirements-lock.txt + .github + e2e)
+
+## data-plane/requirements-lock.txt
+No known vulnerabilities found
+
+## .github/requirements-audit.txt
+No known vulnerabilities found
+
+## frontend/e2e/requirements.txt
+No known vulnerabilities found

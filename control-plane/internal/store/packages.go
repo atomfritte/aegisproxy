@@ -96,11 +96,6 @@ func (s *Store) PackageFirewall() models.PackageFirewall {
 	return clonePackageFirewall(s.state.Packages, true)
 }
 
-// PackageFirewallRaw returns the configuration with secrets intact (for the bundle and the loops).
-func (s *Store) packageFirewallRawLocked() models.PackageFirewall {
-	return clonePackageFirewall(s.state.Packages, false)
-}
-
 func clonePackageFirewall(p models.PackageFirewall, redact bool) models.PackageFirewall {
 	out := models.PackageFirewall{Settings: p.Settings}
 	out.Settings.Ecosystems = map[string]models.PackageEcosystemSettings{}

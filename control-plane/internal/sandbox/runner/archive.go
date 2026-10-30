@@ -168,8 +168,8 @@ func extractTar(dst string, r io.Reader, compressed int64, lim ExtractLimits, re
 				res.warn("%s not materialized: %s -> %s", kind, clampPath(hdr.Name), clampPath(hdr.Linkname))
 			}
 			continue
-		case tar.TypeReg, tar.TypeRegA:
-			// handled below
+		case tar.TypeReg:
+			// handled below (the tar reader already normalizes the deprecated TypeRegA to TypeReg)
 		default:
 			res.reject(hdr.Name, fmt.Sprintf("unsupported entry type %q (device node / fifo?)", hdr.Typeflag))
 			continue

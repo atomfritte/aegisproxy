@@ -88,9 +88,7 @@ func parseNpm(root string, files []sandbox.File) ManifestResult {
 	if mainS, ok := m["main"].(string); ok && mainS != "" {
 		res.Entrypoints = append(res.Entrypoints, mainS)
 	}
-	for _, ep := range exportsEntrypoints(m["exports"]) {
-		res.Entrypoints = append(res.Entrypoints, ep)
-	}
+	res.Entrypoints = append(res.Entrypoints, exportsEntrypoints(m["exports"])...)
 	if len(res.Entrypoints) == 0 {
 		if findFile(files, "index.js") != "" {
 			res.Entrypoints = append(res.Entrypoints, "index.js")

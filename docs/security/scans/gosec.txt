@@ -1,0 +1,1214 @@
+Results:
+
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/pkgver/pep508.go:791] - G115 (CWE-190): integer overflow conversion uint64 -> rune (Confidence: MEDIUM, Severity: HIGH)
+    790: 			n, _ := strconv.ParseUint(s[i:j], 8, 32)
+  > 791: 			b.WriteRune(rune(n))
+    792: 			i = j - 1
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:318] - G115 (CWE-190): integer overflow conversion uint64 -> int64 (Confidence: MEDIUM, Severity: HIGH)
+    317: 		if _, err := t.tx.Exec(ctx, "UPDATE aegis_package_work SET revision = $1, doc = $2, updated_at = now(), updated_by = $3 WHERE id = 1",
+  > 318: 			int64(pkgRev), pkgDoc, t.b.nodeID); err != nil {
+    319: 			return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:309] - G115 (CWE-190): integer overflow conversion uint64 -> int64 (Confidence: MEDIUM, Severity: HIGH)
+    308: 		if _, err := t.tx.Exec(ctx, "UPDATE aegis_config SET revision = $1, doc = $2, updated_at = now(), updated_by = $3 WHERE id = 1",
+  > 309: 			int64(rev), doc, t.b.nodeID); err != nil {
+    310: 			return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:227] - G115 (CWE-190): integer overflow conversion uint64 -> int64 (Confidence: MEDIUM, Severity: HIGH)
+    226: 		}
+  > 227: 		err = writeMember(dst, rel, rc, int64(zf.UncompressedSize64), int64(zf.CompressedSize64), lim, res)
+    228: 		rc.Close()
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:227] - G115 (CWE-190): integer overflow conversion uint64 -> int64 (Confidence: MEDIUM, Severity: HIGH)
+    226: 		}
+  > 227: 		err = writeMember(dst, rel, rc, int64(zf.UncompressedSize64), int64(zf.CompressedSize64), lim, res)
+    228: 		rc.Close()
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/format.go:259] - G115 (CWE-190): integer overflow conversion uint64 -> int64 (Confidence: MEDIUM, Severity: HIGH)
+    258: 		put("aegisproxy.audit.scope_groups", a.ScopeGroups)
+  > 259: 		put("aegisproxy.audit.revision", int64(a.Revision))
+    260: 		put("aegisproxy.audit.hash", a.EventHash)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:240] - G115 (CWE-190): integer overflow conversion uint32 -> byte (Confidence: MEDIUM, Severity: HIGH)
+    239: func appendU32(b []byte, v uint32) []byte {
+  > 240: 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+    241: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:240] - G115 (CWE-190): integer overflow conversion uint32 -> byte (Confidence: MEDIUM, Severity: HIGH)
+    239: func appendU32(b []byte, v uint32) []byte {
+  > 240: 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+    241: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:240] - G115 (CWE-190): integer overflow conversion uint32 -> byte (Confidence: MEDIUM, Severity: HIGH)
+    239: func appendU32(b []byte, v uint32) []byte {
+  > 240: 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+    241: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:238] - G115 (CWE-190): integer overflow conversion uint16 -> byte (Confidence: MEDIUM, Severity: HIGH)
+    237: 
+  > 238: func appendU16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }
+    239: func appendU32(b []byte, v uint32) []byte {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:375] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    374: 	}
+  > 375: 	if err := config(doc, uint64(rev)); err != nil {
+    376: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:246] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    245: 	}
+  > 246: 	if uint64(pkgRev) != knownPkgRev && pkgRev != 0 {
+    247: 		t.pkgDoc = pkgDoc
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:243] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    242: 	t := &pgTx{b: b, tx: tx, rev: uint64(rev), pkgRev: uint64(pkgRev)}
+  > 243: 	if uint64(rev) != knownRev && rev != 0 {
+    244: 		t.doc = doc
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:242] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    241: 	}
+  > 242: 	t := &pgTx{b: b, tx: tx, rev: uint64(rev), pkgRev: uint64(pkgRev)}
+    243: 	if uint64(rev) != knownRev && rev != 0 {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:242] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    241: 	}
+  > 242: 	t := &pgTx{b: b, tx: tx, rev: uint64(rev), pkgRev: uint64(pkgRev)}
+    243: 	if uint64(rev) != knownRev && rev != 0 {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:198] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    197: 	}
+  > 198: 	return uint64(rev), err
+    199: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:189] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    188: 	}
+  > 189: 	return doc, uint64(rev), nil
+    190: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:176] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    175: 	}
+  > 176: 	return uint64(rev), err
+    177: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:167] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    166: 	}
+  > 167: 	return doc, uint64(rev), nil
+    168: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/tlog.go:97] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    96: 	}
+  > 97: 	if err := verifyCheckpoint(log, p.Checkpoint.Envelope, uint64(p.TreeSize), p.RootHash); err != nil {
+    98: 		return time.Time{}, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/tlog.go:94] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    93: 	leaf := sha256.Sum256(append([]byte{0}, e.CanonicalizedBody...))
+  > 94: 	if err := verifyInclusion(uint64(p.LogIndex), uint64(p.TreeSize), leaf[:], p.Hashes, p.RootHash); err != nil {
+    95: 		return time.Time{}, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/tlog.go:94] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    93: 	leaf := sha256.Sum256(append([]byte{0}, e.CanonicalizedBody...))
+  > 94: 	if err := verifyInclusion(uint64(p.LogIndex), uint64(p.TreeSize), leaf[:], p.Hashes, p.RootHash); err != nil {
+    95: 		return time.Time{}, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:320] - G115 (CWE-190): integer overflow conversion int -> uint32 (Confidence: MEDIUM, Severity: HIGH)
+    319: 		buf := make([]byte, 4+len(rec))
+  > 320: 		binary.BigEndian.PutUint32(buf, uint32(len(rec)))
+    321: 		copy(buf[4:], rec)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/threatintel/snapshot.go:90] - G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+    89: 	b.sources = append(b.sources, src)
+  > 90: 	return uint16(len(b.sources) - 1)
+    91: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:116] - G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+    115: 		var out [2]byte
+  > 116: 		binary.BigEndian.PutUint16(out[:], uint16(len(resp)))
+    117: 		if _, err := conn.Write(append(out[:], resp...)); err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/certificate.go:105] - G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+    104: 		msg = append(msg, tbs...)
+  > 105: 		msg = binary.BigEndian.AppendUint16(msg, uint16(len(s.ext)))
+    106: 		msg = append(msg, s.ext...)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/certificate.go:103] - G115 (CWE-190): integer overflow conversion int -> byte (Confidence: MEDIUM, Severity: HIGH)
+    102: 		msg = append(msg, keyHash[:]...)
+  > 103: 		msg = append(msg, byte(len(tbs)>>16), byte(len(tbs)>>8), byte(len(tbs)))
+    104: 		msg = append(msg, tbs...)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/certificate.go:103] - G115 (CWE-190): integer overflow conversion int -> byte (Confidence: MEDIUM, Severity: HIGH)
+    102: 		msg = append(msg, keyHash[:]...)
+  > 103: 		msg = append(msg, byte(len(tbs)>>16), byte(len(tbs)>>8), byte(len(tbs)))
+    104: 		msg = append(msg, tbs...)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/provenance/certificate.go:103] - G115 (CWE-190): integer overflow conversion int -> byte (Confidence: MEDIUM, Severity: HIGH)
+    102: 		msg = append(msg, keyHash[:]...)
+  > 103: 		msg = append(msg, byte(len(tbs)>>16), byte(len(tbs)>>8), byte(len(tbs)))
+    104: 		msg = append(msg, tbs...)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/main.go:400] - G404 (CWE-338): Use of weak random number generator (math/rand or math/rand/v2 instead of crypto/rand) (Confidence: MEDIUM, Severity: HIGH)
+    399: 			FullURL: pick.url, UserAgent: pick.ua, Verdict: res.Verdict, MatchedRuleID: res.MatchedRuleID,
+  > 400: 			MatchedRuleName: res.MatchedRuleName, StatusCode: status, LatencyMs: int64(8 + rand.IntN(75)),
+    401: 			TLSIntercepted: !res.TLSBypass, SessionID: res.SessionID, BlockReason: res.BlockReason,
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/main.go:387] - G404 (CWE-338): Use of weak random number generator (math/rand or math/rand/v2 instead of crypto/rand) (Confidence: MEDIUM, Severity: HIGH)
+    386: 		}
+  > 387: 		pick := samples[rand.IntN(len(samples))]
+    388: 		res := st.Evaluate(engine.EvaluationRequest{
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/export.go:952] - G404 (CWE-338): Use of weak random number generator (math/rand or math/rand/v2 instead of crypto/rand) (Confidence: MEDIUM, Severity: HIGH)
+    951: 		rt.backoff = min(max(rt.backoff*2, time.Second), 5*time.Minute)
+  > 952: 		jitter := time.Duration(rand.Int64N(int64(rt.backoff / 4)))
+    953: 		rt.nextRetry = time.Now().Add(rt.backoff + jitter)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/main.go:122] - G402 (CWE-295): TLS InsecureSkipVerify set to true. (Confidence: HIGH, Severity: HIGH)
+    121: 	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
+  > 122: 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // loopback liveness probe only
+    123: 	}}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:122] - G402 (CWE-295): TLS InsecureSkipVerify may be set to true. (Confidence: LOW, Severity: HIGH)
+    121: func tlsConfig(cfg models.ExportSink, serverName string) (*tls.Config, error) {
+  > 122: 	tc := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName, InsecureSkipVerify: cfg.TLSSkipVerify} //nolint:gosec // explicit, audited admin option
+    123: 	if strings.TrimSpace(cfg.CACertPEM) != "" {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:977] - G704 (CWE-918): SSRF via taint analysis: net/http.NewRequestWithContext (Confidence: HIGH, Severity: HIGH)
+    976: 			"scope": {monitorResource(d.cfg.Endpoint) + "//.default"}, "grant_type": {"client_credentials"}}
+  > 977: 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, authority+"/"+url.PathEscape(d.cfg.TenantID)+"/oauth2/v2.0/token", strings.NewReader(form.Encode()))
+    978: 		if err == nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:970] - G704 (CWE-918): SSRF via taint analysis: net/http.NewRequestWithContext (Confidence: HIGH, Severity: HIGH)
+    969: 			"client_assertion_type": {"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"}, "client_assertion": {strings.TrimSpace(string(assertion))}}
+  > 970: 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, authority+"/"+url.PathEscape(tenant)+"/oauth2/v2.0/token", strings.NewReader(form.Encode()))
+    971: 		if err == nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/main.go:124] - G704 (CWE-918): SSRF via taint analysis: (*net/http.Client).Get (Confidence: HIGH, Severity: HIGH)
+    123: 	}}
+  > 124: 	resp, err := client.Get(fmt.Sprintf("%s://127.0.0.1:%s/%s", scheme, port, endpoint))
+    125: 	if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:985] - G704 (CWE-918): SSRF via taint analysis: (*net/http.Client).Do (Confidence: HIGH, Severity: HIGH)
+    984: 	}
+  > 985: 	resp, err := client.Do(req)
+    986: 	if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/scim.go:27] - G101 (CWE-798): Potential hardcoded credentials (Confidence: LOW, Severity: HIGH)
+    26: const (
+  > 27: 	scimTokenPrefix    = "aegis_scim_"
+    28: 	maxSCIMTokens      = 5
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/oidc/oidc.go:47] - G101 (CWE-798): Potential hardcoded credentials (Confidence: LOW, Severity: HIGH)
+    46: // TokenAuthPrivateKeyJWT authenticates the client with a signed JWT instead of a shared secret.
+  > 47: const TokenAuthPrivateKeyJWT = "private_key_jwt"
+    48: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/models/models.go:666] - G101 (CWE-798): Potential hardcoded credentials (Confidence: LOW, Severity: HIGH)
+    665: // MaskedSecretMarker marks a redacted secret in API responses; sending it back keeps the stored value.
+  > 666: const MaskedSecretMarker = "••••••"
+    667: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/blockpage/blockpage.go:544] - G101 (CWE-798): Potential hardcoded credentials (Confidence: LOW, Severity: HIGH)
+    543: 	}
+  > 544: 	data, _ := json.Marshal(map[string]string{"endpoint": publicURL + "/api/public/requests", "block_token": "v1.preview.preview"})
+    545: 	return map[string]string{
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/auth/token.go:17] - G101 (CWE-798): Potential hardcoded credentials (Confidence: LOW, Severity: HIGH)
+    16: 
+  > 17: const tokenIssuer = "aegisproxy-control-plane"
+    18: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/static.go:46] - G703 (CWE-22): Path traversal via taint analysis: os.Stat (Confidence: HIGH, Severity: HIGH)
+    45: 		target := filepath.Join(abs, clean)
+  > 46: 		if fi, err := os.Stat(target); err != nil || fi.IsDir() {
+    47: 			// SPA fallback: unknown paths render index.html (client-side routing).
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:954] - G703 (CWE-22): Path traversal via taint analysis: os.ReadFile (Confidence: HIGH, Severity: HIGH)
+    953: 		tokenFile := os.Getenv("AZURE_FEDERATED_TOKEN_FILE")
+  > 954: 		assertion, rerr := os.ReadFile(tokenFile)
+    955: 		if tokenFile == "" || rerr != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/config/config.go:151] - G703 (CWE-22): Path traversal via taint analysis: os.ReadFile (Confidence: HIGH, Severity: HIGH)
+    150: 	if p := strings.TrimSpace(os.Getenv(key + "_FILE")); p != "" {
+  > 151: 		b, err := os.ReadFile(p)
+    152: 		if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_verify.go:145] - G118 (CWE-400): Goroutine uses context.Background/TODO while request-scoped context is available (Confidence: MEDIUM, Severity: HIGH)
+    144: 		s.full.passes.Add(1)
+  > 145: 		go s.runCompleteTrail(f, key, path, trigger, s.full.started)
+    146: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:562] - G122 (CWE-367): Filesystem operation in filepath.Walk/WalkDir callback uses race-prone path; consider root-scoped APIs (e.g. os.Root) to prevent symlink TOCTOU traversal (Confidence: MEDIUM, Severity: HIGH)
+    561: 		}
+  > 562: 		_ = os.Lchown(p, uid, gid)
+    563: 		return nil
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/sso_handlers.go:251] - G124 (CWE-614): http.Cookie missing or has insecure Secure, HttpOnly, or SameSite attribute (Confidence: HIGH, Severity: MEDIUM)
+    250: 	}
+  > 251: 	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: "", Path: "/api/auth/sso", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
+    252: 	s.setSessionCookie(w, token, time.Unix(tc.Exp, 0))
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/sso_handlers.go:148] - G124 (CWE-614): http.Cookie missing or has insecure Secure, HttpOnly, or SameSite attribute (Confidence: HIGH, Severity: MEDIUM)
+    147: 	mac.Write([]byte(payload))
+  > 148: 	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)),
+    149: 		Path: "/api/auth/sso", MaxAge: 600, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/sso_handlers.go:114] - G124 (CWE-614): http.Cookie missing or has insecure Secure, HttpOnly, or SameSite attribute (Confidence: HIGH, Severity: MEDIUM)
+    113: 	s.log.Warn("single sign-on failed", "reason", code, "detail", detail, "client_ip", s.clientIP(r))
+  > 114: 	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: "", Path: "/api/auth/sso", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
+    115: 	http.Redirect(w, r, s.consoleURL("/login?sso_error="+url.QueryEscape(code)), http.StatusFound)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/auth_handlers.go:128] - G124 (CWE-614): http.Cookie missing or has insecure Secure, HttpOnly, or SameSite attribute (Confidence: HIGH, Severity: MEDIUM)
+    127: func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+  > 128: 	http.SetCookie(w, &http.Cookie{
+    129: 		Name: sessionCookie, Value: "", Path: "/", Domain: s.cfg.CookieDomain, MaxAge: -1, Expires: time.Unix(0, 0),
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/auth_handlers.go:114] - G124 (CWE-614): http.Cookie missing or has insecure Secure, HttpOnly, or SameSite attribute (Confidence: HIGH, Severity: MEDIUM)
+    113: func (s *Server) setSessionCookie(w http.ResponseWriter, token string, exp time.Time) {
+  > 114: 	http.SetCookie(w, &http.Cookie{
+    115: 		Name:     sessionCookie,
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/policy_handlers.go:1017] - G705 (CWE-79): XSS via taint analysis: io.WriteString (Confidence: HIGH, Severity: MEDIUM)
+    1016: 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+  > 1017: 	_, _ = io.WriteString(w, html)
+    1018: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/policy_handlers.go:1011] - G705 (CWE-79): XSS via taint analysis: io.WriteString (Confidence: HIGH, Severity: MEDIUM)
+    1010: 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+  > 1011: 		_, _ = io.WriteString(w, cli)
+    1012: 		return
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/oidc/clientauth.go:117] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    116: func CertThumbprints(der []byte) (x5t, x5tS256 string) {
+  > 117: 	s1 := sha1.Sum(der)
+    118: 	s256 := sha256.Sum256(der)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/blockpage/blockpage.go:388] - G203 (CWE-79): The used method does not auto-escape HTML. This can potentially lead to 'Cross-site Scripting' vulnerabilities, in case the attacker controls the input. (Confidence: LOW, Severity: MEDIUM)
+    387: 		vm.HasSupport = t.Support.Email != "" || t.Support.Phone != "" || t.Support.URL != ""
+  > 388: 		vm.CSS = template.CSS(css(t))
+    389: 		if threat {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandboxworker/firecracker.go:102] - G204 (CWE-78): Subprocess launched with variable (Confidence: HIGH, Severity: MEDIUM)
+    101: 	// --no-api with a config file boots the VM headless; the serial console (ttyS0) carries the report.
+  > 102: 	cmd := exec.CommandContext(runCtx, bin, "--no-api", "--config-file", cfgPath)
+    103: 	var console bytes.Buffer
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandboxworker/docker.go:78] - G204 (CWE-78): Subprocess launched with variable (Confidence: HIGH, Severity: MEDIUM)
+    77: 	}
+  > 78: 	cmd := exec.CommandContext(runCtx, bin, args...)
+    79: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/exec_linux.go:52] - G204 (CWE-78): Subprocess launched with a potential tainted input or cmd arguments (Confidence: HIGH, Severity: MEDIUM)
+    51: 	full := append(stracePrefix(spec.stracePath, spec.traceFile), spec.argv...)
+  > 52: 	cmd := exec.Command(full[0], full[1:]...)
+    53: 	cmd.Dir = spec.dir
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/store.go:584] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    583: 	}
+  > 584: 	if d, err := os.Open(dir); err == nil {
+    585: 		_ = d.Sync()
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/flowjournal.go:161] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    160: 		next = max(next, seq+1)
+  > 161: 		fh, err := os.Open(path)
+    162: 		if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/flowjournal.go:128] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    127: func syncDir(dir string) {
+  > 128: 	if d, err := os.Open(dir); err == nil {
+    129: 		_ = d.Sync()
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_file_other.go:20] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    19: 	}
+  > 20: 	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+    21: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/util.go:52] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    51: func readTextCapped(abs string, max int64) (string, bool) {
+  > 52: 	f, err := os.Open(abs)
+    53: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:273] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    272: 	out := map[string]string{}
+  > 273: 	raw, err := os.ReadFile(filepath.Join(pkgDir, "package.json"))
+    274: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:189] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    188: func parseTraceFile(path string) []Event {
+  > 189: 	f, err := os.Open(path)
+    190: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/kinds.go:103] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    102: func readHead(abs string, n int) []byte {
+  > 103: 	f, err := os.Open(abs)
+    104: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/input.go:34] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    33: 	}
+  > 34: 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+    35: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:259] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    258: 	// Never honor exotic modes from the archive; the file is for inspection only.
+  > 259: 	out, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o644)
+    260: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:115] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    114: 	}
+  > 115: 	f, err := os.Open(srcPath)
+    116: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/packages/reportstore.go:58] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    57: 	}
+  > 58: 	b, err := os.ReadFile(filepath.Join(r.dir, key+".json"))
+    59: 	if errors.Is(err, os.ErrNotExist) {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:239] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    238: func readSegment(path string, from int64, fn func(rec []byte)) error {
+  > 239: 	f, err := os.Open(path)
+    240: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:203] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    202: func countRecords(path string, start int64) (int64, int64, error) {
+  > 203: 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+    204: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:195] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    194: func syncDir(dir string) {
+  > 195: 	if d, err := os.Open(dir); err == nil {
+    196: 		_ = d.Sync()
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:170] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    169: 	tmp := path + ".tmp"
+  > 170: 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+    171: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:131] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    130: 	var cur spoolCursor
+  > 131: 	if b, err := os.ReadFile(filepath.Join(dir, "cursor")); err == nil {
+    132: 		_ = json.Unmarshal(b, &cur)
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:101] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    100: 	}
+  > 101: 	if b, err := os.ReadFile(filepath.Join(dir, legacyFile)); err == nil {
+    102: 		s.legacyKey = string(b)
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:93] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    92: 	metaPath := filepath.Join(dir, "signature")
+  > 93: 	if old, err := os.ReadFile(metaPath); err == nil && string(old) != spoolVersion {
+    94: 		if err := writeFileSync(filepath.Join(dir, legacyFile), []byte(legacyEncoding(string(old)))); err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/replay.go:49] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    48: func readCursor(path string) (auditMark, error) {
+  > 49: 	b, err := os.ReadFile(path)
+    50: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:954] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    953: 		tokenFile := os.Getenv("AZURE_FEDERATED_TOKEN_FILE")
+  > 954: 		assertion, rerr := os.ReadFile(tokenFile)
+    955: 		if tokenFile == "" || rerr != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/deadletter_unix.go:12] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    11: func openAppendNoFollow(path string) (*os.File, error) {
+  > 12: 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+    13: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/config/config.go:162] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    161: func loadOrCreateSecret(path string) (string, bool, error) {
+  > 162: 	if b, err := os.ReadFile(path); err == nil {
+    163: 		if s := strings.TrimSpace(string(b)); len(s) >= minSecretLen {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/config/config.go:151] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    150: 	if p := strings.TrimSpace(os.Getenv(key + "_FILE")); p != "" {
+  > 151: 		b, err := os.ReadFile(p)
+    152: 		if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/pki.go:148] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    147: func ImportSignedCA(certsDir, certPath, chainPath string) (*x509.Certificate, error) {
+  > 148: 	keyPEM, err := os.ReadFile(filepath.Join(certsDir, pendingKey))
+    149: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/pki.go:126] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    125: 		// DER (AD CS "Base 64 / DER" downloads)
+  > 126: 		raw, _ := os.ReadFile(path)
+    127: 		if c, err := x509.ParseCertificate(raw); err == nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/pki.go:104] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    103: func readCerts(path string) ([]*x509.Certificate, error) {
+  > 104: 	data, err := os.ReadFile(path)
+    105: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/ca.go:49] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    48: 
+  > 49: 	if data, err := os.ReadFile(certPEMPath); err == nil && len(data) > 0 {
+    50: 		block, _ := pem.Decode(data)
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/dataplane_handlers.go:360] - G110 (CWE-409): Potential DoS vulnerability via decompression bomb (Confidence: MEDIUM, Severity: MEDIUM)
+    359: 	}
+  > 360: 	_, _ = io.Copy(w, zr)
+    361: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/oidc/oidctest/idp.go:80] - G710 (CWE): Open redirect via taint analysis: net/http.Redirect (Confidence: HIGH, Severity: MEDIUM)
+    79: 		idp.mu.Unlock()
+  > 80: 		http.Redirect(w, r, q.Get("redirect_uri")+"?code="+url.QueryEscape(code)+"&state="+url.QueryEscape(q.Get("state")), http.StatusFound)
+    81: 	})
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/export.go:166] - G117 (CWE-499): Marshaled struct field "Secret" (JSON key "secret") matches secret pattern (Confidence: MEDIUM, Severity: MEDIUM)
+    165: 	s.UpdatedAt, s.UpdatedBy, s.Name = nil, "", ""
+  > 166: 	b, _ := json.Marshal(s)
+    167: 	h := sha256.Sum256(b)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:229] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    228: 	// installs the wheel/sdist file). It is already digest-verified, so let uid 1000 read it.
+  > 229: 	_ = os.Chmod(ctx.artifactPath, 0o644)
+    230: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:259] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    258: 	// Never honor exotic modes from the archive; the file is for inspection only.
+  > 259: 	out, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o644)
+    260: 	if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:1253] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    1252: 	}
+  > 1253: 	f, err := os.OpenFile(d.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+    1254: 	if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:239] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    238: 	_ = os.MkdirAll(ctx.siteDir, 0o755)
+  > 239: 	_ = os.MkdirAll(ctx.traceDir, 0o755)
+    240: 
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:238] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    237: 	}
+  > 238: 	_ = os.MkdirAll(ctx.siteDir, 0o755)
+    239: 	_ = os.MkdirAll(ctx.traceDir, 0o755)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:232] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    231: 	// Home + decoys.
+  > 232: 	if err := os.MkdirAll(ctx.home, 0o755); err != nil {
+    233: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:202] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    201: 	obs := func(path string, mode os.FileMode, data []byte) error {
+  > 202: 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+    203: 			return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:109] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    108: 	_ = os.RemoveAll(extractRoot)
+  > 109: 	if err := os.MkdirAll(extractRoot, 0o755); err != nil {
+    110: 		rep.Errors = append(rep.Errors, "mkdir extract: "+err.Error())
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:83] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    82: 
+  > 83: 	if err := os.MkdirAll(workRoot, 0o755); err != nil {
+    84: 		rep.Errors = append(rep.Errors, "mkdir work: "+err.Error())
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:524] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    523: func writeNugetStub(dir string, props, targets []string) error {
+  > 524: 	if err := os.MkdirAll(dir, 0o755); err != nil {
+    525: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:415] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    414: 		stubDir := filepath.Join("/work", "psstubs")
+  > 415: 		_ = os.MkdirAll(stubDir, 0o755)
+    416: 		_ = chownR(stubDir, unprivUID, unprivGID)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/init_linux.go:29] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    28: 	for _, m := range mounts {
+  > 29: 		_ = os.MkdirAll(m.target, 0o755)
+    30: 		if err := unix.Mount(m.source, m.target, m.fstype, m.flags, ""); err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/canary.go:150] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    149: 		abs := filepath.Join(d.Home, filepath.FromSlash(f.rel))
+  > 150: 		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+    151: 			return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:255] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    254: 	abs := filepath.Join(dst, rel)
+  > 255: 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+    256: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:202] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    201: 			if rel, ok := safeRel(name); ok {
+  > 202: 				_ = os.MkdirAll(filepath.Join(dst, rel), 0o755)
+    203: 			}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:156] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    155: 		case tar.TypeDir:
+  > 156: 			_ = os.MkdirAll(filepath.Join(dst, rel), 0o755)
+    157: 			continue
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/ca.go:143] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    142: func (m *CAManager) WritePublic(dir string) error {
+  > 143: 	if err := os.MkdirAll(dir, 0o755); err != nil {
+    144: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/runner.go:243] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    242: 	resolv := []byte("nameserver 127.0.0.53\noptions timeout:1 attempts:1 single-request\n")
+  > 243: 	if err := os.WriteFile("/etc/resolv.conf", resolv, 0o644); err != nil {
+    244: 		logf("resolv.conf: %v (continuing)", err)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/phases.go:543] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    542: `
+  > 543: 	return os.WriteFile(filepath.Join(dir, "stub.csproj"), []byte(csproj), 0o644)
+    544: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/pki.go:225] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    224: 	for name, data := range map[string][]byte{"mitmproxy-ca-cert.pem": certOnly.Bytes(), "aegis-enterprise-ca.crt": certOnly.Bytes(), "aegis-enterprise-ca.der": leaf.Raw} {
+  > 225: 		if err := os.WriteFile(filepath.Join(certsDir, name), data, 0o644); err != nil {
+    226: 			return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/pki.go:97] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    96: 	csrPath := filepath.Join(certsDir, "pending.csr")
+  > 97: 	if err := os.WriteFile(csrPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), 0o644); err != nil {
+    98: 		return "", err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/ca.go:147] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    146: 	for name, data := range map[string][]byte{"mitmproxy-ca-cert.pem": m.CertPEM, "aegis-enterprise-ca.crt": m.CertPEM, "aegis-enterprise-ca.der": m.CertDER} {
+  > 147: 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+    148: 			return fmt.Errorf("write CA certificate: %w", err)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/ca/ca.go:129] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    128: 	for path, data := range map[string][]byte{certPEMPath: m.CertPEM, certCRTPath: m.CertPEM, certDERPath: m.CertDER} {
+  > 129: 		if err := os.WriteFile(path, data, 0o644); err != nil {
+    130: 			return fmt.Errorf("write CA certificate: %w", err)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/oidc/clientauth.go:14] - G505 (CWE-327): Blocklisted import crypto/sha1: weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    13: 	"crypto/rsa"
+  > 14: 	"crypto/sha1" // x5t is defined as the SHA-1 certificate thumbprint (RFC 7515 section 4.1.7)
+    15: 	"crypto/sha256"
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/main.go:128] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    127: 	}
+  > 128: 	resp.Body.Close()
+    129: 	if resp.StatusCode != http.StatusOK {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/threatintel/manager.go:579] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    578: 	if err := tmp.Sync(); err != nil {
+  > 579: 		tmp.Close()
+    580: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/threatintel/manager.go:575] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    574: 	if _, err := tmp.Write(data); err != nil {
+  > 575: 		tmp.Close()
+    576: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/threatintel/manager.go:571] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    570: 	if err := tmp.Chmod(0o600); err != nil {
+  > 571: 		tmp.Close()
+    572: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/store.go:586] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    585: 		_ = d.Sync()
+  > 586: 		d.Close()
+    587: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/store.go:570] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    569: 	if err := tmp.Sync(); err != nil {
+  > 570: 		tmp.Close()
+    571: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/store.go:566] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    565: 	if _, err := tmp.Write(data); err != nil {
+  > 566: 		tmp.Close()
+    567: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/store.go:562] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    561: 	if err := tmp.Chmod(0o600); err != nil {
+  > 562: 		tmp.Close()
+    563: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:239] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    238: 	if err := tx.QueryRow(ctx, "SELECT revision, doc FROM aegis_package_work WHERE id = 1 FOR UPDATE").Scan(&pkgRev, &pkgDoc); err != nil {
+  > 239: 		tx.Rollback(ctx)
+    240: 		return nil, fmt.Errorf("read work-store under write lock: %w", err)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:233] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    232: 	if err := tx.QueryRow(ctx, "SELECT revision, doc FROM aegis_config WHERE id = 1 FOR UPDATE").Scan(&rev, &doc); err != nil {
+  > 233: 		tx.Rollback(ctx)
+    234: 		return nil, fmt.Errorf("acquire cluster write lock: %w", err)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:225] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    224: 	if _, err := tx.Exec(ctx, `INSERT INTO aegis_package_work (id, revision, doc) VALUES (1, 0, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`); err != nil {
+  > 225: 		tx.Rollback(ctx)
+    226: 		return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:221] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    220: 	if _, err := tx.Exec(ctx, `INSERT INTO aegis_config (id, revision, doc) VALUES (1, 0, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`); err != nil {
+  > 221: 		tx.Rollback(ctx)
+    222: 		return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/postgres.go:217] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    216: 	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '10s'"); err != nil {
+  > 217: 		tx.Rollback(ctx)
+    218: 		return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/flowjournal.go:180] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    179: 		}
+  > 180: 		fh.Close()
+    181: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/flowjournal.go:130] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    129: 		_ = d.Sync()
+  > 130: 		d.Close()
+    131: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/cluster.go:624] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    623: 		case <-fast.C:
+  > 624: 			s.flushTelemetry(ctx)
+    625: 			s.pullTelemetry(ctx)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/cluster.go:620] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    619: 			flushCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
+  > 620: 			s.flushTelemetry(flushCtx)
+    621: 			c()
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_trail.go:356] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    355: 		if drop[g] {
+  > 356: 			g.f.Close()
+    357: 		} else {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_trail.go:123] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    122: 	for _, t := range files {
+  > 123: 		t.f.Close()
+    124: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_trail.go:34] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    33: 	if !fi.Mode().IsRegular() {
+  > 34: 		f.Close()
+    35: 		return nil, &fs.PathError{Op: "open", Path: f.Name(), Err: errNotRegularFile}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_trail.go:30] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    29: 	if err != nil {
+  > 30: 		f.Close()
+    31: 		return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit_anchor.go:533] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    532: 	})
+  > 533: 	pr.Close()
+    534: 	if err == nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit.go:571] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    570: 	if err := f.Sync(); err != nil {
+  > 571: 		f.Close()
+    572: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit.go:469] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    468: 	}
+  > 469: 	in.Close()
+    470: 	if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit.go:244] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    243: 	if err != nil {
+  > 244: 		f.Close()
+    245: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/store/audit.go:233] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    232: 	if err != nil {
+  > 233: 		f.Close()
+    234: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandboxworker/worker.go:198] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    197: 	}
+  > 198: 	resp.Body.Close()
+    199: }
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandboxworker/worker.go:168] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    167: 			if resp, err := w.cp.Do(req); err == nil {
+  > 168: 				resp.Body.Close()
+    169: 			}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/sinks.go:180] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    179: 	for _, ln := range s.listeners {
+  > 180: 		ln.Close()
+    181: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/sinks.go:74] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    73: 	if s.srvTLS != nil {
+  > 74: 		s.srvTLS.Close()
+    75: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/sinks.go:71] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    70: 	if s.srvPlain != nil {
+  > 71: 		s.srvPlain.Close()
+    72: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/init_linux.go:83] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    82: 		for {
+  > 83: 			unix.Pause()
+    84: 		}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/init_linux.go:61] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    60: 	mask, _ := unix.NewIfreq("lo")
+  > 61: 	mask.SetInet4Addr([]byte{255, 0, 0, 0})
+    62: 	_ = unix.IoctlIfreq(fd, unix.SIOCSIFNETMASK, mask)
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/init_linux.go:56] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    55: 	}
+  > 56: 	ifreq.SetInet4Addr([]byte{127, 0, 0, 1})
+    57: 	if err := unix.IoctlIfreq(fd, unix.SIOCSIFADDR, ifreq); err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:66] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    65: 	if s.tcp != nil {
+  > 66: 		s.tcp.Close()
+    67: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:63] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    62: 	if s.udp != nil {
+  > 63: 		s.udp.Close()
+    64: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/dns.go:37] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    36: 			if s.udp != nil {
+  > 37: 				s.udp.Close()
+    38: 			}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:278] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    277: 		if remainingTotal <= 0 {
+  > 278: 			out.Close()
+    279: 			return errTotalCap
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/sandbox/runner/archive.go:228] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    227: 		err = writeMember(dst, rel, rc, int64(zf.UncompressedSize64), int64(zf.CompressedSize64), lim, res)
+  > 228: 		rc.Close()
+    229: 		if err != nil {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:420] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    419: 		}
+  > 420: 		f.Close()
+    421: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:402] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    401: 		if _, err := f.Seek(start, io.SeekStart); err != nil {
+  > 402: 			f.Close()
+    403: 			return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:197] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    196: 		_ = d.Sync()
+  > 197: 		d.Close()
+    198: 	}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:179] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    178: 	if err := f.Sync(); err != nil {
+  > 179: 		f.Close()
+    180: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/spool.go:175] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    174: 	if _, err := f.Write(data); err != nil {
+  > 175: 		f.Close()
+    176: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:396] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    395: 	if d.conn != nil {
+  > 396: 		d.conn.Close()
+    397: 		d.conn = nil
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:385] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    384: 	if err := flush(); err != nil {
+  > 385: 		d.conn.Close()
+    386: 		d.conn = nil
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:378] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    377: 			if err := flush(); err != nil {
+  > 378: 				d.conn.Close()
+    379: 				d.conn = nil
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:363] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    362: 			if _, err := d.conn.Write(r); err != nil {
+  > 363: 				d.conn.Close()
+    364: 				d.conn = nil
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/drivers.go:328] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    327: 		if err := tc.HandshakeContext(hctx); err != nil {
+  > 328: 			c.Close()
+    329: 			return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/deadletter.go:59] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    58: 	if err := f.Sync(); err != nil {
+  > 59: 		f.Close()
+    60: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/deadletter.go:55] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    54: 	if _, err := f.Write(line); err != nil {
+  > 55: 		f.Close()
+    56: 		return err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/deadletter.go:26] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    25: 	if !fi.Mode().IsRegular() {
+  > 26: 		f.Close()
+    27: 		return nil, &fs.PathError{Op: "open", Path: f.Name(), Err: errNotRegular}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/export/deadletter.go:22] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    21: 	if err != nil {
+  > 22: 		f.Close()
+    23: 		return nil, err
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/defender/defender.go:208] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    207: 		}
+  > 208: 		resp.Body.Close()
+    209: 		select {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/defender/defender.go:166] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    165: 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+  > 166: 		resp.Body.Close()
+    167: 		switch {
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/auth_handlers.go:214] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    213: 		if !viaCookie || s.csrfOK(r) {
+  > 214: 			s.store.RevokeToken(claims.JTI, time.Unix(claims.Exp, 0))
+    215: 		}
+
+Autofix: 
+
+[/home/manu/Dokumente/mitmproxy/control-plane/internal/api/admin_handlers.go:428] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    427: 	if p := parsed.Port(); p != "" {
+  > 428: 		fmt.Sscanf(p, "%d", &port)
+    429: 	}
+
+Autofix: 
+
+Summary:
+  Gosec  : dev
+  Files  : 183
+  Lines  : 57308
+  Nosec  : 0
+  Issues : 172
+
