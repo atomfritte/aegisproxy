@@ -152,7 +152,7 @@ type Store struct {
 	state       StateSnapshot
 	compiledIdx *engine.CompiledPolicyIndex
 	// bundleGen increments whenever a data-plane-bundle input is recompiled (buildIndexLocked); it does
-	// NOT move on work-store churn (bumpConfigLocked), so the bundle handler can cache the built bundle.
+	// NOT move on work-store churn (bumpPackageWorkLocked), so the bundle handler can cache the built bundle.
 	bundleGen   uint64
 	ruleIndex   map[string]int
 	quarantined map[string]bool
@@ -168,6 +168,11 @@ type Store struct {
 
 	saveSignal chan struct{}
 	dirty      bool // state changed without a config revision bump (last login, ...): saved within a second
+	// pkgWorkRev is the package work-store's own revision (requests/assessments/jobs). It advances
+	// independently of the configuration revision so work-store churn does not re-serialize or
+	// re-replicate the configuration document. pkgWorkDirty flags an unpersisted work-store change.
+	pkgWorkRev   uint64
+	pkgWorkDirty bool
 	// telemetryDirty marks new traffic records only: the flow window is saved at most every
 	// telemetryPersistInterval, so busy proxies do not rewrite the state file every second.
 	telemetryDirty bool
@@ -457,12 +462,15 @@ func (s *Store) markDirtyLocked() {
 	}
 }
 
-// bumpConfigLocked persists a configuration change that does not affect the data-plane bundle or the
-// policy index (the package firewall's work-store: requests, assessments, analysis jobs). It bumps the
-// revision so cluster peers reload the document, but skips the rule/index recompile. The data-plane
-// bundle ETag ignores the revision, so the workers are not resynced. Callers hold s.mu.
-func (s *Store) bumpConfigLocked() {
-	s.state.Revision++
+// bumpPackageWorkLocked records a package work-store change (requests, assessments, analysis jobs). It
+// advances the work-store revision — NOT the configuration revision — so the change travels in the
+// separate work-store document: it does not re-serialize/re-replicate the configuration, does not
+// recompile the policy index, and (the ETag ignores it anyway) does not resync the data-plane. The
+// combined revision exposed to the console still moves (GetStateRevision), so the UI refreshes. Callers
+// hold s.mu.
+func (s *Store) bumpPackageWorkLocked() {
+	s.pkgWorkRev++
+	s.pkgWorkDirty = true
 	s.markDirtyLocked()
 }
 
@@ -913,6 +921,15 @@ func (s *Store) GetRevision() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.Revision
+}
+
+// GetStateRevision is the composite revision for the console (/api/state): it advances on any
+// configuration OR package work-store change, so the UI refreshes on either. Cluster replication and the
+// data-plane bundle use the configuration revision (GetRevision) and the work-store revision separately.
+func (s *Store) GetStateRevision() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Revision + s.pkgWorkRev
 }
 
 // BundleGeneration increments whenever a data-plane-bundle input changes (policy, groups, servers,

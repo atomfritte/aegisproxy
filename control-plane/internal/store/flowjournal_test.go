@@ -173,16 +173,20 @@ type memCluster struct {
 	mu      sync.Mutex
 	doc     []byte
 	rev     uint64
+	pkgDoc  []byte
+	pkgRev  uint64
 	audits  []models.AuditEvent
 	flows   []models.TrafficFlow
 	pushErr error
 }
 
 type memTx struct {
-	c    *memCluster
-	doc  []byte // stored document at BeginWrite (nil when unchanged)
-	rev  uint64
-	done bool
+	c      *memCluster
+	doc    []byte // stored config document at BeginWrite (nil when unchanged)
+	rev    uint64
+	pkgDoc []byte // stored work-store document at BeginWrite (nil when unchanged)
+	pkgRev uint64
+	done   bool
 }
 
 func (c *memCluster) Name() string   { return "memory" }
@@ -197,18 +201,47 @@ func (c *memCluster) StoredRevision(context.Context) (uint64, error) {
 	defer c.mu.Unlock()
 	return c.rev, nil
 }
-func (c *memCluster) BeginWrite(_ context.Context, known uint64) (ClusterTx, error) {
+func (c *memCluster) LoadPackageWork(context.Context) ([]byte, uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pkgRev == 0 {
+		return nil, 0, nil
+	}
+	return c.pkgDoc, c.pkgRev, nil
+}
+func (c *memCluster) StoredPackageWorkRevision(context.Context) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pkgRev, nil
+}
+func (c *memCluster) BeginWrite(_ context.Context, known, knownPkg uint64) (ClusterTx, error) {
 	c.mu.Lock() // released by Commit or Rollback
-	tx := &memTx{c: c, rev: c.rev}
+	tx := &memTx{c: c, rev: c.rev, pkgRev: c.pkgRev}
 	if c.rev != known {
 		tx.doc = c.doc
 	}
+	if c.pkgRev != knownPkg && c.pkgRev != 0 {
+		tx.pkgDoc = c.pkgDoc
+	}
 	return tx, nil
 }
-func (c *memCluster) RecentAudit(context.Context, int) ([]models.AuditEvent, error) {
+func (c *memCluster) RecentAudit(_ context.Context, limit int) ([]models.AuditEvent, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]models.AuditEvent(nil), c.audits...), nil
+	return recentAuditDesc(c.audits, limit), nil
+}
+
+// recentAuditDesc returns the newest `limit` events, newest first — matching the Postgres backend
+// (ORDER BY seq DESC LIMIT n), so the two-node harness exercises the real audit-checkpoint handshake.
+func recentAuditDesc(audits []models.AuditEvent, limit int) []models.AuditEvent {
+	out := make([]models.AuditEvent, 0, len(audits))
+	for i := len(audits) - 1; i >= 0; i-- {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		out = append(out, audits[i])
+	}
+	return out
 }
 func (c *memCluster) StreamAudit(context.Context, func([]byte) error) error { return nil }
 func (c *memCluster) RecentFlows(context.Context, int) ([]models.TrafficFlow, int64, error) {
@@ -246,20 +279,27 @@ func (c *memCluster) Prune(context.Context, time.Duration, time.Duration) error 
 func (c *memCluster) Listen(ctx context.Context, _ func(uint64)) { <-ctx.Done() }
 func (c *memCluster) Close()                                     {}
 
-func (tx *memTx) StoredDoc() []byte      { return tx.doc }
-func (tx *memTx) StoredRevision() uint64 { return tx.rev }
-func (tx *memTx) RecentAudit(context.Context, int) ([]models.AuditEvent, error) {
-	return append([]models.AuditEvent(nil), tx.c.audits...), nil
+func (tx *memTx) StoredDoc() []byte                 { return tx.doc }
+func (tx *memTx) StoredRevision() uint64            { return tx.rev }
+func (tx *memTx) StoredPackageWorkDoc() []byte      { return tx.pkgDoc }
+func (tx *memTx) StoredPackageWorkRevision() uint64 { return tx.pkgRev }
+func (tx *memTx) RecentAudit(_ context.Context, limit int) ([]models.AuditEvent, error) {
+	return recentAuditDesc(tx.c.audits, limit), nil
 }
 func (tx *memTx) ImportAudit(_ context.Context, audits []models.AuditEvent) error {
 	tx.c.audits = append(tx.c.audits, audits...)
 	return nil
 }
-func (tx *memTx) Commit(_ context.Context, doc []byte, rev uint64, audits []models.AuditEvent) error {
+func (tx *memTx) Commit(_ context.Context, doc []byte, rev uint64, audits []models.AuditEvent, pkgDoc []byte, pkgRev uint64) error {
 	if tx.done {
 		return errors.New("transaction finished")
 	}
-	tx.c.doc, tx.c.rev = doc, rev
+	if doc != nil {
+		tx.c.doc, tx.c.rev = doc, rev
+	}
+	if pkgDoc != nil {
+		tx.c.pkgDoc, tx.c.pkgRev = pkgDoc, pkgRev
+	}
 	tx.c.audits = append(tx.c.audits, audits...)
 	tx.done = true
 	tx.c.mu.Unlock()

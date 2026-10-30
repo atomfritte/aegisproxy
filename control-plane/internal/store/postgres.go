@@ -23,6 +23,16 @@ CREATE TABLE IF NOT EXISTS aegis_config (
 	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_by  TEXT NOT NULL DEFAULT ''
 );
+-- The package firewall's high-churn work-store (requests, assessments, analysis jobs), kept out of
+-- aegis_config so its writes do not re-serialize/re-replicate the configuration document. Written in the
+-- same transaction as aegis_config (the aegis_config FOR UPDATE lock serializes both).
+CREATE TABLE IF NOT EXISTS aegis_package_work (
+	id          SMALLINT PRIMARY KEY CHECK (id = 1),
+	revision    BIGINT NOT NULL,
+	doc         JSONB NOT NULL,
+	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_by  TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS aegis_audit (
 	seq         BIGSERIAL PRIMARY KEY,
 	id          TEXT NOT NULL UNIQUE,
@@ -166,15 +176,39 @@ func (b *PostgresBackend) StoredRevision(ctx context.Context) (uint64, error) {
 	return uint64(rev), err
 }
 
-type pgTx struct {
-	b      *PostgresBackend
-	tx     pgx.Tx
-	rev    uint64
-	doc    []byte
-	closed bool
+func (b *PostgresBackend) LoadPackageWork(ctx context.Context) ([]byte, uint64, error) {
+	var rev int64
+	var doc []byte
+	err := b.pool.QueryRow(ctx, "SELECT revision, doc FROM aegis_package_work WHERE id = 1").Scan(&rev, &doc)
+	if errors.Is(err, pgx.ErrNoRows) || rev == 0 {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return doc, uint64(rev), nil
 }
 
-func (b *PostgresBackend) BeginWrite(ctx context.Context, knownRev uint64) (ClusterTx, error) {
+func (b *PostgresBackend) StoredPackageWorkRevision(ctx context.Context) (uint64, error) {
+	var rev int64
+	err := b.pool.QueryRow(ctx, "SELECT revision FROM aegis_package_work WHERE id = 1").Scan(&rev)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return uint64(rev), err
+}
+
+type pgTx struct {
+	b       *PostgresBackend
+	tx      pgx.Tx
+	rev     uint64
+	doc     []byte
+	pkgRev  uint64
+	pkgDoc  []byte
+	closed  bool
+}
+
+func (b *PostgresBackend) BeginWrite(ctx context.Context, knownRev, knownPkgRev uint64) (ClusterTx, error) {
 	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
@@ -187,21 +221,38 @@ func (b *PostgresBackend) BeginWrite(ctx context.Context, knownRev uint64) (Clus
 		tx.Rollback(ctx)
 		return nil, err
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO aegis_package_work (id, revision, doc) VALUES (1, 0, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`); err != nil {
+		tx.Rollback(ctx)
+		return nil, err
+	}
 	var rev int64
 	var doc []byte
+	// FOR UPDATE on aegis_config is the cluster-wide write lock; the work-store row is read in the same
+	// locked transaction so the writer sees the latest work-store before mutating (job-lease coordination).
 	if err := tx.QueryRow(ctx, "SELECT revision, doc FROM aegis_config WHERE id = 1 FOR UPDATE").Scan(&rev, &doc); err != nil {
 		tx.Rollback(ctx)
 		return nil, fmt.Errorf("acquire cluster write lock: %w", err)
 	}
-	t := &pgTx{b: b, tx: tx, rev: uint64(rev)}
+	var pkgRev int64
+	var pkgDoc []byte
+	if err := tx.QueryRow(ctx, "SELECT revision, doc FROM aegis_package_work WHERE id = 1 FOR UPDATE").Scan(&pkgRev, &pkgDoc); err != nil {
+		tx.Rollback(ctx)
+		return nil, fmt.Errorf("read work-store under write lock: %w", err)
+	}
+	t := &pgTx{b: b, tx: tx, rev: uint64(rev), pkgRev: uint64(pkgRev)}
 	if uint64(rev) != knownRev && rev != 0 {
 		t.doc = doc
+	}
+	if uint64(pkgRev) != knownPkgRev && pkgRev != 0 {
+		t.pkgDoc = pkgDoc
 	}
 	return t, nil
 }
 
-func (t *pgTx) StoredDoc() []byte      { return t.doc }
-func (t *pgTx) StoredRevision() uint64 { return t.rev }
+func (t *pgTx) StoredDoc() []byte                 { return t.doc }
+func (t *pgTx) StoredRevision() uint64            { return t.rev }
+func (t *pgTx) StoredPackageWorkDoc() []byte      { return t.pkgDoc }
+func (t *pgTx) StoredPackageWorkRevision() uint64 { return t.pkgRev }
 
 func (t *pgTx) RecentAudit(ctx context.Context, limit int) ([]models.AuditEvent, error) {
 	return queryAudit(ctx, t.tx, limit)
@@ -248,13 +299,25 @@ func (t *pgTx) ImportAudit(ctx context.Context, audits []models.AuditEvent) erro
 	return nil
 }
 
-func (t *pgTx) Commit(ctx context.Context, doc []byte, rev uint64, audits []models.AuditEvent) error {
-	if rev <= t.rev {
-		return fmt.Errorf("refusing to commit non-increasing revision %d (stored %d)", rev, t.rev)
+func (t *pgTx) Commit(ctx context.Context, doc []byte, rev uint64, audits []models.AuditEvent, pkgDoc []byte, pkgRev uint64) error {
+	// The configuration row is rewritten only when it changed (doc != nil); likewise the work-store row.
+	if doc != nil {
+		if rev <= t.rev {
+			return fmt.Errorf("refusing to commit non-increasing revision %d (stored %d)", rev, t.rev)
+		}
+		if _, err := t.tx.Exec(ctx, "UPDATE aegis_config SET revision = $1, doc = $2, updated_at = now(), updated_by = $3 WHERE id = 1",
+			int64(rev), doc, t.b.nodeID); err != nil {
+			return err
+		}
 	}
-	if _, err := t.tx.Exec(ctx, "UPDATE aegis_config SET revision = $1, doc = $2, updated_at = now(), updated_by = $3 WHERE id = 1",
-		int64(rev), doc, t.b.nodeID); err != nil {
-		return err
+	if pkgDoc != nil {
+		if pkgRev <= t.pkgRev {
+			return fmt.Errorf("refusing to commit non-increasing work-store revision %d (stored %d)", pkgRev, t.pkgRev)
+		}
+		if _, err := t.tx.Exec(ctx, "UPDATE aegis_package_work SET revision = $1, doc = $2, updated_at = now(), updated_by = $3 WHERE id = 1",
+			int64(pkgRev), pkgDoc, t.b.nodeID); err != nil {
+			return err
+		}
 	}
 	if len(audits) > 0 {
 		batch := &pgx.Batch{}
@@ -271,8 +334,10 @@ func (t *pgTx) Commit(ctx context.Context, doc []byte, rev uint64, audits []mode
 			return fmt.Errorf("append audit events: %w", err)
 		}
 	}
-	if _, err := t.tx.Exec(ctx, "SELECT pg_notify($1, $2)", pgNotifyChannel, fmt.Sprint(rev)); err != nil {
-		return err
+	if doc != nil {
+		if _, err := t.tx.Exec(ctx, "SELECT pg_notify($1, $2)", pgNotifyChannel, fmt.Sprint(rev)); err != nil {
+			return err
+		}
 	}
 	t.closed = true
 	return t.tx.Commit(ctx)

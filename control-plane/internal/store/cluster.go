@@ -49,8 +49,9 @@ func (s *Store) withWrite(fn func() error) error {
 
 	s.mu.RLock()
 	known := s.state.Revision
+	knownPkg := s.pkgWorkRev
 	s.mu.RUnlock()
-	tx, err := s.cluster.BeginWrite(ctx, known)
+	tx, err := s.cluster.BeginWrite(ctx, known, knownPkg)
 	if err != nil {
 		s.log.Error("cluster write lock failed", "error", err)
 		return fmt.Errorf("%w: %v", ErrClusterUnavailable, err)
@@ -75,38 +76,71 @@ func (s *Store) withWrite(fn func() error) error {
 		s.state.AuditEvents = audits
 		s.checkClusterAuditLocked() // anchor and checkpoint against the trail read in this transaction
 	}
+	// Refresh the work-store to the latest committed under this same lock, so a mutation that claims a
+	// sandbox job or decides a request sees the newest work-store (cross-node coordination).
+	if pkgDoc := tx.StoredPackageWorkDoc(); pkgDoc != nil {
+		if err := s.applyPackageWorkDocLocked(pkgDoc, tx.StoredPackageWorkRevision()); err != nil {
+			return err
+		}
+	}
 	before, err := s.configDocLocked()
 	if err != nil {
 		return err
 	}
+	beforePkg, err := s.packageWorkDocLocked()
+	if err != nil {
+		return err
+	}
 	startRev := s.state.Revision
+	startPkgRev := s.pkgWorkRev
 	s.pendingAudit = nil
 	s.dirty = false
+	s.pkgWorkDirty = false
 	s.reportAuditViolationsLocked() // committed with this write
 
 	fnErr := fn()
-	changed := s.state.Revision != startRev || len(s.pendingAudit) > 0 || s.dirty
-	if !changed {
+	configChanged := s.state.Revision != startRev || len(s.pendingAudit) > 0
+	pkgChanged := s.pkgWorkRev != startPkgRev || s.pkgWorkDirty
+	if !configChanged && !pkgChanged {
 		s.pendingAudit = nil
 		return fnErr
 	}
-	if fnErr != nil {
-		// Partial mutation before an error: restore the pre-mutation configuration.
+	restore := func() {
 		_ = s.applyConfigDocLocked(before, startRev)
+		_ = s.applyPackageWorkDocLocked(beforePkg, startPkgRev)
 		s.dropPendingAuditLocked()
+	}
+	if fnErr != nil {
+		// Partial mutation before an error: restore the pre-mutation config and work-store.
+		restore()
 		return fnErr
 	}
-	if s.state.Revision == startRev {
-		s.rebuildIndexLocked()
+	// Only the documents that actually changed are committed (and rewritten); the other row is untouched.
+	var cfgDoc, pkgCommitDoc []byte
+	cfgRev, pkgCommitRev := s.state.Revision, s.pkgWorkRev
+	if configChanged {
+		if s.state.Revision == startRev {
+			s.rebuildIndexLocked()
+			cfgRev = s.state.Revision
+		}
+		if cfgDoc, err = s.configDocLocked(); err != nil {
+			restore()
+			return err
+		}
 	}
-	doc, err := s.configDocLocked()
-	if err == nil {
-		err = tx.Commit(ctx, doc, s.state.Revision, s.pendingAudit)
+	if pkgChanged {
+		if s.pkgWorkRev == startPkgRev {
+			s.pkgWorkRev++ // a dirty flag without an explicit bump: advance so peers observe the change
+			pkgCommitRev = s.pkgWorkRev
+		}
+		if pkgCommitDoc, err = s.packageWorkDocLocked(); err != nil {
+			restore()
+			return err
+		}
 	}
-	if err != nil {
-		s.log.Error("cluster commit failed; restoring last committed configuration", "error", err)
-		_ = s.applyConfigDocLocked(before, startRev)
-		s.dropPendingAuditLocked()
+	if err = tx.Commit(ctx, cfgDoc, cfgRev, s.pendingAudit, pkgCommitDoc, pkgCommitRev); err != nil {
+		s.log.Error("cluster commit failed; restoring last committed state", "error", err)
+		restore()
 		return fmt.Errorf("%w: commit failed: %v", ErrClusterUnavailable, err)
 	}
 	committed = true
@@ -124,10 +158,12 @@ func (s *Store) dropPendingAuditLocked() {
 	s.pendingAudit = nil
 }
 
-// configDocLocked serializes the configuration part of the state (telemetry lives in its own tables).
+// configDocLocked serializes the configuration part of the state (telemetry lives in its own tables, the
+// package work-store in its own document).
 func (s *Store) configDocLocked() ([]byte, error) {
 	cfg := s.state
 	cfg.Flows, cfg.AuditEvents, cfg.SecurityEvents, cfg.RuleStats = nil, nil, nil, nil
+	cfg.PackageWork = PackageWorkState{} // travels in the work-store document (packageWorkDocLocked)
 	// Committed in the same transaction as the audit rows it seals.
 	cfg.AuditCheckpoint = s.sealedCheckpointLocked()
 	sessions := make([]models.LearningSession, len(cfg.Sessions))
@@ -149,8 +185,10 @@ func (s *Store) applyConfigDocLocked(doc []byte, rev uint64) error {
 		return fmt.Errorf("decode cluster configuration: %w", err)
 	}
 	flows, audits, events, stats := s.state.Flows, s.state.AuditEvents, s.state.SecurityEvents, s.state.RuleStats
+	pkgWork := s.state.PackageWork // kept local; replicated as its own document
 	s.state = cfg
 	s.state.Flows, s.state.AuditEvents, s.state.SecurityEvents, s.state.RuleStats = flows, audits, events, stats
+	s.state.PackageWork = pkgWork
 	s.recompileSessionsLocked(nil)
 	s.buildIndexLocked(rev)
 	s.state.Revision = rev
@@ -163,6 +201,23 @@ func (s *Store) applyConfigDocLocked(doc []byte, rev uint64) error {
 	}
 	s.syncThreatIntelLocked()
 	s.syncExportLocked()
+	return nil
+}
+
+// packageWorkDocLocked serializes the package firewall work-store (requests, assessments, analysis jobs).
+func (s *Store) packageWorkDocLocked() ([]byte, error) {
+	return json.Marshal(s.state.PackageWork)
+}
+
+// applyPackageWorkDocLocked replaces the work-store from a replicated document.
+func (s *Store) applyPackageWorkDocLocked(doc []byte, rev uint64) error {
+	var pw PackageWorkState
+	if err := json.Unmarshal(doc, &pw); err != nil {
+		return fmt.Errorf("decode cluster package work: %w", err)
+	}
+	s.state.PackageWork = pw
+	s.pkgWorkRev = rev
+	s.pkgWorkDirty = false
 	return nil
 }
 
@@ -243,7 +298,7 @@ func (s *Store) importFileAuditTrailLocked(ctx context.Context, tx ClusterTx) (a
 func (s *Store) initCluster(seed func() error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	tx, err := s.cluster.BeginWrite(ctx, 0)
+	tx, err := s.cluster.BeginWrite(ctx, 0, 0)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrClusterUnavailable, err)
 	}
@@ -262,6 +317,11 @@ func (s *Store) initCluster(seed func() error) error {
 			return err
 		}
 		s.log.Info("initialized empty cluster storage", "backend", s.cluster.Name(), "node", s.cluster.NodeID())
+	}
+	if pkgDoc := tx.StoredPackageWorkDoc(); pkgDoc != nil {
+		if err := s.applyPackageWorkDocLocked(pkgDoc, tx.StoredPackageWorkRevision()); err != nil {
+			return err
+		}
 	}
 	fresh := tx.StoredDoc() == nil
 	s.pendingAudit = nil
@@ -341,7 +401,18 @@ func (s *Store) initCluster(seed func() error) error {
 	if after, err = s.configDocLocked(); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx, after, s.state.Revision, pending); err != nil {
+	// On a brand-new cluster, seed the work-store document alongside the configuration; when joining an
+	// existing cluster the work-store was loaded above and is left untouched here.
+	var pkgDoc []byte
+	pkgRev := s.pkgWorkRev
+	if fresh {
+		s.pkgWorkRev = tx.StoredPackageWorkRevision() + 1
+		pkgRev = s.pkgWorkRev
+		if pkgDoc, err = s.packageWorkDocLocked(); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx, after, s.state.Revision, pending, pkgDoc, pkgRev); err != nil {
 		return fmt.Errorf("%w: initial commit: %v", ErrClusterUnavailable, err)
 	}
 	for _, ev := range s.pendingAudit {
@@ -552,6 +623,14 @@ func (s *Store) clusterLoops() {
 		case <-fast.C:
 			s.flushTelemetry(ctx)
 			s.pullTelemetry(ctx)
+			if rev, err := s.cluster.StoredPackageWorkRevision(ctx); err == nil {
+				s.mu.RLock()
+				cur := s.pkgWorkRev
+				s.mu.RUnlock()
+				if rev > cur {
+					s.refreshPackageWorkFromCluster(ctx)
+				}
+			}
 		case <-slow.C:
 			if rev, err := s.cluster.StoredRevision(ctx); err == nil {
 				s.mu.RLock()
@@ -595,6 +674,27 @@ func (s *Store) refreshFromCluster(ctx context.Context) {
 	}
 	s.state.AuditEvents = audits
 	s.log.Debug("configuration refreshed from cluster", "revision", rev)
+}
+
+// refreshPackageWorkFromCluster reloads the work-store document when a peer advanced it. Writes refresh
+// the work-store under the write lock (withWrite); this keeps read-only replicas current for the console.
+func (s *Store) refreshPackageWorkFromCluster(ctx context.Context) {
+	doc, rev, err := s.cluster.LoadPackageWork(ctx)
+	if err != nil {
+		s.log.Warn("cluster work-store refresh failed", "error", err)
+		return
+	}
+	if doc == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rev <= s.pkgWorkRev {
+		return
+	}
+	if err := s.applyPackageWorkDocLocked(doc, rev); err != nil {
+		s.log.Error("cluster work-store refresh rejected", "error", err)
+	}
 }
 
 // flushTelemetry commits queued telemetry in one transaction (serialized: a data-plane ingest that finds its flows

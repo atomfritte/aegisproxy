@@ -36,7 +36,7 @@ func (s *Store) Assessment(ecosystem, name, version string) *models.PackageAsses
 	return &cp
 }
 
-// PutAssessment stores or replaces an assessment. Returns without a revision bump via bumpConfigLocked.
+// PutAssessment stores or replaces an assessment. Returns without a revision bump via bumpPackageWorkLocked.
 func (s *Store) PutAssessment(a models.PackageAssessment) {
 	_ = s.withWrite(func() error {
 		if s.state.PackageWork.Assessments == nil {
@@ -47,7 +47,7 @@ func (s *Store) PutAssessment(a models.PackageAssessment) {
 			s.pruneAssessmentsLocked()
 		}
 		s.state.PackageWork.Assessments[key] = a
-		s.bumpConfigLocked()
+		s.bumpPackageWorkLocked()
 		return nil
 	})
 }
@@ -138,7 +138,7 @@ func (s *Store) CreatePackageRequest(r models.PackageRequest) (models.PackageReq
 			s.pruneRequestsLocked()
 		}
 		s.state.PackageWork.Requests = append(s.state.PackageWork.Requests, r)
-		s.bumpConfigLocked()
+		s.bumpPackageWorkLocked()
 		return nil
 	})
 	return r, err
@@ -151,7 +151,7 @@ func (s *Store) SavePackageRequest(r models.PackageRequest) error {
 			if s.state.PackageWork.Requests[i].ID == r.ID {
 				r.UpdatedAt = time.Now().UTC()
 				s.state.PackageWork.Requests[i] = r
-				s.bumpConfigLocked()
+				s.bumpPackageWorkLocked()
 				return nil
 			}
 		}
@@ -197,7 +197,7 @@ func (s *Store) FailOrReject(id, kind, ruleName, reason string) error {
 			} else {
 				r.Status, r.Error = models.PackageReqFailed, reason
 			}
-			s.bumpConfigLocked()
+			s.bumpPackageWorkLocked()
 			return nil
 		}
 		return errors.New("request not found")

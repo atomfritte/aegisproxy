@@ -75,7 +75,9 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, claims *
 
 	me, _ := s.store.GetUserByID(claims.UserID)
 	resp := map[string]any{
-		"revision":            snap.Revision,
+		// Composite config+work-store revision so the console refreshes on either (package request/job
+		// changes advance the work-store revision, not the configuration revision).
+		"revision":            s.store.GetStateRevision(),
 		"version":             s.version,
 		"demo_mode":           s.store.DemoMode(),
 		"fleet_total_servers": totalFleetServers,

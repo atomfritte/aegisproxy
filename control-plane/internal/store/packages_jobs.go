@@ -32,7 +32,7 @@ func (s *Store) EnqueueAnalysis(job models.AnalysisJob) (string, bool, error) {
 		}
 		s.state.PackageWork.Jobs = append(s.state.PackageWork.Jobs, job)
 		id, created = job.ID, true
-		s.bumpConfigLocked()
+		s.bumpPackageWorkLocked()
 		return nil
 	})
 	return id, created, err
@@ -80,7 +80,7 @@ func (s *Store) ClaimAnalysis(worker string, ecosystems []string) (*models.Analy
 		j.State, j.Worker, j.LeasedAt, j.LeaseUntil, j.Attempts = models.AnalysisRunning, worker, &now, &lease, j.Attempts+1
 		cp := *j
 		claimed = &cp
-		s.bumpConfigLocked()
+		s.bumpPackageWorkLocked()
 		return nil
 	})
 	return claimed, err
@@ -94,7 +94,7 @@ func (s *Store) HeartbeatAnalysis(id, worker string) error {
 			if j.ID == id && j.Worker == worker && j.State == models.AnalysisRunning {
 				lease := time.Now().UTC().Add(analysisLeaseSeconds * time.Second)
 				j.LeaseUntil = &lease
-				s.bumpConfigLocked()
+				s.bumpPackageWorkLocked()
 				return nil
 			}
 		}
@@ -121,7 +121,7 @@ func (s *Store) CompleteAnalysis(id, worker, reportKey, failure string) (*models
 			}
 			cp := *j
 			out = &cp
-			s.bumpConfigLocked()
+			s.bumpPackageWorkLocked()
 			return nil
 		}
 		return errors.New("job not found")
