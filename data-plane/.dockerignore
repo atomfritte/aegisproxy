@@ -20,6 +20,7 @@
 !aegis_dp/icap.py
 !aegis_dp/liveconns.py
 !aegis_dp/ops.py
+!aegis_dp/packages.py
 !aegis_dp/policy.py
 !aegis_dp/redact.py
 !aegis_dp/spool.py
