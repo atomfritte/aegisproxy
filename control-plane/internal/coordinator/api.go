@@ -110,29 +110,45 @@ func (c *Coordinator) reaudit(settings models.PackageSettings) {
 			continue
 		}
 		c.store.PutAssessment(*a)
-		fresh := newAdvisories(prev, a) // advisories that appeared since the last assessment
 
-		if threshold != "" && shouldRevoke(a, threshold) {
+		revoke, action, advs := reauditDecision(prev, a, threshold)
+		if revoke {
 			reason := "re-audit: " + a.Summary
 			if err := c.store.RevokePackageApproval(ap.ID, "system", "SYSTEM", reason); err != nil {
-				continue
+				continue // the approval did not actually change state, so do not alert
 			}
 			c.log.Warn("revoked package approval after re-audit", "approval", ap.ID,
 				"package", ap.Ecosystem+":"+ap.Name+"@"+ap.Version, "risk", a.Risk)
-			c.alertReaudit(ap, a, a.Advisories, "revoked")
-			continue
 		}
-		// Not revoked (auto-revoke off, or the threshold is not met): still alert once about newly
-		// discovered findings so a human can decide. Storing the assessment above means the next cycle
-		// no longer sees them as new, so this does not repeat every interval.
-		if len(fresh) > 0 {
-			action := "advisory"
-			if anyMalware(fresh) {
-				action = "malware"
-			}
-			c.alertReaudit(ap, a, fresh, action)
+		if action != "" {
+			c.alertReaudit(ap, a, advs, action)
 		}
 	}
+}
+
+// reauditDecision decides, from the previous (nil = none on record) and current assessment and the
+// auto-revoke threshold, what the re-audit should do with one approved version:
+//   - revoke: the approval must be revoked (threshold met) — always alerted as "revoked".
+//   - action: the alert to raise ("" = none). "revoked" accompanies a revoke; "advisory"/"malware"
+//     reports findings that appeared since the last assessment.
+//
+// A nil prev (a brand-new approval, or a cache that was pruned) is treated as a silent baseline: only a
+// threshold-based revoke still alerts, so pre-existing findings are not reported as if they were new.
+func reauditDecision(prev, cur *models.PackageAssessment, threshold string) (revoke bool, action string, advs []models.PackageAdvisory) {
+	if threshold != "" && shouldRevoke(cur, threshold) {
+		return true, "revoked", cur.Advisories
+	}
+	if prev == nil {
+		return false, "", nil
+	}
+	fresh := newAdvisories(prev, cur)
+	if len(fresh) == 0 {
+		return false, "", nil
+	}
+	if anyMalware(fresh) {
+		return false, "malware", fresh
+	}
+	return false, "advisory", fresh
 }
 
 // newAdvisories returns the non-withdrawn advisories in cur that were not already present in prev
@@ -202,11 +218,17 @@ func (c *Coordinator) alertReaudit(ap models.PackageApproval, a *models.PackageA
 	if name == "" {
 		name = ap.Name
 	}
-	rcv := c.store.PackageReceivers(ap.Ecosystem, ap.Name, ap.Version, "")
+	// Counting receivers scans the whole retained flow window under a read lock, so only pay for it on
+	// the high-signal actions (revoke / malware). Informational advisory alerts leave it unresolved
+	// (Servers = -1); the receiver view is one click away via the alert's deep link.
+	servers := -1
+	if action == "revoked" || action == "malware" {
+		servers = len(c.store.PackageReceivers(ap.Ecosystem, ap.Name, ap.Version, "").Receivers)
+	}
 	c.notifier.NotifyPackageEvent(models.PackageAlert{
 		Action: action, Ecosystem: ap.Ecosystem, Name: name, Version: ap.Version,
 		Severity: a.Risk, Summary: a.Summary, Advisories: ids, Reason: "re-audit",
-		ApprovalID: ap.ID, Servers: len(rcv.Receivers),
+		ApprovalID: ap.ID, Servers: servers,
 	})
 }
 

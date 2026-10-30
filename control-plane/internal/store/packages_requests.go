@@ -60,6 +60,14 @@ func (s *Store) pruneAssessmentsLocked() {
 			referenced[assessmentKey(n.Ecosystem, n.Name, n.Version)] = true
 		}
 	}
+	// Keep the assessment of every still-approved version too: the re-audit loop diffs against it to
+	// tell new advisories from pre-existing ones, so dropping it would make re-audit re-alert as if
+	// every known finding were new.
+	for _, a := range s.state.Packages.Approvals {
+		if a.Status == "approved" {
+			referenced[assessmentKey(a.Ecosystem, a.Name, a.Version)] = true
+		}
+	}
 	type kv struct {
 		key string
 		at  time.Time

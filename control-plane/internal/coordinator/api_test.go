@@ -79,3 +79,44 @@ func TestAnyMalware(t *testing.T) {
 		t.Fatal("malware present")
 	}
 }
+
+func assess(advs ...models.PackageAdvisory) *models.PackageAssessment {
+	return &models.PackageAssessment{Advisories: advs}
+}
+
+func TestReauditDecision(t *testing.T) {
+	high := adv("GHSA-high", "high", false, false)
+	crit := adv("GHSA-crit", "critical", false, false)
+	mal := adv("MAL-1", "critical", false, true)
+
+	cases := []struct {
+		name       string
+		prev, cur  *models.PackageAssessment
+		threshold  string
+		wantRevoke bool
+		wantAction string
+	}{
+		{"baseline: no prior, no findings, no threshold", nil, assess(), "", false, ""},
+		{"baseline suppresses pre-existing findings (auto-revoke off)", nil, assess(crit, mal), "", false, ""},
+		{"baseline still revokes when the threshold is met", nil, assess(crit), "critical", true, "revoked"},
+		{"baseline still revokes on malware regardless of threshold", nil, assess(mal), "high", true, "revoked"},
+		{"new advisory below threshold is reported, not revoked", assess(high), assess(high, crit), "", false, "advisory"},
+		{"new malware is reported as malware (auto-revoke off)", assess(high), assess(high, mal), "", false, "malware"},
+		{"nothing new: silent", assess(high), assess(high), "", false, ""},
+		{"revoke takes precedence over the advisory alert", assess(high), assess(high, crit), "critical", true, "revoked"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			revoke, action, advs := reauditDecision(tc.prev, tc.cur, tc.threshold)
+			if revoke != tc.wantRevoke || action != tc.wantAction {
+				t.Fatalf("got (revoke=%v, action=%q), want (revoke=%v, action=%q)", revoke, action, tc.wantRevoke, tc.wantAction)
+			}
+			if action == "" && advs != nil {
+				t.Fatalf("no action but advisories returned: %v", ids(advs))
+			}
+			if action != "" && len(advs) == 0 {
+				t.Fatal("an action was chosen but no advisories were attached")
+			}
+		})
+	}
+}
