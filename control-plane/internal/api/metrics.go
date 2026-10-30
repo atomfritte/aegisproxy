@@ -83,28 +83,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	s.metrics.write(w)
 
-	snap := s.store.GetSnapshot()
+	mc := s.store.MetricCounts()
 	gauge := func(name, help string, v float64, labels ...string) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %g\n", name, help, name, seriesKey(name, labels...), v)
 	}
 	gauge("aegis_build_info", "Build information.", 1, "version", s.version)
 	gauge("aegis_uptime_seconds", "Control-plane uptime.", time.Since(s.started).Seconds())
-	gauge("aegis_config_revision", "Current policy configuration revision.", float64(snap.Revision))
-	gauge("aegis_policy_rules", "Configured whitelist/guardrail rules.", float64(len(snap.Rules)))
-	gauge("aegis_servers", "Registered servers.", float64(len(snap.Servers)))
-	pending, open := 0, 0
-	for _, rq := range snap.Requests {
-		if rq.Status == "pending" {
-			pending++
-		}
-	}
-	for _, ev := range snap.SecurityEvents {
-		if !ev.Acknowledged {
-			open++
-		}
-	}
-	gauge("aegis_access_requests_pending", "Access requests awaiting review.", float64(pending))
-	gauge("aegis_security_events_open", "Unacknowledged security events.", float64(open))
+	gauge("aegis_config_revision", "Current policy configuration revision.", float64(mc.Revision))
+	gauge("aegis_policy_rules", "Configured whitelist/guardrail rules.", float64(mc.Rules))
+	gauge("aegis_servers", "Registered servers.", float64(mc.Servers))
+	gauge("aegis_access_requests_pending", "Access requests awaiting review.", float64(mc.PendingRequests))
+	gauge("aegis_security_events_open", "Unacknowledged security events.", float64(mc.OpenSecurityEvents))
 	audit := s.store.AuditStatus()
 	writable, intact, pendingLegacy := 0.0, 0.0, 0.0
 	if audit.Writable {

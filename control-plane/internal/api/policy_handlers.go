@@ -859,7 +859,7 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request, clai
 	out := []models.AccessRequest{}
 	total := 0
 	scope := scopeFor(claims)
-	for _, req := range s.store.GetSnapshot().Requests {
+	for _, req := range s.store.AccessRequests() {
 		switch {
 		case scope != nil && !scope.anyOf(req.TargetGroupIDs, req.GroupIDs):
 			continue
@@ -886,7 +886,7 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request, clai
 func (s *Server) handleGetRequest(w http.ResponseWriter, r *http.Request, claims *auth.TokenClaims) {
 	id := r.PathValue("id")
 	scope := scopeFor(claims)
-	for _, req := range s.store.GetSnapshot().Requests {
+	for _, req := range s.store.AccessRequests() {
 		if req.ID == id && (scope == nil || scope.anyOf(req.TargetGroupIDs, req.GroupIDs)) {
 			writeJSON(w, http.StatusOK, req)
 			return

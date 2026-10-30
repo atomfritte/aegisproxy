@@ -908,6 +908,42 @@ func (s *Store) BundleGeneration() uint64 {
 	return s.bundleGen
 }
 
+// AccessRequests returns a copy of the access-request list (shallow per element, matching GetSnapshot),
+// so the request list/detail endpoints need not clone the whole state snapshot just to read requests.
+func (s *Store) AccessRequests() []models.AccessRequest {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]models.AccessRequest(nil), s.state.Requests...)
+}
+
+// MetricCounts are the few fleet/queue counts the Prometheus endpoint needs, computed under one read
+// lock without cloning the whole state (the scrape runs on an interval).
+type MetricCounts struct {
+	Revision           uint64
+	Rules              int
+	Servers            int
+	PendingRequests    int
+	OpenSecurityEvents int
+}
+
+// MetricCounts returns the gauge values for the metrics endpoint without a full GetSnapshot clone.
+func (s *Store) MetricCounts() MetricCounts {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m := MetricCounts{Revision: s.state.Revision, Rules: len(s.state.Rules), Servers: len(s.state.Servers)}
+	for _, rq := range s.state.Requests {
+		if rq.Status == "pending" {
+			m.PendingRequests++
+		}
+	}
+	for _, ev := range s.state.SecurityEvents {
+		if !ev.Acknowledged {
+			m.OpenSecurityEvents++
+		}
+	}
+	return m
+}
+
 func (s *Store) GetUserByID(userID string) (*models.User, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
