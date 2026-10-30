@@ -31,6 +31,18 @@ import type {
   LoginResponse,
   NotificationConfig,
   NotificationLog,
+  PackageApproval,
+  PackageApprovalDetail,
+  PackageApprovalsPage,
+  PackageBlock,
+  PackageDecisionInput,
+  PackageLookupResult,
+  PackageReceiversResponse,
+  PackageRequest,
+  PackageRequestInput,
+  PackageRule,
+  PackageSettings,
+  PackagesOverview,
   PolicyDiff,
   PolicyRule,
   PolicySetBundle,
@@ -48,6 +60,7 @@ import type {
   ReviewAccessRequestBody,
   ReviewDecision,
   RotateTokenResponse,
+  SandboxReport,
   ScimSettings,
   ScimTokenIssued,
   SecurityPolicy,
@@ -375,6 +388,63 @@ export const api = {
   system: {
     /** InfoSec / Super Admin. */
     posture: () => apiJSON<PostureReport>('/api/system/posture'),
+  },
+
+  // -------------------------------------------------------------------------
+  // Package firewall (3.0) — /api/packages/*
+  // Reads: any signed-in role. Writes (settings, rules, blocks, approvals,
+  // decisions, reanalyze): InfoSec Approver or Super Admin (`canManageSystem`).
+  // -------------------------------------------------------------------------
+  packages: {
+    /** Ecosystem modes, counts, sandbox worker status, recent decisions and the current settings. */
+    overview: () => apiJSON<PackagesOverview>('/api/packages/overview'),
+    settings: {
+      /** Replaces PackageSettings. Advisory-source tokens are write-only (sent only when typed). */
+      update: (s: PackageSettings) => apiPost<PackageSettings>('/api/packages/settings', s),
+    },
+    rules: {
+      list: () => apiJSON<PackageRule[]>('/api/packages/rules'),
+      create: (r: Partial<PackageRule>) => apiPost<PackageRule>('/api/packages/rules', r),
+      update: (id: string, r: Partial<PackageRule>) => apiPut<PackageRule>(`/api/packages/rules/${seg(id)}`, r),
+      delete: (id: string) => apiDelete<Status>(`/api/packages/rules/${seg(id)}`),
+      toggle: (id: string, enabled: boolean) => apiPost<PackageRule>(`/api/packages/rules/${seg(id)}/toggle`, { enabled }),
+    },
+    blocks: {
+      list: () => apiJSON<PackageBlock[]>('/api/packages/blocks'),
+      add: (b: Partial<PackageBlock>) => apiPost<PackageBlock>('/api/packages/blocks', b),
+      delete: (id: string) => apiDelete<Status>(`/api/packages/blocks/${seg(id)}`),
+    },
+    approvals: {
+      /** Paged, newest first. Returns `{ approvals, cursor? }`. */
+      list: (params: { ecosystem?: string; status?: string; q?: string; cursor?: string } = {}) =>
+        apiJSON<PackageApprovalsPage>(`/api/packages/approvals${qs(params)}`),
+      get: (id: string) => apiJSON<PackageApprovalDetail>(`/api/packages/approvals/${seg(id)}`),
+      revoke: (id: string, reason: string) => apiPost<PackageApproval>(`/api/packages/approvals/${seg(id)}/revoke`, { reason }),
+      /** `expires_at`: RFC 3339, or '' to make the approval permanent. */
+      extend: (id: string, expires_at: string) => apiPost<PackageApproval>(`/api/packages/approvals/${seg(id)}/extend`, { expires_at }),
+    },
+    requests: {
+      list: (params: { status?: string; ecosystem?: string; mine?: boolean } = {}) =>
+        apiJSON<PackageRequest[]>(`/api/packages/requests${qs(params)}`),
+      /** One request with the full resolved graph and per-node assessment. */
+      get: (id: string) => apiJSON<PackageRequest>(`/api/packages/requests/${seg(id)}`),
+      /** Opens a request; resolution + analysis start asynchronously. */
+      create: (body: PackageRequestInput) => apiPost<PackageRequest>('/api/packages/requests', body),
+      /** Review; approve creates the graph's approvals. */
+      decide: (id: string, body: PackageDecisionInput) => apiPost<PackageRequest>(`/api/packages/requests/${seg(id)}/decision`, body),
+      /** Re-run resolution + analysis (new advisories / rules). */
+      reanalyze: (id: string) => apiPost<PackageRequest>(`/api/packages/requests/${seg(id)}/reanalyze`),
+    },
+    /** Live assessment preview for the request wizard (no request is created). */
+    lookup: (params: { ecosystem: string; name: string; version?: string }) =>
+      apiJSON<PackageLookupResult>(`/api/packages/lookup${qs(params)}`),
+    analysis: {
+      /** The full sandbox report of one analysis (URLs, syscalls, processes, files, findings). */
+      get: (jobId: string) => apiJSON<SandboxReport>(`/api/packages/analysis/${seg(jobId)}`),
+    },
+    /** Which servers obtained a package — backed by the `package` field on flow telemetry. */
+    receivers: (params: { ecosystem: string; name: string; version?: string; sha256?: string }) =>
+      apiJSON<PackageReceiversResponse>(`/api/packages/receivers${qs(params)}`),
   },
 };
 

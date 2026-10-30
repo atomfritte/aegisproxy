@@ -12,6 +12,7 @@ import { GovernanceSection } from './settings/GovernanceSection';
 import { IdentitySection } from './settings/IdentitySection';
 import { LogExportSection } from './settings/logexport/LogExportSection';
 import { NotificationsSection } from './settings/NotificationsSection';
+import { PackagesSection } from './settings/PackagesSection';
 import { ServiceAccountsSection } from './settings/ServiceAccountsSection';
 import { SsoSection } from './settings/SsoSection';
 import { SETTINGS_SECTIONS, type SettingsSectionId } from './settings/shared';
@@ -26,6 +27,7 @@ const SECTION_COMPONENTS: Record<SettingsSectionId, React.FC> = {
   'data-planes': DataPlanesSection,
   'log-export': LogExportSection,
   defender: DefenderSection,
+  packages: PackagesSection,
 };
 
 /** Routes /settings (general) and /settings/:tab with a section sub-navigation. */

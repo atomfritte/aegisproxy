@@ -18,6 +18,7 @@ import {
   LogOut,
   Monitor,
   Moon,
+  PackagePlus,
   Plus,
   RefreshCw,
   Rows3,
@@ -102,7 +103,8 @@ export const CommandPalette: React.FC<{ open: boolean; onClose: () => void; onCh
     if (!perms.isReadOnly) {
       actions.push(
         { id: 'act-new-set', group: 'Actions', label: 'Create policy set', icon: Plus, keywords: 'new add rule', run: go('/policies/new') },
-        { id: 'act-import-sets', group: 'Actions', label: 'Import policy sets', icon: FileUp, keywords: 'policy as code json bundle gitops', run: go('/policies?import=1') }
+        { id: 'act-import-sets', group: 'Actions', label: 'Import policy sets', icon: FileUp, keywords: 'policy as code json bundle gitops', run: go('/policies?import=1') },
+        { id: 'act-request-package', group: 'Actions', label: 'Request a package', icon: PackagePlus, keywords: 'npm pypi nuget powershell gallery package firewall dependency new', run: go('/packages/requests?new=1') }
       );
     }
     if (perms.canManageSystem) actions.push({ id: 'act-new-yara', group: 'Actions', label: 'Create YARA rule set', icon: FileCode2, keywords: 'new add yara', run: go('/threats/yara/new') });

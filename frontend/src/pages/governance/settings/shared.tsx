@@ -1,9 +1,9 @@
 import React from 'react';
 import type { LucideIcon } from 'lucide-react';
-import { Bell, Bot, Lock, Fingerprint, Gavel, Info, ScrollText, ServerCog, ShieldHalf, Users } from 'lucide-react';
+import { Bell, Bot, Lock, Fingerprint, Gavel, Info, PackageCheck, ScrollText, ServerCog, ShieldHalf, Users } from 'lucide-react';
 import { Button } from '../../../ui';
 
-export type SettingsSectionId = 'general' | 'governance' | 'notifications' | 'identity' | 'sso' | 'service-accounts' | 'data-planes' | 'log-export' | 'defender';
+export type SettingsSectionId = 'general' | 'governance' | 'notifications' | 'identity' | 'sso' | 'service-accounts' | 'data-planes' | 'log-export' | 'defender' | 'packages';
 
 export interface SettingsSectionMeta {
   id: SettingsSectionId;
@@ -57,6 +57,15 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     path: '/settings/defender',
     description: 'Endpoint risk, isolation and indicators',
     keywords: 'mde defender for endpoint integration edr device risk isolation quarantine indicators microsoft',
+    systemOnly: true,
+  },
+  {
+    id: 'packages',
+    label: 'Package firewall',
+    icon: PackageCheck,
+    path: '/settings/packages',
+    description: 'Ecosystems, cooldown, sandbox and advisory sources',
+    keywords: 'package firewall npm pypi nuget powershell gallery registry cooldown karenz sandbox advisory osv snyk socket ossindex depsdev supply chain',
     systemOnly: true,
   },
 ];
