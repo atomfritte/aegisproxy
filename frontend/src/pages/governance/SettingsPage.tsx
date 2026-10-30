@@ -1,33 +1,25 @@
-import React, { useEffect, useRef } from 'react';
+import React, { lazy, Suspense, useEffect, useRef } from 'react';
 import { usePermissions } from '../../data/AppData';
 import { cn } from '../../lib/cn';
 import { useDocumentTitle } from '../../lib/hooks';
 import { NavLink, Redirect, useParams } from '../../lib/router';
-import { PageHeader } from '../../ui';
+import { PageHeader, Skeleton } from '../../ui';
 import { NotFoundPage } from '../system/NotFoundPage';
-import { DataPlanesSection } from './settings/DataPlanesSection';
-import { DefenderSection } from './settings/DefenderSection';
-import { GeneralSection } from './settings/GeneralSection';
-import { GovernanceSection } from './settings/GovernanceSection';
-import { IdentitySection } from './settings/IdentitySection';
-import { LogExportSection } from './settings/logexport/LogExportSection';
-import { NotificationsSection } from './settings/NotificationsSection';
-import { PackagesSection } from './settings/PackagesSection';
-import { ServiceAccountsSection } from './settings/ServiceAccountsSection';
-import { SsoSection } from './settings/SsoSection';
 import { SETTINGS_SECTIONS, type SettingsSectionId } from './settings/shared';
 
+// Each settings tab is a sizeable editor (SSO/JWKS, Defender, log-export sinks, …). Only one renders at
+// a time, so load each on demand instead of shipping all ten in one chunk.
 const SECTION_COMPONENTS: Record<SettingsSectionId, React.FC> = {
-  general: GeneralSection,
-  governance: GovernanceSection,
-  notifications: NotificationsSection,
-  identity: IdentitySection,
-  sso: SsoSection,
-  'service-accounts': ServiceAccountsSection,
-  'data-planes': DataPlanesSection,
-  'log-export': LogExportSection,
-  defender: DefenderSection,
-  packages: PackagesSection,
+  general: lazy(() => import('./settings/GeneralSection').then((m) => ({ default: m.GeneralSection }))),
+  governance: lazy(() => import('./settings/GovernanceSection').then((m) => ({ default: m.GovernanceSection }))),
+  notifications: lazy(() => import('./settings/NotificationsSection').then((m) => ({ default: m.NotificationsSection }))),
+  identity: lazy(() => import('./settings/IdentitySection').then((m) => ({ default: m.IdentitySection }))),
+  sso: lazy(() => import('./settings/SsoSection').then((m) => ({ default: m.SsoSection }))),
+  'service-accounts': lazy(() => import('./settings/ServiceAccountsSection').then((m) => ({ default: m.ServiceAccountsSection }))),
+  'data-planes': lazy(() => import('./settings/DataPlanesSection').then((m) => ({ default: m.DataPlanesSection }))),
+  'log-export': lazy(() => import('./settings/logexport/LogExportSection').then((m) => ({ default: m.LogExportSection }))),
+  defender: lazy(() => import('./settings/DefenderSection').then((m) => ({ default: m.DefenderSection }))),
+  packages: lazy(() => import('./settings/PackagesSection').then((m) => ({ default: m.PackagesSection }))),
 };
 
 /** Routes /settings (general) and /settings/:tab with a section sub-navigation. */
@@ -85,7 +77,9 @@ export const SettingsPage: React.FC = () => {
           </ul>
         </nav>
         <section aria-label={meta.label} className="min-w-0">
-          <Section />
+          <Suspense fallback={<Skeleton className="h-64" />}>
+            <Section />
+          </Suspense>
         </section>
       </div>
     </>

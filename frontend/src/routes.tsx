@@ -4,16 +4,18 @@
 import { lazy, type ComponentType } from 'react';
 import type { RouteDef } from './lib/router';
 import { OverviewPage } from './pages/overview/OverviewPage';
-import { PolicySetsPage } from './pages/policies/PolicySetsPage';
-import { PolicySetCreatePage } from './pages/policies/PolicySetCreatePage';
-import { PolicySetDetailPage } from './pages/policies/PolicySetDetailPage';
-import { ChangeRequestsPage } from './pages/changes/ChangeRequestsPage';
-import { ChangeRequestDetailPage } from './pages/changes/ChangeRequestDetailPage';
-import { LoginRedirect } from './pages/auth/LoginRedirect';
 
 // Larger pages (and pages that still host legacy 2.0 views) are code-split and loaded on first visit.
 const page = <K extends string>(load: () => Promise<Record<K, ComponentType>>, name: K) =>
   lazy(() => load().then((m) => ({ default: m[name] })));
+// Only the Overview (landing route) is eager. The policy / change-request authoring suite is large and
+// off the landing path, so it is code-split like everything else — keeping it out of the initial bundle.
+const PolicySetsPage = page(() => import('./pages/policies/PolicySetsPage'), 'PolicySetsPage');
+const PolicySetCreatePage = page(() => import('./pages/policies/PolicySetCreatePage'), 'PolicySetCreatePage');
+const PolicySetDetailPage = page(() => import('./pages/policies/PolicySetDetailPage'), 'PolicySetDetailPage');
+const ChangeRequestsPage = page(() => import('./pages/changes/ChangeRequestsPage'), 'ChangeRequestsPage');
+const ChangeRequestDetailPage = page(() => import('./pages/changes/ChangeRequestDetailPage'), 'ChangeRequestDetailPage');
+const LoginRedirect = page(() => import('./pages/auth/LoginRedirect'), 'LoginRedirect');
 const AccessRequestsPage = page(() => import('./pages/requests/AccessRequestsPage'), 'AccessRequestsPage');
 const AccessRequestDetailPage = page(() => import('./pages/requests/AccessRequestDetailPage'), 'AccessRequestDetailPage');
 const LearningSessionsPage = page(() => import('./pages/learning/LearningSessionsPage'), 'LearningSessionsPage');

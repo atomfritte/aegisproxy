@@ -1,20 +1,22 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { Ban, Database, FileCheck2, FileCode2, LayoutDashboard, ScanSearch, ShieldAlert, SlidersHorizontal } from 'lucide-react';
 import { useDocumentTitle } from '../../lib/hooks';
 import { navigate, useLocation, useParams } from '../../lib/router';
-import { PageHeader, TabPanel, Tabs } from '../../ui';
+import { PageHeader, Skeleton, TabPanel, Tabs } from '../../ui';
 import { NotFoundPage } from '../system/NotFoundPage';
 import { ModeBadge } from './threats/components';
-import { EventsTab } from './threats/EventsTab';
-import { ExceptionsTab } from './threats/ExceptionsTab';
-import { FeedsTab } from './threats/FeedsTab';
-import { IocsTab } from './threats/IocsTab';
-import { LookupTab } from './threats/LookupTab';
 import { tabPath, THREAT_TABS, ThreatTab } from './threats/meta';
-import { OverviewTab } from './threats/OverviewTab';
-import { PolicyTab } from './threats/PolicyTab';
 import { useThreatData } from './threats/useThreatData';
-import { YaraTab } from './threats/YaraTab';
+
+// One tab renders at a time; the heavy editors (PolicyTab, YaraTab, feed/IOC drawers) load on demand.
+const OverviewTab = lazy(() => import('./threats/OverviewTab').then((m) => ({ default: m.OverviewTab })));
+const EventsTab = lazy(() => import('./threats/EventsTab').then((m) => ({ default: m.EventsTab })));
+const FeedsTab = lazy(() => import('./threats/FeedsTab').then((m) => ({ default: m.FeedsTab })));
+const IocsTab = lazy(() => import('./threats/IocsTab').then((m) => ({ default: m.IocsTab })));
+const ExceptionsTab = lazy(() => import('./threats/ExceptionsTab').then((m) => ({ default: m.ExceptionsTab })));
+const YaraTab = lazy(() => import('./threats/YaraTab').then((m) => ({ default: m.YaraTab })));
+const PolicyTab = lazy(() => import('./threats/PolicyTab').then((m) => ({ default: m.PolicyTab })));
+const LookupTab = lazy(() => import('./threats/LookupTab').then((m) => ({ default: m.LookupTab })));
 
 const TITLES: Record<ThreatTab, string> = {
   overview: 'Threat protection',
@@ -83,14 +85,16 @@ export const ThreatProtectionPage: React.FC = () => {
         ]}
       />
       <TabPanel id={tab} idPrefix="threats">
-        {tab === 'overview' && <OverviewTab />}
-        {tab === 'events' && <EventsTab eventId={id} />}
-        {tab === 'feeds' && <FeedsTab />}
-        {tab === 'iocs' && <IocsTab />}
-        {tab === 'exceptions' && <ExceptionsTab />}
-        {tab === 'yara' && <YaraTab id={id} />}
-        {tab === 'policy' && <PolicyTab />}
-        {tab === 'lookup' && <LookupTab />}
+        <Suspense fallback={<Skeleton className="h-64" />}>
+          {tab === 'overview' && <OverviewTab />}
+          {tab === 'events' && <EventsTab eventId={id} />}
+          {tab === 'feeds' && <FeedsTab />}
+          {tab === 'iocs' && <IocsTab />}
+          {tab === 'exceptions' && <ExceptionsTab />}
+          {tab === 'yara' && <YaraTab id={id} />}
+          {tab === 'policy' && <PolicyTab />}
+          {tab === 'lookup' && <LookupTab />}
+        </Suspense>
       </TabPanel>
     </>
   );
