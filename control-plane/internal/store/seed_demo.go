@@ -674,4 +674,5 @@ func (s *Store) seedDemoData() {
 	}
 	s.seedAuditEventsLocked(now)
 	s.seedDemoPolicyLocked(now)
+	s.seedDemoPackagesLocked(now)
 }
