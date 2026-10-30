@@ -130,7 +130,7 @@ Against real mitmproxy 12.3.0 with the 2.0 end-to-end state directory (schema 2,
 | | password login with local login disabled | refused for a normal local user; the break-glass admin works and raises `BREAK_GLASS_LOGIN` |
 | | forged callback without state cookie | `sso_error=session` |
 | c-icap 0.5.10 + `virus_scan` module 0.5.7 (Debian 13) + ClamAV 1.5 (clamd over a shared socket) | ICAP client: OPTIONS/ISTag, RESPMOD clean / EICAR / 3 MB ZIP containing EICAR, REQMOD clean / EICAR upload, empty body, unreachable service | 10/10 |
-| mitmproxy data-plane (`aegisproxy/data-plane:2.1.0`) → internet, with YARA (block) and ICAP (RESPMOD + REQMOD) | clean download (pypi.org) | 200, scanned by YARA and ICAP |
+| mitmproxy data-plane (`aegisproxy/data-plane:3.0.0`) → internet, with YARA (block) and ICAP (RESPMOD + REQMOD) | clean download (pypi.org) | 200, scanned by YARA and ICAP |
 | | file matching a YARA rule (raw.githubusercontent.com) | 403 block page, `MALWARE_BLOCKED` / `yara`, security event source `YARA` |
 | | EICAR from secure.eicar.org | 403, `MALWARE_BLOCKED` / `icap` (ClamAV via c-icap) |
 | | EICAR uploaded with POST (built-in DLP **off**) | 403 via ICAP REQMOD; clean upload passes |

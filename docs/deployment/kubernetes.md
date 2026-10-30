@@ -66,7 +66,7 @@ create the Secret yourself and set `secrets.existingSecret`. Without `ca.existin
 ## Images
 
 The chart defaults to the release images of this repository, `ghcr.io/atomfritte/aegisproxy-control-plane`,
-`-data-plane` and `-console`, tag `v<appVersion>` (e.g. `v2.1.0`). They are built by
+`-data-plane` and `-console`, tag `v<appVersion>` (e.g. `v3.0.0`). They are built by
 `.github/workflows/release.yml` from the tag, scanned after the push, signed keyless with cosign and carry an
 SBOM and SLSA build provenance. Each GitHub release carries `aegisproxy-vX.Y.Z-image-digests.txt` (the digest of
 every image) and `aegisproxy-X.Y.Z.tgz`, this chart with `controlPlane.image.digest`, `dataPlane.image.digest`
@@ -75,7 +75,7 @@ the exact signer (the release workflow at this tag) and deploy by digest, so a r
 runs:
 
 ```bash
-V=v2.1.0 SIGNER=atomfritte/aegisproxy/.github/workflows/release.yml
+V=v3.0.0 SIGNER=atomfritte/aegisproxy/.github/workflows/release.yml
 gh release download "$V" --repo atomfritte/aegisproxy --pattern 'aegisproxy-*'
 for f in "aegisproxy-$V-image-digests.txt" "aegisproxy-${V#v}.tgz"; do
   gh attestation verify "$f" --repo atomfritte/aegisproxy --signer-workflow "$SIGNER" --source-ref "refs/tags/$V"

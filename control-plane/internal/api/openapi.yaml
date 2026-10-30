@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: AegisProxy Control-Plane API
-  version: 2.1.0
+  version: 3.0.0
   summary: REST API of the AegisProxy Enterprise zero-trust egress gateway control-plane.
   description: |
     The control-plane API manages policy sets, access requests, learning sessions, the server fleet,
@@ -221,7 +221,7 @@ paths:
                 aegis_http_requests_total{method="GET",route="/api/state",code="2xx"} 42
                 # HELP aegis_build_info Build information.
                 # TYPE aegis_build_info gauge
-                aegis_build_info{version="2.1.0"} 1
+                aegis_build_info{version="3.0.0"} 1
         '401':
           $ref: '#/components/responses/Unauthorized'
   /api/state:

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # AegisProxy control-plane + bundled web console ("all-in-one" image).
-#   docker build -t ghcr.io/atomfritte/aegisproxy-control-plane:v2.1.0 --build-arg VERSION=2.1.0 .   (or: make images)
+#   docker build -t ghcr.io/atomfritte/aegisproxy-control-plane:v3.0.0 --build-arg VERSION=3.0.0 .   (or: make images)
 # For split deployments use control-plane/Dockerfile (API only) and frontend/Dockerfile (console only).
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
 
@@ -19,7 +19,7 @@ WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./
 RUN go mod download
 COPY control-plane/ ./
-ARG VERSION=2.1.0
+ARG VERSION=3.0.0
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" -o /out/aegis-control-plane . \
  && mkdir -p /out/data /out/certs
 

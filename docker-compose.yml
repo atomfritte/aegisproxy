@@ -27,8 +27,8 @@ services:
   # the data-plane only; the control-plane gets aegis-ca-public with the certificate alone.
   ca-init:
     <<: *hardening
-    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
-    build: { context: ., args: { VERSION: "${AEGIS_VERSION:-2.1.0}" } }
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-3.0.0}
+    build: { context: ., args: { VERSION: "${AEGIS_VERSION:-3.0.0}" } }
     pull_policy: build
     command: ["gen-ca", "/certs", "/public"]
     volumes: ["aegis-ca:/certs", "aegis-ca-public:/public"]
@@ -36,7 +36,7 @@ services:
 
   control-plane:
     <<: *hardening
-    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-control-plane:v${AEGIS_VERSION:-3.0.0}
     pull_policy: never   # built by ca-init
     depends_on:
       ca-init: { condition: service_completed_successfully }
@@ -63,7 +63,7 @@ services:
 
   data-plane:
     <<: *hardening
-    image: ghcr.io/atomfritte/aegisproxy-data-plane:v${AEGIS_VERSION:-2.1.0}
+    image: ghcr.io/atomfritte/aegisproxy-data-plane:v${AEGIS_VERSION:-3.0.0}
     build: { context: ./data-plane }
     pull_policy: build
     depends_on:

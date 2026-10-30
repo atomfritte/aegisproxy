@@ -32,7 +32,7 @@ import (
 )
 
 // Version is overridden at build time: -ldflags "-X main.Version=..."
-var Version = "2.1.0-dev"
+var Version = "3.0.0-dev"
 
 func main() {
 	if len(os.Args) > 1 {

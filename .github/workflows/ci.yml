@@ -341,8 +341,8 @@ jobs:
           curl -sSLo /usr/local/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
           echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  /usr/local/bin/kind" | sha256sum -c -
           chmod +x /usr/local/bin/kind
-      # Tagged like the release images (ghcr.io/atomfritte/aegisproxy-*:v2.1.0), which the chart uses by default.
-      - run: make images VERSION=2.1.0
+      # Tagged like the release images (ghcr.io/atomfritte/aegisproxy-*:v3.0.0), which the chart uses by default.
+      - run: make images VERSION=3.0.0
       - name: cluster with Cilium and CloudNativePG (chart and manifest pinned by SHA-256)
         run: |
           kind create cluster --config deploy/helm/ci/kind-cilium.yaml --wait 0s
@@ -356,7 +356,7 @@ jobs:
           echo "37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb  cnpg-1.30.1.yaml" | sha256sum -c -
           kubectl apply --server-side -f cnpg-1.30.1.yaml
           kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=600s
-          for i in control-plane data-plane console; do kind load docker-image "ghcr.io/atomfritte/aegisproxy-$i:v2.1.0" --name aegis; done
+          for i in control-plane data-plane console; do kind load docker-image "ghcr.io/atomfritte/aegisproxy-$i:v3.0.0" --name aegis; done
       - name: install the chart (policies enforced, exec probes)
         run: |
           kubectl create namespace aegis

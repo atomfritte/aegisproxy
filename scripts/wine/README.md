@@ -16,7 +16,7 @@ Windows Server 2022/2025, which stays the authoritative test.
 
 ```bash
 scripts/wine/run-go-tests.sh /tmp/aegis-wine --cluster
-GOOS=windows GOARCH=amd64 go -C control-plane build -ldflags "-X main.Version=2.1.0-wine" -o /tmp/aegis-wine/app/aegis-control-plane.exe .
+GOOS=windows GOARCH=amd64 go -C control-plane build -ldflags "-X main.Version=3.0.0-wine" -o /tmp/aegis-wine/app/aegis-control-plane.exe .
 python3 -I scripts/wine/exe_e2e.py /tmp/aegis-wine/app
 scripts/wine/prepare-windows-python.sh /tmp/aegis-wine
 python3 -I scripts/wine/dp_e2e.py /tmp/aegis-wine/app /tmp/aegis-wine/python "$PWD/data-plane"

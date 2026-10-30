@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # AegisProxy data-plane worker (mitmproxy 12 + AegisProxy addon).
-#   docker build -t ghcr.io/atomfritte/aegisproxy-data-plane:v2.1.0 data-plane/   (or: make images)
+#   docker build -t ghcr.io/atomfritte/aegisproxy-data-plane:v3.0.0 data-plane/   (or: make images)
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
 FROM mitmproxy/mitmproxy:12.3.0@sha256:c8a3753de11fd8266afeb103e163f7b7ac6a4a568a707fa2e15b23d20acf4eba
 
