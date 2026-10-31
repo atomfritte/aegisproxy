@@ -4,17 +4,17 @@
 
 | Version | Supported |
 |---|---|
-| 2.1.x | security fixes |
-| 2.0.x | security fixes until 2027-04-30 |
-| < 2.0 | no — upgrade (1.x contained critical defects, see docs/security.md) |
+| 3.0.x | security fixes |
+| < 3.0 | no — upgrade |
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities privately to the product security team (security contact of your AegisProxy
-support agreement, or a private GitHub security advisory for this repository). Do not open public issues.
-Include affected version, component (control-plane, data-plane, console, deployment artifact), reproduction
-steps and impact. We acknowledge within 2 business days and provide a fix or mitigation plan within 30 days
-for high/critical issues.
+Please report vulnerabilities **privately**. Preferred: open a private report under this repository's
+**Security → Advisories → "Report a vulnerability"** (GitHub private vulnerability reporting is enabled).
+Alternatively, holders of an AegisProxy support agreement may use their support security contact. Do not
+open public issues for security reports. Include affected version, component (control-plane, data-plane,
+console, deployment artifact), reproduction steps and impact. We acknowledge within 2 business days and
+provide a fix or mitigation plan within 30 days for high/critical issues.
 
 ## Release integrity
 
@@ -97,9 +97,8 @@ without them the release integrity rests on who has write access.
 
 - **Tag ruleset for `refs/tags/v*`**: only release managers (bypass list) may create tags; update (moving a tag)
   and deletion are blocked for everyone.
-- **Branch protection** (or a branch ruleset) for the release branches (`aegisproxy-2.1`, the default branch):
-  pull requests with at least one approving review and the CI checks required, no force pushes, no deletion,
-  administrators included.
+- **Branch protection** (or a branch ruleset) for the default branch (`main`): pull requests with at least
+  one approving review and the CI checks required, no force pushes, no deletion, administrators included.
 - **Environment `release`** with required reviewers (other than the person who pushed the tag, "Prevent
   self-review"), and its deployment restricted to tags `v*`. The publish and release-asset jobs run in it, so
   nothing is pushed, signed or released before a second person approved the run.
