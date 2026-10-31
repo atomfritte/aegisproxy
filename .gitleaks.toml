@@ -1,0 +1,25 @@
+# gitleaks configuration for AegisProxy.
+# We run gitleaks over the full history (see docs/security). It extends the default
+# ruleset and allowlists only paths that legitimately contain FABRICATED secrets:
+# unit/integration test fixtures, end-to-end throwaway credentials, ephemeral CI
+# values, and the sandbox honeytokens (deliberately planted fake credentials used
+# to detect exfiltration by the untrusted code under analysis). No real credential
+# is committed anywhere in this repository.
+title = "AegisProxy gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures, e2e throwaway secrets, CI values, and sandbox honeytokens — no real credentials."
+paths = [
+  '''.*_test\.go$''',
+  '''.*\.Tests\.ps1$''',
+  '''data-plane/tests/.*''',
+  '''scripts/wine/.*''',
+  '''scripts/conformance/.*''',
+  # Honeytokens: fabricated bait credentials planted in the analysis sandbox.
+  '''control-plane/internal/sandbox/runner/canary\.go$''',
+  # Ephemeral kind-cluster password for the CI Helm test only.
+  '''deploy/helm/ci/values-ci\.yaml$''',
+]
