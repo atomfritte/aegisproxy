@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   control-plane:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     services:
       postgres:
         image: postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb
@@ -36,7 +36,7 @@ jobs:
         working-directory: control-plane
 
   data-plane:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
@@ -73,7 +73,7 @@ jobs:
       - run: go -C control-plane test -run TestCrossLanguageBlockToken -v ./internal/auth/
 
   frontend:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
@@ -87,7 +87,7 @@ jobs:
 
   # Browser regression suite (frontend/e2e): the built console against fresh control planes, as every role.
   console-e2e:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -119,7 +119,7 @@ jobs:
           retention-days: 7
 
   deploy-artifacts:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
@@ -160,6 +160,7 @@ jobs:
   # Both Windows installers on real Windows Server runners: services, virtual service accounts, ACLs,
   # CA roll-out script, proxying through the data-plane service, uninstall.
   windows:
+    if: ${{ vars.RUN_PLATFORM_JOBS != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -329,7 +330,8 @@ jobs:
 
   # Helm chart on Kubernetes with NetworkPolicies enforced (kind + Cilium + CloudNativePG).
   kubernetes:
-    runs-on: ubuntu-24.04
+    if: ${{ vars.RUN_PLATFORM_JOBS != 'false' }}
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     needs: [control-plane, data-plane, frontend]
     timeout-minutes: 45
     steps:
@@ -372,7 +374,7 @@ jobs:
           kubectl -n aegis logs -l app.kubernetes.io/component=control-plane --tail=100 || true
 
   images:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     needs: [control-plane, data-plane, frontend]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
