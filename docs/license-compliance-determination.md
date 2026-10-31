@@ -1,7 +1,7 @@
 # License-compliance determination — can AegisProxy be sold commercially?
 
-**Date:** 2026-10-31 · **Scope:** AegisProxy 3.0.0 (`main`) · **Question:** May we
-dual-license AegisProxy and sell it under a commercial license?
+**Scope:** AegisProxy 3.0.0 (`main`) · **Question:** May we dual-license
+AegisProxy and sell it under a commercial license?
 
 ## Determination
 

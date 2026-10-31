@@ -29,7 +29,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Incident recall**: which servers obtained a given package version,
     reconstructed from flow telemetry (including gateway cache hits).
 - Concept document for extending the firewall to **container images (OCI/Docker)**
-  (`docs/docker-image-firewall-concept.de.md`), design only.
+  (`docs/docker-image-firewall-concept.md`), design only.
 
 ### Changed
 

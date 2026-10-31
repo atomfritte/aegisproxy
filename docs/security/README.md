@@ -5,7 +5,8 @@ what the scanners found, and what we did about each finding. Everyone on the tea
 reviewers) can reproduce every scan from the commands below and compare against the saved reports in
 [`scans/`](scans/).
 
-**Last full run:** 2026-10-31 · against `main` at the 3.0.0 line.
+All scans below run against `main` at the 3.0.0 line (see Git history for when
+each was last refreshed).
 
 ## TL;DR
 
