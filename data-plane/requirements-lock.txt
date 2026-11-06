@@ -755,9 +755,11 @@ pyasn1==0.6.5 \
 pycparser==3.12 ; implementation_name != 'PyPy' \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6
-pydivert==3.1.3 ; sys_platform == 'win32' \
-    --hash=sha256:74ae83a5d1b4a31db8f84a55c1cf875eb4e7a0d2bc2e4730ef171819bc5e9008 \
-    --hash=sha256:e5cba087f3f17eb66cf50965cf9670c55691c580f81dcad20549a0ef49af8e06
+pydivert==4.0.1 ; sys_platform == 'win32' \
+    --hash=sha256:1985fc89d2ec495ecd180ae679375b90636ffb8f6983502e8da3a701b13d457a \
+    --hash=sha256:73eb86a3d311660fe35f22c3f91eb5479ddc8416fe4c4d57f2c5ad15daeeb46f \
+    --hash=sha256:7de2eab52bef9005bcdb9d1ea3641b9a42bc8be8093af748d33c635d997dced2 \
+    --hash=sha256:848e8da98a39b4da056758f51b53af33cdf027d8c55eff19d910922b61347db1
 pylsqpack==0.3.24 \
     --hash=sha256:23b4d8af48836893beac356c10ca268161953de5bf9ed691526a93f5c82433e9 \
     --hash=sha256:54978a9879471596d84bbad5e67d727014048926bc5bb2dac0eb3701b48c5ac9 \
