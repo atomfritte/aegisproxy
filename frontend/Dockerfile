@@ -5,7 +5,7 @@
 #   AEGIS_API_BASE_URL   API origin when it differs from the console origin, e.g. https://aegis-api.corp.example
 #   AEGIS_API_UPSTREAM   alternatively: reverse-proxy /api/ to this upstream (same-origin), e.g. http://control-plane:8081
 # Base images are pinned by digest (tag kept for readability; Dependabot updates both).
-FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build
+FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
